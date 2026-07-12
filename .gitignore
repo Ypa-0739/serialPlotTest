@@ -1,0 +1,27 @@
+# STM32CubeIDE / GCC build artifacts
+/Debug/
+*.o
+*.elf
+*.map
+*.su
+*.cyclo
+*.d
+*.bin
+*.axf
+*.hex
+
+# IDE and OS
+.vscode/
+.settings/
+/.cproject
+
+# Logs and temp
+debug.log
+*.log
+
+# Python / tools
+__pycache__/
+*.pyc
+
+# llm-pid-tuner artifacts
+/llm-pid-tuner-main/artifacts/

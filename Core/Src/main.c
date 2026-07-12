@@ -31,6 +31,7 @@
 #include "serialPlot.h"
 #include "zdtUart.h"
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include "mecanum_chassis.h"
 #include "ops9.h"
@@ -44,6 +45,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define LLM_TUNE_CONTROL_PERIOD_MS  20U
+#define LLM_TUNE_DURATION_MS        4000U
+#define LLM_TUNE_TARGET_MM          300.0f
+#define LLM_TUNE_MAX_SPEED_MPS      0.25f
+#define LLM_TUNE_KP_MAX             0.005f
+#define LLM_TUNE_KI_MAX             0.00005f
+#define LLM_TUNE_KD_MAX             0.002f
 
 /* USER CODE END PD */
 
@@ -66,16 +74,117 @@ float motor_actual_speed[4] = {0};  // 实际速度
 PID_Controller pid_x;
 PID_Controller pid_y;
 PID_Controller pid_yaw;
+// === LLM 自动调参状态机专属变量 ===
+uint8_t pc_rx_byte;                       // PC 串口单字节接收
+char pc_rx_buf[64];                       // ISR 正在拼接的命令
+char pc_command_buf[64];                  // 主循环待处理的完整命令
+volatile uint8_t pc_rx_idx = 0;
+volatile uint8_t pc_command_ready = 0;
+
+typedef enum {
+    TUNE_STATE_WAIT = 0,     // 等待大模型参数状态
+    TUNE_STATE_RUN           // 正在运行测试状态
+} TuneState_t;
+
+TuneState_t current_tune_state = TUNE_STATE_WAIT;
+uint32_t tune_start_time = 0;
+uint32_t last_control_time = 0;
+float start_y_pos = 0.0f;
+float tune_direction = 1.0f;             // 每轮往返，避免一直驶离测试区域
+float tune_output = 0.0f;
+uint32_t tune_round_count = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
+static void LLM_ProcessCommand(void);
+static void LLM_StartTuneRound(void);
+static void LLM_StopTuneRound(const char *reason);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void LLM_StartTuneRound(void)
+{
+    if (tune_round_count > 0U) {
+        tune_direction = -tune_direction;
+    }
+    tune_round_count++;
+
+    StopAllMotors();
+    PID_Reset(&pid_y);
+    start_y_pos = robot_y;
+    PID_SetTarget(&pid_y, start_y_pos + tune_direction * LLM_TUNE_TARGET_MM);
+    tune_output = 0.0f;
+    tune_start_time = HAL_GetTick();
+    last_control_time = tune_start_time;
+    current_tune_state = TUNE_STATE_RUN;
+    printf("# ROUND START %lu DIR %.0f\r\n",
+           (unsigned long)tune_round_count, tune_direction);
+}
+
+static void LLM_StopTuneRound(const char *reason)
+{
+    StopAllMotors();
+    tune_output = 0.0f;
+    current_tune_state = TUNE_STATE_WAIT;
+    printf("# ROUND STOP %s\r\n", reason);
+}
+
+static void LLM_ProcessCommand(void)
+{
+    char command[64];
+    uint8_t i;
+    float p_val, i_val, d_val;
+
+    if (!pc_command_ready) {
+        return;
+    }
+
+    __disable_irq();
+    for (i = 0; i < sizeof(command); i++) {
+        command[i] = pc_command_buf[i];
+        if (command[i] == '\0') {
+            break;
+        }
+    }
+    command[sizeof(command) - 1U] = '\0';
+    pc_command_ready = 0U;
+    __enable_irq();
+
+    if ((sscanf(command, "SET P:%f I:%f D:%f", &p_val, &i_val, &d_val) == 3) ||
+        (sscanf(command, "SET KP:%f KI:%f KD:%f", &p_val, &i_val, &d_val) == 3) ||
+        (sscanf(command, "PID %f %f %f", &p_val, &i_val, &d_val) == 3) ||
+        (sscanf(command, "P:%f,I:%f,D:%f", &p_val, &i_val, &d_val) == 3)) {
+        if (isfinite(p_val) && isfinite(i_val) && isfinite(d_val) &&
+            p_val >= 0.0f && p_val <= LLM_TUNE_KP_MAX &&
+            i_val >= 0.0f && i_val <= LLM_TUNE_KI_MAX &&
+            d_val >= 0.0f && d_val <= LLM_TUNE_KD_MAX) {
+            pid_y.Kp = p_val;
+            pid_y.Ki = i_val;
+            pid_y.Kd = d_val;
+            printf("# PID UPDATED P=%.7f I=%.8f D=%.7f\r\n", p_val, i_val, d_val);
+            LLM_StartTuneRound();
+        } else {
+            printf("# ERROR PID LIMIT P<=%.4f I<=%.5f D<=%.4f\r\n",
+                   LLM_TUNE_KP_MAX, LLM_TUNE_KI_MAX, LLM_TUNE_KD_MAX);
+        }
+    } else if (strcmp(command, "STATUS") == 0) {
+        printf("# STATUS P=%.7f I=%.8f D=%.7f STATE=%u\r\n",
+               pid_y.Kp, pid_y.Ki, pid_y.Kd, (unsigned int)current_tune_state);
+    } else if (strcmp(command, "RESET") == 0) {
+        PID_Reset(&pid_y);
+        tune_round_count = 0U;
+        tune_direction = 1.0f;
+        LLM_StopTuneRound("RESET");
+    } else if (strcmp(command, "STOP") == 0) {
+        LLM_StopTuneRound("HOST");
+    } else {
+        printf("# ERROR UNKNOWN COMMAND\r\n");
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -113,11 +222,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM3_Init();
   MX_USART2_UART_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
   // 声明外部的接收缓存变量
   extern uint8_t ops9_rx_byte;
   // 开启 USART2 单字节中断接收
   HAL_UART_Receive_IT(&huart2, &ops9_rx_byte, 1);
+  // 开启 USART1 单字节中断接收 (接收 LLM 发来的参数)
+    HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
   // 1. 初始化 CAN 和过滤器
   ZDT_CAN_ConfigFilter();
 
@@ -148,19 +260,12 @@ int main(void)
   //7.初始化PID参数
   // 注意：坐标单位是 mm，误差 1000mm 时，乘以 Kp=0.001，算出的速度正好是 1.0 m/s
     PID_Init(&pid_x,   0.002f, 0.0f, 0.0f, 0.3f, 0.1f);  // X轴纠偏：限速 0.3 m/s
-    PID_Init(&pid_y,   0.001f, 0.0f, 0.0f, 0.3f, 0.2f);  // Y轴主干：限速 0.5 m/s (比较安全的测试速度)
+    PID_Init(&pid_y,   0.001f, 0.0f, 0.0f, LLM_TUNE_MAX_SPEED_MPS, 5000.0f);
     PID_Init(&pid_yaw, 0.02f,  0.0f, 0.0f, 0.5f, 0.2f);  // 角度纠偏：限速 0.5 rad/s
 
-    // 设定小车的首个演示目标
-    PID_SetTarget(&pid_x, 0.0f);     // 目标 X 坐标 = 0
-    PID_SetTarget(&pid_y, 300.0f);  // 目标 Y 坐标 = 1000 (向前直行 1米)
-    PID_SetTarget(&pid_yaw, 0.0f);   // 目标角度 = 0 (车头保持朝前不变)
-
-    for(int i = 5; i > 0; i--) {
-          printf("Counting down: %d\r\n", i);
-          HAL_Delay(1000); // 延时 1000ms (1秒)
-      }
-
+    StopAllMotors();
+    printf("# STM32F407 MECANUM Y-AXIS PID TUNER READY\r\n");
+    printf("# CSV timestamp_ms,setpoint_mm,input_mm,output_mps,error_mm,p,i,d\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -170,25 +275,44 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  // 1. 根据当前 OPS-9 的实时绝对坐标，计算出三个维度的期望速度
-	      float out_x   = PID_Calc(&pid_x, robot_x);
-	      float out_y   = PID_Calc(&pid_y, robot_y);
-	      float out_yaw = PID_Calc(&pid_yaw, robot_yaw);
+      uint32_t now = HAL_GetTick();
+      LLM_ProcessCommand();
 
-	      // 2. 将 PID 算出的速度喂给麦克纳姆轮底盘进行逆解算
-	      float V1, V2, V3, V4;
-	      // (坐标系已对齐：out_x对应向右Vx，out_y对应向前Vy，out_yaw对应逆时针Vz)
-	      Mecanum_Kinematics(out_x, out_y, out_yaw, &V1, &V2, &V3, &V4);
+      if (current_tune_state == TUNE_STATE_RUN &&
+          (uint32_t)(now - last_control_time) >= LLM_TUNE_CONTROL_PERIOD_MS)
+      {
+          float current_y = robot_y;
+          float moved_distance;
+          float normalized_input;
+          float normalized_error;
+          float V1, V2, V3, V4;
 
-	      // 3. 把解算出来的四个轮子转速发送给 CAN 电机驱动
-	      SetAllMotorsSpeed(V1, V2, V3, V4);
+          last_control_time += LLM_TUNE_CONTROL_PERIOD_MS;
+          if (!isfinite(current_y)) {
+              LLM_StopTuneRound("INVALID OPS9");
+              continue;
+          }
+          if ((uint32_t)(now - tune_start_time) >= LLM_TUNE_DURATION_MS) {
+              LLM_StopTuneRound("TIMEOUT");
+              continue;
+          }
 
-	      // 4. 打印实时状态，方便通过串口助手观察小车位姿和收敛情况
-	      printf("Pos(%.0f, %.0f) Yaw:%.1f | Out[X:%.2f Y:%.2f Yaw:%.2f]\r\n",
-	             robot_x, robot_y, robot_yaw, out_x, out_y, out_yaw);
+          tune_output = PID_Calc(&pid_y, current_y);
+          Mecanum_Kinematics(0.0f, tune_output, 0.0f, &V1, &V2, &V3, &V4);
+          SetAllMotorsSpeed(V1, V2, V3, V4);
 
-	      // 5. PID 控制周期定为 20ms (50Hz 控制频率)
-	      HAL_Delay(20);
+          moved_distance = current_y - start_y_pos;
+          normalized_input = tune_direction * moved_distance;
+          normalized_error = LLM_TUNE_TARGET_MM - normalized_input;
+          printf("%lu,%.2f,%.2f,%.4f,%.2f,%.7f,%.8f,%.7f\r\n",
+                 (unsigned long)(now - tune_start_time),
+                 LLM_TUNE_TARGET_MM, normalized_input,
+                 tune_direction * tune_output, normalized_error,
+                 pid_y.Kp, pid_y.Ki, pid_y.Kd);
+      }
+
+      HAL_Delay(1);
+
   }
   /* USER CODE END 3 */
 }
@@ -260,10 +384,53 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    // 调用 OPS-9 解析函数
-    OPS9_UART_RxCpltCallback(huart);
+	// 1. 处理 OPS-9 传感器数据 (USART2)
+	    if (huart->Instance == USART2)
+	    {
+	        OPS9_UART_RxCpltCallback(huart);
+	    }
+	    // 2. 处理 PC 端大模型发来的指令 (USART1)
+	    else if (huart->Instance == USART1)
+	    {
+	        // ISR 只组帧；浮点解析和状态切换放到主循环执行。
+	        if (pc_rx_byte == '\n' || pc_rx_byte == '\r')
+	        {
+	            if (pc_rx_idx > 0U && !pc_command_ready)
+	            {
+	                uint8_t i;
+	                pc_rx_buf[pc_rx_idx] = '\0';
+	                for (i = 0U; i <= pc_rx_idx; i++) {
+	                    pc_command_buf[i] = pc_rx_buf[i];
+	                }
+	                pc_command_ready = 1U;
+	            }
+	            pc_rx_idx = 0U;
+	        }
+	        else
+	        {
+	            if (!pc_command_ready && pc_rx_idx < sizeof(pc_rx_buf) - 1U)
+	            {
+	                pc_rx_buf[pc_rx_idx++] = pc_rx_byte;
+	            }
+	        }
+	        // 必须重新开启中断，等待下一个字节
+	        HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
+	    }
 }
-
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	extern uint8_t ops9_rx_byte;
+    if (huart->Instance == USART2)
+    {
+        // 一旦检测到 USART2 报错（如 ORE 溢出），强行重新开启接收！
+        HAL_UART_Receive_IT(&huart2, &ops9_rx_byte, 1);
+    }
+    else if (huart->Instance == USART1)
+    {
+        pc_rx_idx = 0U;
+        HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
+    }
+}
 /* USER CODE END 4 */
 
 /**

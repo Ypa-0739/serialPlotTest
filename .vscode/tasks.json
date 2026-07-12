@@ -1,0 +1,52 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "STM32: Build Debug",
+            "type": "process",
+            "command": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe",
+            "args": [
+                "-j8",
+                "all"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}\\Debug",
+                "env": {
+                    "PATH": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\\tools\\bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": ["$gcc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "STM32: Clean Debug",
+            "type": "process",
+            "command": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe",
+            "args": ["clean"],
+            "options": {
+                "cwd": "${workspaceFolder}\\Debug",
+                "env": {
+                    "PATH": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\\tools\\bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "STM32: Rebuild Debug",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "STM32: Clean Debug",
+                "STM32: Build Debug"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}
