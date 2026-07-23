@@ -8,6 +8,10 @@
 
 extern CAN_HandleTypeDef hcan1;
 static ZDT_CAN_RxCallback_t pRxCallback = NULL;
+static volatile uint32_t tx_ok_count = 0;
+static volatile uint32_t tx_error_count = 0;
+static volatile uint32_t rx_count = 0;
+static volatile uint8_t last_tx_result = 0;
 
 // 配置过滤器：允许所有扩展帧通过
 void ZDT_CAN_ConfigFilter(void) {
@@ -56,12 +60,20 @@ uint8_t ZDT_CAN_Send_ExtId(uint32_t ExtId, uint8_t *Data, uint8_t Len) {
     // 等待邮箱空闲（简易超时机制）
     uint32_t tick = HAL_GetTick();
     while (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0) {
-        if (HAL_GetTick() - tick > 10) return 1; // 超时
+        if (HAL_GetTick() - tick > 10) {
+            tx_error_count++;
+            last_tx_result = 1;
+            return 1;
+        }
     }
 
     if (HAL_CAN_AddTxMessage(&hcan1, &TxHeader, Data, &TxMailbox) != HAL_OK) {
+        tx_error_count++;
+        last_tx_result = 2;
         return 2; // 发送失败
     }
+    tx_ok_count++;
+    last_tx_result = 0;
     return 0; // 成功
 }
 
@@ -70,9 +82,20 @@ void ZDT_CAN_RxFIFO0_Handler(CAN_HandleTypeDef *hcan) {
     CAN_RxHeaderTypeDef RxHeader;
     uint8_t RxData[8];
 
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
-        if (pRxCallback != NULL) {
-            pRxCallback(RxHeader.ExtId, RxData, RxHeader.DLC);
+    while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0U) {
+        if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK) {
+            rx_count++;
+            if (pRxCallback != NULL && RxHeader.IDE == CAN_ID_EXT) {
+                pRxCallback(RxHeader.ExtId, RxData, RxHeader.DLC);
+            }
         }
     }
+}
+
+void ZDT_CAN_GetStats(ZDT_CAN_Stats_t *stats) {
+    if (stats == NULL) return;
+    stats->tx_ok = tx_ok_count;
+    stats->tx_error = tx_error_count;
+    stats->rx_count = rx_count;
+    stats->last_tx_result = last_tx_result;
 }

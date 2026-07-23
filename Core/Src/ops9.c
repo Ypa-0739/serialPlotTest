@@ -6,11 +6,26 @@
  */
 #include "ops9.h"
 #include "usart.h" // 需要用到 huart2
+#include <math.h>
 
-// 暴露给外部使用的坐标变量（X向右为正，Y向前为正）
-float robot_x = 0.0f;
-float robot_y = 0.0f;
-float robot_yaw = 0.0f;
+/* OPS-9 每帧数据区包含 6 个小端 IEEE-754 float，下面是手册规定的索引。 */
+#define OPS9_INDEX_Z_ANGLE   0U
+#define OPS9_INDEX_POS_X     3U
+#define OPS9_INDEX_POS_Y     4U
+
+/* 车辆坐标与 OPS-9 原生坐标保持完全一致。 */
+volatile float robot_x = 0.0f;   // OPS X，单位 mm
+volatile float robot_y = 0.0f;   // OPS Y，单位 mm
+volatile float robot_yaw = 0.0f; // OPS Z 轴角度，单位 degree
+volatile uint32_t ops9_frame_count = 0U;
+volatile uint32_t ops9_invalid_frame_count = 0U;
+volatile uint32_t ops9_rx_byte_count = 0U;
+volatile uint32_t ops9_header_count = 0U;
+volatile uint32_t ops9_format_error_count = 0U;
+volatile uint32_t ops9_uart_error_count = 0U;
+volatile uint32_t ops9_last_update_tick = 0U;
+volatile uint32_t ops9_last_byte_tick = 0U;
+volatile uint8_t ops9_last_raw_byte = 0U;
 
 // 用于 HAL 库单字节接收的缓存
 uint8_t ops9_rx_byte;
@@ -35,6 +50,11 @@ void OPS9_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 
     	uint8_t ch = ops9_rx_byte;
 
+        /* 第一层诊断：只要 USART2 收到过电平正确的字节，这些计数就会增长。 */
+        ops9_rx_byte_count++;
+        ops9_last_raw_byte = ch;
+        ops9_last_byte_tick = HAL_GetTick();
+
         // 状态机解析 (参考官方手册附录)
         switch (count)
         {
@@ -48,10 +68,12 @@ void OPS9_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             case 1: // 等待帧头第二个字节 0x0A
                 if (ch == 0x0A) {
                     i = 0;
+                    ops9_header_count++;
                     count++;
                 } else if (ch == 0x0D) {
                     ; // 保持状态
                 } else {
+                    ops9_format_error_count++;
                     count = 0;
                 }
                 break;
@@ -68,27 +90,41 @@ void OPS9_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             case 3: // 等待帧尾第一个字节 0x0A
                 if (ch == 0x0A)
                     count++;
-                else
+                else {
+                    ops9_format_error_count++;
                     count = 0;
+                }
                 break;
 
             case 4: // 等待帧尾第二个字节 0x0D 并提取数据
                 if (ch == 0x0D)
                 {
-                    // 数据提取：航向角为 ActVal[0]，X为 ActVal[3]，Y为 ActVal[4] [cite: 557]
-                    float ops_zangle = posture.ActVal[0];
-                    float ops_pos_x  = posture.ActVal[3];
-                    float ops_pos_y  = posture.ActVal[4];
+                    float ops_zangle = posture.ActVal[OPS9_INDEX_Z_ANGLE];
+                    float ops_pos_x  = posture.ActVal[OPS9_INDEX_POS_X];
+                    float ops_pos_y  = posture.ActVal[OPS9_INDEX_POS_Y];
 
-                    // === 坐标系转换 (将OPS9的"Y前X右" 转为你的 "X前Y左") ===
-                    robot_x = ops_pos_x;    // OPS的Y(前) -> 你的X(前)
-                    robot_y = ops_pos_y;   // OPS的X(右) -> 你的Y(左)
-                    robot_yaw = ops_zangle; // 航向角 (假设逆时针为正，如需取反加负号即可)
+                    /*
+                     * 直接映射：OPS X -> 车辆 X，OPS Y -> 车辆 Y，OPS角度 -> 车辆航向角。
+                     * 不再进行旧注释中所说的 X/Y 交换或符号反转。
+                     */
+                    if (isfinite(ops_pos_x) && isfinite(ops_pos_y) && isfinite(ops_zangle)) {
+                        robot_x = ops_pos_x;
+                        robot_y = ops_pos_y;
+                        robot_yaw = ops_zangle;
+                        ops9_frame_count++;
+                        ops9_last_update_tick = HAL_GetTick();
+                    } else {
+                        /* 数据损坏时保留上一帧有效坐标，避免 NaN 进入 PID。 */
+                        ops9_invalid_frame_count++;
+                    }
+                } else {
+                    ops9_format_error_count++;
                 }
                 count = 0;
                 break;
 
             default:
+                ops9_format_error_count++;
                 count = 0;
                 break;
         }
@@ -99,8 +135,8 @@ void OPS9_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 void OPS9_Reset_Zero(void)
 {
-    // 通过 USART2 发送 "ACTO"，长度为 4 字节，超时时间 100ms
-    HAL_UART_Transmit(&huart2, (uint8_t *)"ACTO", 4, 100);
+    // OPS-9 manual: zero command is "ACT0" (digit zero).
+    HAL_UART_Transmit(&huart2, (uint8_t *)"ACT0", 4, 100);
 }
 
 

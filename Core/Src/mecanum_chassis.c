@@ -5,14 +5,15 @@
  *      Author: steph
  */
 /*
- * @brief  麦克纳姆轮运动学逆解算 (坐标系与 OPS-9 对齐)
- * @param  Vx: 沿 X 轴的速度 (正值向右平移，单位 m/s)
- * @param  Vy: 沿 Y 轴的速度 (正值向前平移，单位 m/s)
- * @param  Vz: 绕 Z 轴的角速度 (正值逆时针旋转，单位 rad/s)
+ * @brief  麦克纳姆轮车体速度逆解算
+ * @param  Vx: 车体向右速度，单位 m/s
+ * @param  Vy: 车体向前速度，单位 m/s
+ * @param  Vz: 沿 OPS 航向角正方向的角速度，单位 rad/s
  * @retval 算出各轮目标线速度，存入指针
  */
 #include "mecanum_chassis.h"
 #include "zdtEmm.h"
+#include <math.h>
 
 void Mecanum_Kinematics(float Vx, float Vy, float Vz, float *V_bl, float *V_fl, float *V_fr, float *V_br) {
     float L = (ROBOT_H / 2.0f) + (ROBOT_W / 2.0f);
@@ -36,6 +37,21 @@ float MsToRpm(float v_ms) {
  * @brief  设置 4 个轮子速度并下发至 CAN 节点
  */
 void SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
+    float max_abs = fabsf(V_bl);
+    float scale;
+
+    if (fabsf(V_fl) > max_abs) max_abs = fabsf(V_fl);
+    if (fabsf(V_fr) > max_abs) max_abs = fabsf(V_fr);
+    if (fabsf(V_br) > max_abs) max_abs = fabsf(V_br);
+    if (max_abs > MECANUM_MAX_WHEEL_SPEED_MPS) {
+        /* 四轮同时按比例缩放，保留期望的平移与旋转方向比例。 */
+        scale = MECANUM_MAX_WHEEL_SPEED_MPS / max_abs;
+        V_bl *= scale;
+        V_fl *= scale;
+        V_fr *= scale;
+        V_br *= scale;
+    }
+
     ZDT_Emm_SetSpeedByID(1, MsToRpm(V_bl));  // ID 1: 左后
     ZDT_Emm_SetSpeedByID(2, MsToRpm(V_fl));  // ID 2: 左前
     ZDT_Emm_SetSpeedByID(3, MsToRpm(V_fr));  // ID 3: 右前

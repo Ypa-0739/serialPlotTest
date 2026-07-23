@@ -1,0 +1,3 @@
+[submodule "llm-pid-tuner-main"]
+	path = llm-pid-tuner-main
+	url = git@github.com:stephenchiao/llm-pid-tuner.git

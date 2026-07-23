@@ -25,3 +25,4 @@ __pycache__/
 
 # llm-pid-tuner artifacts
 /llm-pid-tuner-main/artifacts/
+/tmp/

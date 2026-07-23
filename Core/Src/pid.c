@@ -55,44 +55,46 @@ void PID_Reset(PID_Controller *pid)
  * @param  current_val  传感器当前真实值 (如 OPS-9 的当前 X 坐标)
  * @return float        PID 计算输出的控制量 (如电机的目标速度)
  */
-float PID_Calc(PID_Controller *pid, float current_val)
+float PID_CalcError(PID_Controller *pid, float error)
 {
-    // 1. 计算当前偏差 (目标值 - 当前值)
-    pid->error = pid->target - current_val;
+    float candidate_integral = pid->integral;
+    float p_out;
+    float d_out;
+    float total_out;
 
-    // 2. 累加积分 (只有当需要积分时才算，防止浮点数越界)
-    if (pid->Ki != 0.0f)
-    {
-        pid->integral += pid->error;
+    pid->error = error;
+    p_out = pid->Kp * pid->error;
+    d_out = pid->Kd * (pid->error - pid->last_error);
 
-        // 积分抗饱和处理 (Anti-windup)
-        if (pid->integral > pid->max_integral) {
-            pid->integral = pid->max_integral;
-        } else if (pid->integral < -pid->max_integral) {
-            pid->integral = -pid->max_integral;
+    if (pid->Ki != 0.0f) {
+        candidate_integral += pid->error;
+        if (candidate_integral > pid->max_integral) {
+            candidate_integral = pid->max_integral;
+        } else if (candidate_integral < -pid->max_integral) {
+            candidate_integral = -pid->max_integral;
+        }
+
+        total_out = p_out + pid->Ki * candidate_integral + d_out;
+        /* 输出已经饱和且误差仍推动同一方向时暂停积分，避免停车后积分继续释放。 */
+        if (!((total_out > pid->max_out && pid->error > 0.0f) ||
+              (total_out < -pid->max_out && pid->error < 0.0f))) {
+            pid->integral = candidate_integral;
         }
     }
 
-    // 3. 计算 P, I, D 三项各自的输出
-    float p_out = pid->Kp * pid->error;
-    float i_out = pid->Ki * pid->integral;
-    float d_out = pid->Kd * (pid->error - pid->last_error);
-
-    // 4. 将三项相加，得到总输出
-    float total_out = p_out + i_out + d_out;
-
-    // 5. 整体输出限幅 (限制小车的最高速度)
+    total_out = p_out + pid->Ki * pid->integral + d_out;
     if (total_out > pid->max_out) {
         total_out = pid->max_out;
     } else if (total_out < -pid->max_out) {
         total_out = -pid->max_out;
     }
-
-    // 6. 记录本次偏差，作为下一次求微分的依据
     pid->last_error = pid->error;
-
-    // 7. 返回最终需要输出给执行机构的数值
     return total_out;
+}
+
+float PID_Calc(PID_Controller *pid, float current_val)
+{
+    return PID_CalcError(pid, pid->target - current_val);
 }
 
 

@@ -19,6 +19,18 @@ typedef struct {
     uint8_t enabled;
 } ZDT_Motor_t;
 
+typedef enum {
+    ZDT_PROTOCOL_EMM = 0,
+    ZDT_PROTOCOL_X = 1
+} ZDT_Protocol_t;
+
+typedef struct {
+    uint8_t motor_id;
+    uint8_t function_code;
+    uint8_t value;
+    float speed_rpm;
+} ZDT_MotorEvent_t;
+
 
 extern ZDT_Motor_t motors[4];
 
@@ -28,17 +40,21 @@ extern ZDT_Motor_t motors[4];
 #define MOTOR_ID_BR  4  // Back-Right 右后
 
 void ZDT_Emm_InitAll(void);
-void ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm);
-void ZDT_Emm_ReadSpeedByID(uint8_t id);
-void ZDT_Emm_EnableByID(uint8_t id);
+uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm);
+uint8_t ZDT_Emm_ReadSpeedByID(uint8_t id);
+uint8_t ZDT_Emm_ReadStatusByID(uint8_t id);
+uint8_t ZDT_Emm_EnableByID(uint8_t id);
 void ZDT_Emm_RxHandler(uint32_t ExtId, uint8_t *Data, uint8_t Len);
+void ZDT_Emm_SetProtocol(ZDT_Protocol_t protocol);
+ZDT_Protocol_t ZDT_Emm_GetProtocol(void);
+uint8_t ZDT_Emm_PollEvent(ZDT_MotorEvent_t *event);
 
 void ZDT_Emm_ReadPositionByID(uint8_t id);//读取单个电机位置
 
 int32_t ZDT_Emm_GetSingleMotorPosition(uint8_t id);//获取单个电机位置
 //调试用
-void ZDT_Emm_SetSingleMotorSpeed(uint8_t id, float speed_rpm);      // 设置单个电机速度
-void ZDT_Emm_ReadSingleMotorSpeed(uint8_t id);                       // 读取单个电机速度
-void ZDT_Emm_EnableSingleMotor(uint8_t id, uint8_t enable);          // 使能/失能单个电机
+uint8_t ZDT_Emm_SetSingleMotorSpeed(uint8_t id, float speed_rpm);
+uint8_t ZDT_Emm_ReadSingleMotorSpeed(uint8_t id);
+uint8_t ZDT_Emm_EnableSingleMotor(uint8_t id, uint8_t enable);
 float ZDT_Emm_GetSingleMotorSpeed(uint8_t id);                       // 获取单个电机实际速度
 #endif

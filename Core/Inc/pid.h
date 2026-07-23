@@ -38,6 +38,9 @@ void PID_Reset(PID_Controller *pid);
 // PID 核心计算函数 (放在定时器中断或主循环中周期性调用)
 float PID_Calc(PID_Controller *pid, float current_val);
 
+// 已由调用者计算好误差时使用，例如需要处理 +/-180 度环绕的航向环
+float PID_CalcError(PID_Controller *pid, float error);
+
 
 
 #endif /* INC_PID_H_ */
