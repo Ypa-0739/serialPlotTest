@@ -28,14 +28,14 @@
 /* USER CODE BEGIN Includes */
 #include "zdtCan.h"
 #include "zdtEmm.h"
-#include "serialPlot.h"
-#include "zdtUart.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include "mecanum_chassis.h"
 #include "ops9.h"
 #include "pid.h"
+#include "llm_tuner.h"
+#include "dm_g6220.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,41 +45,40 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LLM_TUNE_CONTROL_PERIOD_MS  20U
-#define LLM_TUNE_DURATION_MS        5000U
-#define LLM_TUNE_TARGET_MM          200.0f
-#define LLM_TUNE_TARGET_YAW_DEG     30.0f
-#define LLM_TUNE_MAX_SPEED_MPS      0.15f
-#define LLM_TUNE_SPEED_HARD_MAX_MPS 0.30f
-#define LLM_TUNE_MAX_ACCEL_MPS2     0.20f
-#define LLM_TUNE_MAX_DECEL_MPS2     0.40f
-#define LLM_TUNE_YAW_MAX_RADPS      0.30f
-#define LLM_TUNE_YAW_HARD_MAX_RADPS 0.80f
-#define LLM_TUNE_YAW_ACCEL_RADPS2   0.50f
-#define LLM_TUNE_YAW_DECEL_RADPS2   0.80f
-#define LLM_TUNE_OPS_TIMEOUT_MS     300U
-#define LLM_TUNE_HOST_TIMEOUT_MS    1500U
-#define LLM_TUNE_OVERTRAVEL_MM      50.0f
-#define LLM_TUNE_WRONG_DIR_MM       25.0f
-#define LLM_TUNE_MAX_YAW_ERROR_DEG  15.0f
-#define LLM_TUNE_POSITION_TOL_MM    5.0f
-#define LLM_TUNE_YAW_TOL_DEG        1.0f
-#define LLM_TUNE_SETTLE_CYCLES      10U
-#define LLM_POSE_POSITION_TOL_MM    2.0f
-#define LLM_POSE_YAW_TOL_DEG        0.5f
-#define LLM_POSE_SETTLE_CYCLES      15U
-#define LLM_TUNE_KP_MAX             0.005f
-#define LLM_TUNE_KI_MAX             0.00005f
-#define LLM_TUNE_KD_MAX             0.002f
-#define LLM_TUNE_YAW_KP_MAX         0.05f
-#define LLM_TUNE_YAW_KI_MAX         0.00010f
-#define LLM_TUNE_YAW_KD_MAX         0.02f
-#define LLM_TUNE_HOLD_LINEAR_MPS    0.10f
-#define LLM_TUNE_HOLD_YAW_RADPS     0.15f
+#define POSE_POSITION_TOL_MM    2.0f
+#define POSE_YAW_TOL_DEG        0.5f
+#define POSE_SETTLE_CYCLES      25U
+#define POSE_CONTROL_PERIOD_MS  20U
+#define POSE_DT_MAX_MS          100U
+#define POSE_TUNE_TIMEOUT_MS    15000U
+#define POSE_WORK_TIMEOUT_MS    35000U
+#define POSE_STOP_LINEAR_EPS_MPS 0.005f
+#define POSE_STOP_YAW_EPS_RADPS  0.010f
+/* POSE 平移规划参数：速度 m/s，加/减速度 m/s^2。 */
+#define POSE_SPEED_DEFAULT_MPS       0.15f
+#define POSE_SPEED_MIN_MPS           0.02f
+#define POSE_SPEED_HARD_MAX_MPS      0.30f
+#define POSE_ACCEL_DEFAULT_MPS2      0.20f
+#define POSE_ACCEL_MIN_MPS2          0.05f
+#define POSE_ACCEL_HARD_MAX_MPS2     0.80f
+#define POSE_DECEL_DEFAULT_MPS2      0.40f
+#define POSE_DECEL_MIN_MPS2          0.05f
+#define POSE_DECEL_HARD_MAX_MPS2     1.20f
+/* POSE 航向规划参数：速度 rad/s，加/减速度 rad/s^2。 */
+#define POSE_YAW_SPEED_DEFAULT_RADPS     0.30f
+#define POSE_YAW_SPEED_MIN_RADPS         0.02f
+#define POSE_YAW_SPEED_HARD_MAX_RADPS    0.80f
+#define POSE_YAW_ACCEL_DEFAULT_RADPS2    0.50f
+#define POSE_YAW_ACCEL_MIN_RADPS2        0.10f
+#define POSE_YAW_ACCEL_HARD_MAX_RADPS2   2.00f
+#define POSE_YAW_DECEL_DEFAULT_RADPS2    0.80f
+#define POSE_YAW_DECEL_MIN_RADPS2        0.10f
+#define POSE_YAW_DECEL_HARD_MAX_RADPS2   3.00f
+/* 单个 POSE 航点相对当前车体中心的硬行程边界，防止错误坐标导致长距离失控。 */
+#define POSE_TARGET_DISTANCE_HARD_MAX_MM 10000.0f
+#define POSE_RUNTIME_ERROR_HARD_MAX_MM   10500.0f
 #define OPS_CENTER_OFFSET_X_MM      0.0f
 #define OPS_CENTER_OFFSET_Y_MM      25.0f
-#define LLM_TUNE_CROSS_TRACK_MM     50.0f
-#define LLM_TUNE_YAW_TRANSLATION_MM 50.0f
 #define DEBUG_MOTOR_MAX_RPM         300.0f
 #define DEBUG_MOTOR_DEFAULT_MS      2000UL
 #define DEBUG_MOTOR_MAX_MS          10000UL
@@ -89,6 +88,20 @@
 #define DEBUG_MOVE_MAX_MS           3000UL
 #define DEBUG_TURN_DEFAULT_RADPS     0.15f
 #define DEBUG_TURN_MAX_RADPS         0.30f
+#define TELEMETRY_PERIOD_MS          50U
+#define TELEMETRY_STAGGER_MS         25U
+#define TELEMETRY_MASK_WHEEL         0x01U
+#define TELEMETRY_MASK_POSE          0x02U
+#define TELEMETRY_MASK_BOTH          (TELEMETRY_MASK_WHEEL | TELEMETRY_MASK_POSE)
+#define MOTOR_FEEDBACK_POLL_MS       10U
+#define HOST_PROTOCOL_VERSION        2U
+#define HOST_UART_TX_TIMEOUT_MS      20U
+#define G6220_CAN_ID                 0x01U
+#define G6220_MASTER_ID              0x00U
+#define G6220_CAN2_FILTER_BANK       14U
+#define G6220_SLAVE_FILTER_START     14U
+#define G6220_STARTUP_DELAY_MS       1000U
+#define G6220_COMMAND_DELAY_MS       50U
 
 /* USER CODE END PD */
 
@@ -111,34 +124,41 @@ float motor_actual_speed[4] = {0};  // 实际速度
 PID_Controller pid_x;
 PID_Controller pid_y;
 PID_Controller pid_yaw;
-// === LLM 自动调参状态机专属变量 ===
-uint8_t pc_rx_byte;                       // PC 串口单字节接收
+// === 主机串口命令接收状态 ===
+uint8_t pc_rx_byte;                       // 主机串口单字节接收
 char pc_rx_buf[64];                       // ISR 正在拼接的命令
 char pc_command_buf[64];                  // 主循环待处理的完整命令
 volatile uint8_t pc_rx_idx = 0;
 volatile uint8_t pc_command_ready = 0;
 
 typedef enum {
-    TUNE_STATE_WAIT = 0,     // 等待大模型参数状态
-    TUNE_STATE_RUN           // 正在运行测试状态
-} TuneState_t;
+    ROBOT_MODE_WORK = 0,
+    ROBOT_MODE_TUNE,
+    ROBOT_MODE_PLOT
+} RobotMode_t;
 
 typedef enum {
-    TUNE_AXIS_Y = 0,
-    TUNE_AXIS_X,
-    TUNE_AXIS_YAW
-} TuneAxis_t;
+    POSE_PHASE_IDLE = 0,
+    POSE_PHASE_TRANSLATE,
+    POSE_PHASE_ROTATE
+} PoseControlPhase_t;
 
-TuneState_t current_tune_state = TUNE_STATE_WAIT;
-TuneAxis_t current_tune_axis = TUNE_AXIS_Y;
-uint32_t tune_start_time = 0;
-uint32_t last_control_time = 0;
-float start_x_pos = 0.0f;
-float start_y_pos = 0.0f;
-float start_yaw_deg = 0.0f;
-float tune_direction = 1.0f;             // 每轮往返，避免一直驶离测试区域
-float tune_output = 0.0f;
-uint32_t tune_round_count = 0;
+typedef enum {
+    CHASSIS_MOTION_NONE = 0,
+    CHASSIS_MOTION_POSE,
+    CHASSIS_MOTION_TUNE_ROUND,
+    CHASSIS_MOTION_DEBUG_CHASSIS,
+    CHASSIS_MOTION_SINGLE_MOTOR
+} ChassisMotionType_t;
+
+typedef struct {
+    float linear_accel_mps2;
+    float linear_decel_mps2;
+    float yaw_accel_radps2;
+    float yaw_decel_radps2;
+} PoseMotionProfile_t;
+
+RobotMode_t current_robot_mode = ROBOT_MODE_WORK;
 uint8_t debug_motor_active = 0U;
 uint8_t debug_motor_id = 0U;
 uint32_t debug_motor_stop_tick = 0U;
@@ -147,48 +167,236 @@ uint32_t debug_chassis_stop_tick = 0U;
 uint8_t ops_monitor_enabled = 0U;
 uint32_t ops_monitor_last_tick = 0U;
 uint32_t last_host_command_tick = 0U;
-uint16_t tune_settle_cycles = 0U;
 uint8_t pose_control_active = 0U;
+PoseControlPhase_t pose_control_phase = POSE_PHASE_IDLE;
 float pose_target_x_mm = 0.0f;
 float pose_target_y_mm = 0.0f;
 float pose_target_yaw_deg = 0.0f;
+float pose_translation_yaw_deg = 0.0f;
 float pose_target_center_x_mm = 0.0f;
 float pose_target_center_y_mm = 0.0f;
 float pose_output_vx = 0.0f;
 float pose_output_vy = 0.0f;
 float pose_output_vz = 0.0f;
+float pose_target_vx = 0.0f;
+float pose_target_vy = 0.0f;
+float pose_target_vz = 0.0f;
 uint16_t pose_settle_cycles = 0U;
 uint32_t pose_last_control_time = 0U;
+uint32_t pose_start_time = 0U;
+PoseMotionProfile_t pose_motion_profile;
+uint8_t telemetry_mask = 0U;
+uint8_t telemetry_next_group = TELEMETRY_MASK_WHEEL;
+uint16_t telemetry_wheel_sequence = 0U;
+uint16_t telemetry_pose_sequence = 0U;
+uint32_t telemetry_last_tick = 0U;
+uint32_t telemetry_tx_ok = 0U;
+uint32_t telemetry_tx_error = 0U;
+uint8_t motor_feedback_poll_id = 1U;
+uint32_t motor_feedback_poll_tick = 0U;
+volatile uint32_t host_uart_tx_ok = 0U;
+volatile uint32_t host_uart_tx_error = 0U;
+DM_G6220_Motor_t g6220_motor;
+uint8_t g6220_initialized = 0U;
+uint8_t g6220_enable_requested = 0U;
+DM_G6220_Result_t g6220_last_result = DM_G6220_ERROR_PARAM;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static void LLM_ProcessCommand(void);
-static void LLM_StartTuneRound(void);
-static void LLM_StopTuneRound(const char *reason);
-static uint8_t LLM_ProcessDebugCommand(const char *command);
-static void LLM_ProcessMotorFeedback(void);
-static void LLM_PrintHelp(void);
-static void LLM_PrintOpsStatus(void);
-static float LLM_AngleErrorDeg(float current_deg, float reference_deg);
-static void LLM_OpsToChassisCenter(float ops_x_mm, float ops_y_mm, float yaw_deg,
-                                   float *center_x_mm, float *center_y_mm);
-static const char *LLM_TuneAxisName(TuneAxis_t axis);
-static PID_Controller *LLM_GetPidForAxis(TuneAxis_t axis);
-static PID_Controller *LLM_GetTunePid(void);
-static void LLM_ProcessPoseControl(uint32_t now);
+static void Host_ProcessCommand(void);
+static uint8_t Host_ProcessOperationalCommand(const char *command);
+static void Motor_ProcessFeedback(void);
+static void Host_PrintHelp(void);
+static void Ops_PrintStatus(void);
+static float Pose_AngleErrorDeg(float current_deg, float reference_deg);
+static void Pose_OpsToChassisCenter(float ops_x_mm, float ops_y_mm, float yaw_deg,
+                                    float *center_x_mm, float *center_y_mm);
+static void Pose_ProcessControl(uint32_t now);
+static void Telemetry_Process(uint32_t now);
+static void Motor_ProcessFeedbackPolling(uint32_t now);
+static void ChassisSafety_Process(uint32_t now);
+static const char *RobotMode_Name(RobotMode_t mode);
+static DM_G6220_Result_t G6220_SetEnabled(uint8_t enable);
+static void Pose_InitMotionProfile(void);
+static void Pose_ResetPlanner(void);
+static void Robot_StopAllMotion(void);
+static void Robot_SetMode(RobotMode_t mode);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static uint8_t LLM_IsValidMotorId(unsigned int id)
+static uint8_t Motor_IsValidId(unsigned int id)
 {
     return (id >= 1U && id <= 4U) ? 1U : 0U;
 }
 
-static float LLM_AngleErrorDeg(float current_deg, float reference_deg)
+static const char *RobotMode_Name(RobotMode_t mode)
+{
+    if (mode == ROBOT_MODE_TUNE) return "TUNE";
+    if (mode == ROBOT_MODE_PLOT) return "PLOT";
+    return "WORK";
+}
+
+static DM_G6220_Result_t G6220_SetEnabled(uint8_t enable)
+{
+    if (!g6220_initialized) {
+        g6220_last_result = DM_G6220_ERROR_PARAM;
+        return g6220_last_result;
+    }
+
+    g6220_last_result = DM_G6220_SendCommand(
+        &g6220_motor,
+        enable ? DM_G6220_CMD_ENABLE : DM_G6220_CMD_DISABLE);
+    if (g6220_last_result == DM_G6220_OK) {
+        g6220_enable_requested = enable ? 1U : 0U;
+    }
+    return g6220_last_result;
+}
+
+static void Robot_StopAllMotion(void)
+{
+    (void)StopAllMotors();
+    debug_motor_active = 0U;
+    debug_chassis_active = 0U;
+    pose_control_active = 0U;
+    Pose_ResetPlanner();
+    LLM_TunerAbort();
+    (void)G6220_SetEnabled(0U);
+    /* PID_Reset 只清运行历史，不修改已经调好的 Kp/Ki/Kd 和输出限幅。 */
+    PID_Reset(&pid_x);
+    PID_Reset(&pid_y);
+    PID_Reset(&pid_yaw);
+}
+
+static void Robot_SetMode(RobotMode_t mode)
+{
+    if (current_robot_mode == mode) {
+        if (mode == ROBOT_MODE_PLOT) telemetry_mask = TELEMETRY_MASK_BOTH;
+        if (mode == ROBOT_MODE_WORK) {
+            (void)G6220_SetEnabled(1U);
+        }
+        printf("# MODE %s PLOT=%u CHANGED=0\r\n",
+               RobotMode_Name(current_robot_mode), telemetry_mask != 0U);
+        return;
+    }
+
+    /* 模式切换是安全边界：先停掉旧模式的一切运动，再启用新模式输出。 */
+    Robot_StopAllMotion();
+    LLM_TunerResetSession();
+    current_robot_mode = mode;
+
+    if (mode == ROBOT_MODE_PLOT) {
+        telemetry_mask = TELEMETRY_MASK_BOTH;
+        telemetry_last_tick = HAL_GetTick();
+    } else if (mode == ROBOT_MODE_WORK) {
+        (void)G6220_SetEnabled(1U);
+    }
+
+    printf("# MODE %s PLOT=%u CHANGED=1 MOTION=STOPPED\r\n",
+           RobotMode_Name(current_robot_mode), telemetry_mask != 0U);
+}
+
+static ChassisMotionType_t ChassisSafety_GetActiveMotion(void)
+{
+    if (LLM_TunerIsRunning()) return CHASSIS_MOTION_TUNE_ROUND;
+    if (pose_control_active) return CHASSIS_MOTION_POSE;
+    if (debug_chassis_active) return CHASSIS_MOTION_DEBUG_CHASSIS;
+    if (debug_motor_active) return CHASSIS_MOTION_SINGLE_MOTOR;
+    return CHASSIS_MOTION_NONE;
+}
+
+static const char *ChassisSafety_MotionName(ChassisMotionType_t motion)
+{
+    if (motion == CHASSIS_MOTION_POSE) return "POSE";
+    if (motion == CHASSIS_MOTION_TUNE_ROUND) return "TUNE";
+    if (motion == CHASSIS_MOTION_DEBUG_CHASSIS) return "DEBUG_CHASSIS";
+    if (motion == CHASSIS_MOTION_SINGLE_MOTOR) return "SINGLE_MOTOR";
+    return "NONE";
+}
+
+static uint8_t ChassisSafety_CanReady(void)
+{
+    return (HAL_CAN_GetState(&hcan1) == HAL_CAN_STATE_LISTENING &&
+            HAL_CAN_GetError(&hcan1) == HAL_CAN_ERROR_NONE) ? 1U : 0U;
+}
+
+static uint8_t ChassisSafety_OpsReady(uint32_t now)
+{
+    uint32_t last_ops_tick = ops9_last_update_tick;
+    return (isfinite(robot_x) && isfinite(robot_y) && isfinite(robot_yaw) &&
+            ops9_frame_count > 0U &&
+            (uint32_t)(now - last_ops_tick) <= LLM_TUNE_OPS_TIMEOUT_MS) ? 1U : 0U;
+}
+
+static void ChassisSafety_Stop(ChassisMotionType_t motion, const char *reason)
+{
+    debug_motor_active = 0U;
+    debug_chassis_active = 0U;
+    pose_control_active = 0U;
+    Pose_ResetPlanner();
+    (void)G6220_SetEnabled(0U);
+    PID_Reset(&pid_x);
+    PID_Reset(&pid_y);
+    PID_Reset(&pid_yaw);
+
+    if (motion == CHASSIS_MOTION_TUNE_ROUND && LLM_TunerIsRunning()) {
+        LLM_TunerStopRound(reason);
+        return;
+    }
+
+    LLM_TunerAbort();
+    (void)StopAllMotors();
+    if (motion == CHASSIS_MOTION_POSE) {
+        printf("# POSE STOP SAFETY REASON=%s\r\n", reason);
+    } else {
+        printf("# MOTION STOP SAFETY TYPE=%s REASON=%s\r\n",
+               ChassisSafety_MotionName(motion), reason);
+    }
+}
+
+static void ChassisSafety_Process(uint32_t now)
+{
+    ChassisMotionType_t motion = ChassisSafety_GetActiveMotion();
+    uint8_t needs_ops;
+    uint8_t needs_host;
+
+    if (motion == CHASSIS_MOTION_NONE) return;
+
+    /* CAN状态和四轮实际发送结果对所有运动类型都是共同的硬安全边界。 */
+    if (!ChassisSafety_CanReady() ||
+        Mecanum_ConsumeCanTxFault()) {
+        ChassisSafety_Stop(motion, "CAN FAULT");
+        return;
+    }
+
+    /* 单电机悬空台架测试不依赖OPS；其余底盘运动都要求位姿链路有效。 */
+    needs_ops = (motion != CHASSIS_MOTION_SINGLE_MOTOR) ? 1U : 0U;
+    if (needs_ops && !ChassisSafety_OpsReady(now)) {
+        ChassisSafety_Stop(motion, "OPS LOST");
+        return;
+    }
+
+    /* 只有TUNE豁免心跳；WORK和PLOT中的任何运动仍由HOST LOST保护。 */
+    needs_host = (current_robot_mode != ROBOT_MODE_TUNE) ? 1U : 0U;
+    if (needs_host &&
+        (uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) {
+        ChassisSafety_Stop(motion, "HOST LOST");
+        return;
+    }
+
+    if (motion == CHASSIS_MOTION_POSE) {
+        uint32_t timeout_ms = (current_robot_mode == ROBOT_MODE_TUNE) ?
+                              POSE_TUNE_TIMEOUT_MS : POSE_WORK_TIMEOUT_MS;
+        if ((uint32_t)(now - pose_start_time) > timeout_ms) {
+            ChassisSafety_Stop(motion, "TIMEOUT");
+        }
+    }
+}
+
+static float Pose_AngleErrorDeg(float current_deg, float reference_deg)
 {
     float error = fmodf(current_deg - reference_deg + 180.0f, 360.0f);
     if (error < 0.0f) {
@@ -197,8 +405,8 @@ static float LLM_AngleErrorDeg(float current_deg, float reference_deg)
     return error - 180.0f;
 }
 
-static void LLM_OpsToChassisCenter(float ops_x_mm, float ops_y_mm, float yaw_deg,
-                                   float *center_x_mm, float *center_y_mm)
+static void Pose_OpsToChassisCenter(float ops_x_mm, float ops_y_mm, float yaw_deg,
+                                    float *center_x_mm, float *center_y_mm)
 {
     float yaw_rad = yaw_deg * (3.1415926f / 180.0f);
     float cos_yaw = cosf(yaw_rad);
@@ -217,63 +425,114 @@ static void LLM_OpsToChassisCenter(float ops_x_mm, float ops_y_mm, float yaw_deg
                     cos_yaw * OPS_CENTER_OFFSET_Y_MM);
 }
 
-static const char *LLM_TuneAxisName(TuneAxis_t axis)
-{
-    if (axis == TUNE_AXIS_X) return "X";
-    if (axis == TUNE_AXIS_YAW) return "YAW";
-    return "Y";
-}
-
-static PID_Controller *LLM_GetTunePid(void)
-{
-    return LLM_GetPidForAxis(current_tune_axis);
-}
-
-static PID_Controller *LLM_GetPidForAxis(TuneAxis_t axis)
-{
-    if (axis == TUNE_AXIS_X) return &pid_x;
-    if (axis == TUNE_AXIS_YAW) return &pid_yaw;
-    return &pid_y;
-}
-
-static float LLM_ClampFloat(float value, float min_value, float max_value)
+static float Math_ClampFloat(float value, float min_value, float max_value)
 {
     if (value > max_value) return max_value;
     if (value < min_value) return min_value;
     return value;
 }
 
-static float LLM_Slew(float current, float target, float max_step)
+static void Pose_InitMotionProfile(void)
+{
+    /* 默认值也经过硬边界裁剪，避免以后改宏时越过机械安全范围。 */
+    pose_motion_profile.linear_accel_mps2 =
+        Math_ClampFloat(POSE_ACCEL_DEFAULT_MPS2,
+                        POSE_ACCEL_MIN_MPS2,
+                        POSE_ACCEL_HARD_MAX_MPS2);
+    pose_motion_profile.linear_decel_mps2 =
+        Math_ClampFloat(POSE_DECEL_DEFAULT_MPS2,
+                        POSE_DECEL_MIN_MPS2,
+                        POSE_DECEL_HARD_MAX_MPS2);
+    pose_motion_profile.yaw_accel_radps2 =
+        Math_ClampFloat(POSE_YAW_ACCEL_DEFAULT_RADPS2,
+                        POSE_YAW_ACCEL_MIN_RADPS2,
+                        POSE_YAW_ACCEL_HARD_MAX_RADPS2);
+    pose_motion_profile.yaw_decel_radps2 =
+        Math_ClampFloat(POSE_YAW_DECEL_DEFAULT_RADPS2,
+                        POSE_YAW_DECEL_MIN_RADPS2,
+                        POSE_YAW_DECEL_HARD_MAX_RADPS2);
+}
+
+static void Pose_ResetPlanner(void)
+{
+    pose_control_phase = POSE_PHASE_IDLE;
+    pose_target_vx = 0.0f;
+    pose_target_vy = 0.0f;
+    pose_target_vz = 0.0f;
+    pose_output_vx = 0.0f;
+    pose_output_vy = 0.0f;
+    pose_output_vz = 0.0f;
+    pose_settle_cycles = 0U;
+    pose_last_control_time = HAL_GetTick();
+}
+
+static float Pose_SlewScalar(float current, float target, float max_step)
 {
     if (target > current + max_step) return current + max_step;
     if (target < current - max_step) return current - max_step;
     return target;
 }
 
-static float LLM_BrakeLimitLinear(float error_mm, float tolerance_mm)
+static void Pose_SlewVector2D(float current_x, float current_y,
+                              float target_x, float target_y,
+                              float accel_mps2, float decel_mps2, float dt_s,
+                              float *output_x, float *output_y)
 {
-    float remaining_m = (fabsf(error_mm) - tolerance_mm) / 1000.0f;
-    if (remaining_m <= 0.0f) return 0.0f;
-    return sqrtf(2.0f * LLM_TUNE_MAX_DECEL_MPS2 * remaining_m);
+    float current_speed = sqrtf(current_x * current_x + current_y * current_y);
+    float target_projection = 0.0f;
+    float delta_x = target_x - current_x;
+    float delta_y = target_y - current_y;
+    float delta_speed = sqrtf(delta_x * delta_x + delta_y * delta_y);
+    float rate = accel_mps2;
+    float max_delta;
+
+    if (current_speed > 0.0001f) {
+        target_projection = (current_x * target_x + current_y * target_y) /
+                            current_speed;
+        /* 反向、转弯或目标在当前速度方向上的投影变小，都按减速度约束。 */
+        if (target_projection < current_speed) {
+            rate = decel_mps2;
+        }
+    }
+
+    max_delta = rate * dt_s;
+    if (delta_speed > max_delta && delta_speed > 0.0001f) {
+        *output_x = current_x + delta_x * max_delta / delta_speed;
+        *output_y = current_y + delta_y * max_delta / delta_speed;
+    } else {
+        *output_x = target_x;
+        *output_y = target_y;
+    }
 }
 
-static float LLM_BrakeLimitYaw(float error_deg, float tolerance_deg)
+static float Pose_BrakeLimitLinear(float distance_mm, float tolerance_mm)
+{
+    float remaining_m = (distance_mm - tolerance_mm) / 1000.0f;
+    if (remaining_m <= 0.0f) return 0.0f;
+    return sqrtf(2.0f * pose_motion_profile.linear_decel_mps2 * remaining_m);
+}
+
+static float Pose_BrakeLimitYaw(float error_deg, float tolerance_deg)
 {
     float remaining_rad = (fabsf(error_deg) - tolerance_deg) *
                           (3.1415926f / 180.0f);
     if (remaining_rad <= 0.0f) return 0.0f;
-    return sqrtf(2.0f * LLM_TUNE_YAW_DECEL_RADPS2 * remaining_rad);
+    return sqrtf(2.0f * pose_motion_profile.yaw_decel_radps2 * remaining_rad);
 }
 
-static void LLM_PrintHelp(void)
+static void Host_PrintHelp(void)
 {
+    printf("# HELP PROTO VERSION | MODE WORK|TUNE|PLOT | MODE STATUS (default WORK; switching stops motion)\r\n");
     printf("# HELP STATUS | PING | STOP | RESET | OPS STATUS | OPS MONITOR ON|OFF | OPS ZERO\r\n");
     printf("# HELP PROTO EMM|X | CAN STATUS | MOTOR EN|DIS <id>\r\n");
     printf("# HELP MOTOR RUN <id> <signed_rpm> [ms] | MOTOR STOP <id>|ALL | MOTOR GET <id>\r\n");
     printf("# HELP MOVE FWD|BACK|LEFT|RIGHT [mps] [ms] | TURN CW|CCW [radps] [ms] | MOVE STOP\r\n");
     printf("# HELP POSE SET <x_mm> <y_mm> <yaw_deg> | POSE STOP | POSE STATUS\r\n");
-    printf("# HELP TUNE AXIS X|Y|YAW | TUNE LIMIT <mps_or_radps>\r\n");
+    printf("# HELP TUNE AXIS X|Y|YAW | TUNE LIMIT <mps_or_radps> | NO PING ROUND=5S POSE=15S ROUNDS=20\r\n");
     printf("# HELP PID SET X|Y|YAW <p> <i> <d> | PID LIMIT X|Y|YAW <value> | PID STATUS ALL\r\n");
+    printf("# HELP G6220 STATUS | G6220 ENABLE | G6220 DISABLE\r\n");
+    printf("# HELP TELEM OFF|WHEEL|POSE|BOTH|STATUS (two tagged 8-channel groups, 20Hz)\r\n");
+    printf("# HELP PLOT ON|OFF|STATUS (legacy alias for MODE PLOT + TELEM BOTH)\r\n");
     printf("# LIMIT motor id=1..4 rpm=+/-%.0f duration=100..%lu ms\r\n",
            DEBUG_MOTOR_MAX_RPM, DEBUG_MOTOR_MAX_MS);
     printf("# LIMIT move speed=0..%.2f mps duration=100..%lu ms; FWD=+Y LEFT=-X\r\n",
@@ -282,7 +541,66 @@ static void LLM_PrintHelp(void)
            DEBUG_TURN_MAX_RADPS, DEBUG_MOVE_MAX_MS);
 }
 
-static void LLM_PrintOpsStatus(void)
+static void Motor_ProcessFeedbackPolling(uint32_t now)
+{
+    uint8_t result;
+
+    if ((telemetry_mask & TELEMETRY_MASK_WHEEL) == 0U ||
+        (uint32_t)(now - motor_feedback_poll_tick) < MOTOR_FEEDBACK_POLL_MS) {
+        return;
+    }
+
+    motor_feedback_poll_tick = now;
+    result = ZDT_Emm_ReadSpeedByID(motor_feedback_poll_id);
+    Mecanum_ReportCanTxResult(result);
+    motor_feedback_poll_id++;
+    if (motor_feedback_poll_id > 4U) motor_feedback_poll_id = 1U;
+}
+
+static void Telemetry_Process(uint32_t now)
+{
+    uint8_t group;
+    uint32_t period_ms;
+    int written;
+
+    if (telemetry_mask == 0U) return;
+    period_ms = (telemetry_mask == TELEMETRY_MASK_BOTH) ?
+                TELEMETRY_STAGGER_MS : TELEMETRY_PERIOD_MS;
+    if ((uint32_t)(now - telemetry_last_tick) < period_ms) return;
+    telemetry_last_tick = now;
+
+    if (telemetry_mask == TELEMETRY_MASK_BOTH) {
+        group = telemetry_next_group;
+        telemetry_next_group = (group == TELEMETRY_MASK_WHEEL) ?
+                               TELEMETRY_MASK_POSE : TELEMETRY_MASK_WHEEL;
+    } else {
+        group = telemetry_mask;
+    }
+
+    if (group == TELEMETRY_MASK_WHEEL) {
+        written = printf("@W,1,%lu,%u,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\r\n",
+                         (unsigned long)now, telemetry_wheel_sequence++,
+                         motors[0].target_speed, motors[1].target_speed,
+                         motors[2].target_speed, motors[3].target_speed,
+                         motors[0].actual_speed, motors[1].actual_speed,
+                         motors[2].actual_speed, motors[3].actual_speed);
+    } else {
+        float center_x;
+        float center_y;
+        Pose_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
+        written = printf("@P,1,%lu,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f\r\n",
+                         (unsigned long)now, telemetry_pose_sequence++,
+                         robot_x, robot_y, robot_yaw, center_x, center_y,
+                         pose_control_active ? pose_output_vx : 0.0f,
+                         pose_control_active ? pose_output_vy : 0.0f,
+                         pose_control_active ? pose_output_vz : 0.0f);
+    }
+
+    if (written > 0) telemetry_tx_ok++;
+    else telemetry_tx_error++;
+}
+
+static void Ops_PrintStatus(void)
 {
     /* 先读取中断更新的时间戳，再读取当前时间，避免无符号减法下溢。 */
     uint32_t last_byte_tick = ops9_last_byte_tick;
@@ -305,7 +623,7 @@ static void LLM_PrintOpsStatus(void)
     else if (frame_age > LLM_TUNE_OPS_TIMEOUT_MS) link = "STALE";
     else link = "OK";
 
-    LLM_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
+    Pose_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
     printf("# OPS LINK=%s X=%.2f Y=%.2f YAW=%.2f CENTER_X=%.2f CENTER_Y=%.2f "
            "OFFSET_X=%.2f OFFSET_Y=%.2f BYTES=%lu HEADERS=%lu "
            "FRAMES=%lu INVALID=%lu FORMAT_ERR=%lu UART_ERR=%lu "
@@ -322,12 +640,16 @@ static void LLM_PrintOpsStatus(void)
            ops9_last_raw_byte);
 }
 
-static void LLM_ProcessMotorFeedback(void)
+static void Motor_ProcessFeedback(void)
 {
     ZDT_MotorEvent_t event;
     while (ZDT_Emm_PollEvent(&event)) {
         if (event.function_code == 0x35U) {
-            printf("# MOTOR SPEED ID=%u RPM=%.1f\r\n", event.motor_id, event.speed_rpm);
+            /* 周期轮询由@W遥测承载；仅在未开四轮遥测时打印人工MOTOR GET回复。 */
+            if ((telemetry_mask & TELEMETRY_MASK_WHEEL) == 0U) {
+                printf("# MOTOR SPEED ID=%u RPM=%.1f\r\n",
+                       event.motor_id, event.speed_rpm);
+            }
         } else if (event.function_code == 0x3AU) {
             printf("# MOTOR STATE ID=%u EN=%u REACHED=%u STALL=%u PROTECT=%u RAW=0x%02X\r\n",
                    event.motor_id,
@@ -355,10 +677,10 @@ static void LLM_ProcessMotorFeedback(void)
     }
 }
 
-static uint8_t LLM_ProcessDebugCommand(const char *command)
+static uint8_t Host_ProcessOperationalCommand(const char *command)
 {
     unsigned int id;
-    float rpm;
+    float rpm = 0.0f;
     unsigned long duration_ms = DEBUG_MOTOR_DEFAULT_MS;
     unsigned long move_duration_ms = DEBUG_MOVE_DEFAULT_MS;
     char move_direction[8];
@@ -370,17 +692,105 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
     float v1, v2, v3, v4;
     float pose_x, pose_y, pose_yaw;
     float center_x, center_y;
+    float target_distance_mm;
     int fields;
     uint8_t result_a;
     uint8_t result_b;
+    DM_G6220_Feedback_t g6220_feedback;
+    DM_G6220_Result_t g6220_result;
 
     if (strcmp(command, "PING") == 0) {
         printf("# PONG\r\n");
         return 1U;
     }
 
+    if (strcmp(command, "PROTO VERSION") == 0) {
+        printf("# PROTO VERSION=%u MODES=WORK,TUNE,PLOT LEGACY_POSE=1\r\n",
+               HOST_PROTOCOL_VERSION);
+        return 1U;
+    }
+
+    if (strcmp(command, "MODE STATUS") == 0) {
+        printf("# MODE %s PLOT=%u TUNE_STATE=%u POSE_ACTIVE=%u\r\n",
+               RobotMode_Name(current_robot_mode), telemetry_mask != 0U,
+               (unsigned int)LLM_TunerGetState(), pose_control_active);
+        return 1U;
+    }
+
+    if (strcmp(command, "MODE WORK") == 0) {
+        Robot_SetMode(ROBOT_MODE_WORK);
+        return 1U;
+    }
+
+    if (strcmp(command, "MODE TUNE") == 0) {
+        Robot_SetMode(ROBOT_MODE_TUNE);
+        return 1U;
+    }
+
+    if (strcmp(command, "MODE PLOT") == 0) {
+        Robot_SetMode(ROBOT_MODE_PLOT);
+        printf("# PLOT ON LEGACY=1 TELEM=BOTH FORMAT=TAGGED_ASCII GROUPS=W8,P8 PERIOD=50MS\r\n");
+        return 1U;
+    }
+
+    if (strcmp(command, "PLOT ON") == 0) {
+        /* 兼容旧命令：PLOT ON 等价于安全切换到独立 PLOT 模式。 */
+        Robot_SetMode(ROBOT_MODE_PLOT);
+        printf("# PLOT ON LEGACY=1 TELEM=BOTH FORMAT=TAGGED_ASCII GROUPS=W8,P8 PERIOD=50MS\r\n");
+        return 1U;
+    }
+
+    if (strcmp(command, "PLOT OFF") == 0) {
+        uint32_t tx_ok = telemetry_tx_ok;
+        uint32_t tx_error = telemetry_tx_error;
+        telemetry_mask = 0U;
+        Robot_SetMode(ROBOT_MODE_WORK);
+        printf("# PLOT OFF TX_OK=%lu TX_ERR=%lu\r\n",
+               (unsigned long)tx_ok, (unsigned long)tx_error);
+        return 1U;
+    }
+
+    if (strcmp(command, "PLOT STATUS") == 0) {
+        printf("# PLOT ENABLED=%u MODE=%s LEGACY=1 TELEM_MASK=%u "
+               "FORMAT=TAGGED_ASCII GROUPS=W8,P8 PERIOD=50MS TX_OK=%lu TX_ERR=%lu\r\n",
+               telemetry_mask != 0U, RobotMode_Name(current_robot_mode),
+               telemetry_mask, (unsigned long)telemetry_tx_ok,
+               (unsigned long)telemetry_tx_error);
+        return 1U;
+    }
+
+    if (strcmp(command, "TELEM STATUS") == 0) {
+        printf("# TELEM MASK=%u WHEEL=%u POSE=%u PERIOD=50MS FORMAT=TAGGED_ASCII "
+               "W_SEQ=%u P_SEQ=%u TX_OK=%lu TX_ERR=%lu\r\n",
+               telemetry_mask,
+               (telemetry_mask & TELEMETRY_MASK_WHEEL) != 0U,
+               (telemetry_mask & TELEMETRY_MASK_POSE) != 0U,
+               telemetry_wheel_sequence, telemetry_pose_sequence,
+               (unsigned long)telemetry_tx_ok,
+               (unsigned long)telemetry_tx_error);
+        return 1U;
+    }
+
+    if (strcmp(command, "TELEM OFF") == 0 ||
+        strcmp(command, "TELEM WHEEL") == 0 ||
+        strcmp(command, "TELEM POSE") == 0 ||
+        strcmp(command, "TELEM BOTH") == 0) {
+        if (strcmp(command, "TELEM OFF") == 0) telemetry_mask = 0U;
+        else if (strcmp(command, "TELEM WHEEL") == 0) telemetry_mask = TELEMETRY_MASK_WHEEL;
+        else if (strcmp(command, "TELEM POSE") == 0) telemetry_mask = TELEMETRY_MASK_POSE;
+        else telemetry_mask = TELEMETRY_MASK_BOTH;
+        telemetry_last_tick = HAL_GetTick();
+        telemetry_next_group = TELEMETRY_MASK_WHEEL;
+        motor_feedback_poll_tick = telemetry_last_tick;
+        printf("# TELEM MASK=%u WHEEL=%u POSE=%u FORMAT=TAGGED_ASCII GROUPS=W8,P8\r\n",
+               telemetry_mask,
+               (telemetry_mask & TELEMETRY_MASK_WHEEL) != 0U,
+               (telemetry_mask & TELEMETRY_MASK_POSE) != 0U);
+        return 1U;
+    }
+
     if (strcmp(command, "HELP") == 0) {
-        LLM_PrintHelp();
+        Host_PrintHelp();
         return 1U;
     }
 
@@ -389,7 +799,8 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
         debug_motor_active = 0U;
         debug_chassis_active = 0U;
         pose_control_active = 0U;
-        current_tune_state = TUNE_STATE_WAIT;
+        Pose_ResetPlanner();
+        LLM_TunerAbort();
         ZDT_Emm_SetProtocol((strcmp(command, "PROTO X") == 0) ? ZDT_PROTOCOL_X : ZDT_PROTOCOL_EMM);
         StopAllMotors();
         printf("# PROTOCOL %s\r\n", ZDT_Emm_GetProtocol() == ZDT_PROTOCOL_X ? "X" : "EMM");
@@ -408,8 +819,51 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
         return 1U;
     }
 
+    if (strcmp(command, "G6220 STATUS") == 0) {
+        (void)DM_G6220_GetFeedback(&g6220_motor, &g6220_feedback);
+        printf("# G6220 INIT=%u ENABLE_REQ=%u CAN_STATE=%u CAN_ERR=0x%08lX "
+               "TX_OK=%lu TX_ERR=%lu RX_OK=%lu RX_IGN=%lu LAST=%u ",
+               g6220_initialized, g6220_enable_requested,
+               (unsigned int)HAL_CAN_GetState(&hcan2),
+               (unsigned long)HAL_CAN_GetError(&hcan2),
+               (unsigned long)g6220_motor.tx_ok,
+               (unsigned long)g6220_motor.tx_error,
+               (unsigned long)g6220_motor.rx_ok,
+               (unsigned long)g6220_motor.rx_ignored,
+               (unsigned int)g6220_last_result);
+        if (g6220_motor.rx_ok > 0U) {
+            printf("STATE=%u POS=%.4f VEL=%.4f TORQUE=%.3f MOS=%.1f ROTOR=%.1f AGE=%luMS\r\n",
+                   (unsigned int)g6220_feedback.state,
+                   g6220_feedback.position_rad,
+                   g6220_feedback.velocity_radps,
+                   g6220_feedback.torque_nm,
+                   g6220_feedback.mos_temperature_c,
+                   g6220_feedback.rotor_temperature_c,
+                   (unsigned long)(HAL_GetTick() - g6220_feedback.update_tick_ms));
+        } else {
+            printf("STATE=NO_FEEDBACK\r\n");
+        }
+        return 1U;
+    }
+
+    if (strcmp(command, "G6220 ENABLE") == 0) {
+        if (current_robot_mode != ROBOT_MODE_WORK) {
+            printf("# ERROR G6220 ENABLE REQUIRES MODE WORK\r\n");
+        } else {
+            g6220_result = G6220_SetEnabled(1U);
+            printf("# G6220 ENABLE RESULT=%u\r\n", (unsigned int)g6220_result);
+        }
+        return 1U;
+    }
+
+    if (strcmp(command, "G6220 DISABLE") == 0) {
+        g6220_result = G6220_SetEnabled(0U);
+        printf("# G6220 DISABLE RESULT=%u\r\n", (unsigned int)g6220_result);
+        return 1U;
+    }
+
     if (strcmp(command, "OPS STATUS") == 0) {
-        LLM_PrintOpsStatus();
+        Ops_PrintStatus();
         return 1U;
     }
 
@@ -434,22 +888,28 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
 
     if (strcmp(command, "POSE STOP") == 0) {
         pose_control_active = 0U;
-        pose_output_vx = 0.0f;
-        pose_output_vy = 0.0f;
-        pose_output_vz = 0.0f;
+        Pose_ResetPlanner();
+        PID_Reset(&pid_x);
+        PID_Reset(&pid_y);
+        PID_Reset(&pid_yaw);
+        /* 保持现有取消协议语义：收到 POSE STOP 后立即确认已经零速。 */
         StopAllMotors();
         printf("# POSE STOP\r\n");
         return 1U;
     }
 
     if (strcmp(command, "POSE STATUS") == 0) {
-        LLM_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
+        Pose_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
         printf("# POSE ACTIVE=%u TARGET_X=%.2f TARGET_Y=%.2f TARGET_YAW=%.2f "
                "TARGET_CENTER_X=%.2f TARGET_CENTER_Y=%.2f "
-               "X=%.2f Y=%.2f YAW=%.2f CENTER_X=%.2f CENTER_Y=%.2f\r\n",
+               "X=%.2f Y=%.2f YAW=%.2f CENTER_X=%.2f CENTER_Y=%.2f "
+               "CMD_VX=%.3f CMD_VY=%.3f CMD_VZ=%.3f "
+               "PLAN_VX=%.3f PLAN_VY=%.3f PLAN_VZ=%.3f\r\n",
                pose_control_active, pose_target_x_mm, pose_target_y_mm,
                pose_target_yaw_deg, pose_target_center_x_mm, pose_target_center_y_mm,
-               robot_x, robot_y, robot_yaw, center_x, center_y);
+               robot_x, robot_y, robot_yaw, center_x, center_y,
+               pose_target_vx, pose_target_vy, pose_target_vz,
+               pose_output_vx, pose_output_vy, pose_output_vz);
         return 1U;
     }
 
@@ -457,16 +917,22 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
         uint32_t last_ops_tick = ops9_last_update_tick;
         uint32_t now = HAL_GetTick();
         if (!isfinite(pose_x) || !isfinite(pose_y) || !isfinite(pose_yaw)) {
+            pose_control_active = 0U;
+            Pose_ResetPlanner();
+            StopAllMotors();
             printf("# ERROR POSE VALUE\r\n");
         } else if (ops9_frame_count == 0U ||
                    (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS) {
+            pose_control_active = 0U;
+            Pose_ResetPlanner();
             StopAllMotors();
             printf("# ERROR OPS NOT READY\r\n");
         } else {
             debug_motor_active = 0U;
             debug_chassis_active = 0U;
-            current_tune_state = TUNE_STATE_WAIT;
+            LLM_TunerAbort();
             StopAllMotors();
+            /* 只清积分和误差历史，调好的 Kp/Ki/Kd 会原样保留。 */
             PID_Reset(&pid_x);
             PID_Reset(&pid_y);
             PID_Reset(&pid_yaw);
@@ -474,25 +940,42 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
              * POSE SET 继续接收 OPS 原始目标坐标，保证现有上位机命令兼容；
              * 内部按目标航向换算成车体中心目标，再用中心坐标闭环。
              */
-            LLM_OpsToChassisCenter(pose_x, pose_y, pose_yaw,
-                                   &pose_target_center_x_mm,
-                                   &pose_target_center_y_mm);
+            Pose_OpsToChassisCenter(pose_x, pose_y, pose_yaw,
+                                    &pose_target_center_x_mm,
+                                    &pose_target_center_y_mm);
+            Pose_OpsToChassisCenter(robot_x, robot_y, robot_yaw,
+                                    &center_x, &center_y);
+            target_distance_mm = sqrtf(
+                (pose_target_center_x_mm - center_x) *
+                (pose_target_center_x_mm - center_x) +
+                (pose_target_center_y_mm - center_y) *
+                (pose_target_center_y_mm - center_y));
+            if (!isfinite(target_distance_mm) ||
+                target_distance_mm > POSE_TARGET_DISTANCE_HARD_MAX_MM) {
+                pose_control_active = 0U;
+                Pose_ResetPlanner();
+                StopAllMotors();
+                printf("# ERROR POSE OUT OF BOUNDS DISTANCE_MM=%.2f MAX_MM=%.2f\r\n",
+                       target_distance_mm, POSE_TARGET_DISTANCE_HARD_MAX_MM);
+                return 1U;
+            }
             PID_SetTarget(&pid_x, pose_target_center_x_mm);
             PID_SetTarget(&pid_y, pose_target_center_y_mm);
             pose_target_x_mm = pose_x;
             pose_target_y_mm = pose_y;
             pose_target_yaw_deg = pose_yaw;
-            pose_output_vx = 0.0f;
-            pose_output_vy = 0.0f;
-            pose_output_vz = 0.0f;
-            pose_settle_cycles = 0U;
+            pose_translation_yaw_deg = robot_yaw;
+            Mecanum_ClearCanTxFault();
+            Pose_ResetPlanner();
             pose_last_control_time = now;
+            pose_start_time = now;
+            pose_control_phase = POSE_PHASE_TRANSLATE;
             pose_control_active = 1U;
             printf("# POSE START X=%.2f Y=%.2f YAW=%.2f "
                    "CENTER_X=%.2f CENTER_Y=%.2f TOL_MM=%.2f TOL_YAW=%.2f\r\n",
                    pose_x, pose_y, pose_yaw,
                    pose_target_center_x_mm, pose_target_center_y_mm,
-                   LLM_POSE_POSITION_TOL_MM, LLM_POSE_YAW_TOL_DEG);
+                   POSE_POSITION_TOL_MM, POSE_YAW_TOL_DEG);
         }
         return 1U;
     }
@@ -502,7 +985,8 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
         debug_motor_active = 0U;
         debug_chassis_active = 0U;
         pose_control_active = 0U;
-        current_tune_state = TUNE_STATE_WAIT;
+        Pose_ResetPlanner();
+        LLM_TunerAbort();
         printf("# MOTOR STOP ALL\r\n");
         return 1U;
     }
@@ -512,7 +996,8 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
         debug_motor_active = 0U;
         debug_chassis_active = 0U;
         pose_control_active = 0U;
-        current_tune_state = TUNE_STATE_WAIT;
+        Pose_ResetPlanner();
+        LLM_TunerAbort();
         printf("# MOVE STOP\r\n");
         return 1U;
     }
@@ -537,11 +1022,24 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
             return 1U;
         }
 
+        /* 调试运动仅限 TUNE/PLOT；WORK 模式下唯一运动源是 POSE SET（受心跳与安全检查保护）。 */
+        if (current_robot_mode == ROBOT_MODE_WORK) {
+            printf("# ERROR MODE REQUIRED=TUNE|PLOT CURRENT=WORK\r\n");
+            return 1U;
+        }
+        if (!ChassisSafety_CanReady() || !ChassisSafety_OpsReady(HAL_GetTick())) {
+            printf("# ERROR DEBUG CHASSIS SAFETY CAN=%u OPS=%u\r\n",
+                   ChassisSafety_CanReady(), ChassisSafety_OpsReady(HAL_GetTick()));
+            return 1U;
+        }
+
         /* 旋转测试只给 Vz，低速且定时自动停止，用于检查四轮旋转组合和OPS航向。 */
         StopAllMotors();
         debug_motor_active = 0U;
         pose_control_active = 0U;
-        current_tune_state = TUNE_STATE_WAIT;
+        Pose_ResetPlanner();
+        LLM_TunerAbort();
+        Mecanum_ClearCanTxFault();
         Mecanum_Kinematics(0.0f, 0.0f, vz, &v1, &v2, &v3, &v4);
         SetAllMotorsSpeed(v1, v2, v3, v4);
         debug_chassis_active = 1U;
@@ -574,10 +1072,23 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
             return 1U;
         }
 
+        /* 调试运动仅限 TUNE/PLOT；WORK 模式下唯一运动源是 POSE SET（受心跳与安全检查保护）。 */
+        if (current_robot_mode == ROBOT_MODE_WORK) {
+            printf("# ERROR MODE REQUIRED=TUNE|PLOT CURRENT=WORK\r\n");
+            return 1U;
+        }
+        if (!ChassisSafety_CanReady() || !ChassisSafety_OpsReady(HAL_GetTick())) {
+            printf("# ERROR DEBUG CHASSIS SAFETY CAN=%u OPS=%u\r\n",
+                   ChassisSafety_CanReady(), ChassisSafety_OpsReady(HAL_GetTick()));
+            return 1U;
+        }
+
         StopAllMotors();
         debug_motor_active = 0U;
         pose_control_active = 0U;
-        current_tune_state = TUNE_STATE_WAIT;
+        Pose_ResetPlanner();
+        LLM_TunerAbort();
+        Mecanum_ClearCanTxFault();
         Mecanum_Kinematics(vx, vy, 0.0f, &v1, &v2, &v3, &v4);
         SetAllMotorsSpeed(v1, v2, v3, v4);
         debug_chassis_active = 1U;
@@ -588,7 +1099,7 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
     }
 
     if (sscanf(command, "MOTOR EN %u", &id) == 1) {
-        if (!LLM_IsValidMotorId(id)) {
+        if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
             result_a = ZDT_Emm_EnableSingleMotor((uint8_t)id, 1U);
@@ -598,7 +1109,7 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
     }
 
     if (sscanf(command, "MOTOR DIS %u", &id) == 1) {
-        if (!LLM_IsValidMotorId(id)) {
+        if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
             ZDT_Emm_SetSingleMotorSpeed((uint8_t)id, 0.0f);
@@ -610,7 +1121,7 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
     }
 
     if (sscanf(command, "MOTOR STOP %u", &id) == 1) {
-        if (!LLM_IsValidMotorId(id)) {
+        if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
             result_a = ZDT_Emm_SetSingleMotorSpeed((uint8_t)id, 0.0f);
@@ -621,7 +1132,7 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
     }
 
     if (sscanf(command, "MOTOR GET %u", &id) == 1) {
-        if (!LLM_IsValidMotorId(id)) {
+        if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
             result_a = ZDT_Emm_ReadSingleMotorSpeed((uint8_t)id);
@@ -634,17 +1145,28 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
 
     fields = sscanf(command, "MOTOR RUN %u %f %lu", &id, &rpm, &duration_ms);
     if (fields >= 2) {
-        if (!LLM_IsValidMotorId(id)) {
+        if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else if (!isfinite(rpm) || rpm == 0.0f || fabsf(rpm) > DEBUG_MOTOR_MAX_RPM) {
             printf("# ERROR RPM RANGE +/-%.0f NONZERO\r\n", DEBUG_MOTOR_MAX_RPM);
         } else if (duration_ms < 100UL || duration_ms > DEBUG_MOTOR_MAX_MS) {
             printf("# ERROR DURATION 100..%lu MS\r\n", DEBUG_MOTOR_MAX_MS);
         } else {
+            /* 调试运动仅限 TUNE/PLOT；WORK 模式下唯一运动源是 POSE SET（受心跳与安全检查保护）。 */
+            if (current_robot_mode == ROBOT_MODE_WORK) {
+                printf("# ERROR MODE REQUIRED=TUNE|PLOT CURRENT=WORK\r\n");
+                return 1U;
+            }
+            if (!ChassisSafety_CanReady()) {
+                printf("# ERROR MOTOR RUN CAN NOT READY\r\n");
+                return 1U;
+            }
             StopAllMotors();
             debug_chassis_active = 0U;
             pose_control_active = 0U;
-            current_tune_state = TUNE_STATE_WAIT;
+            Pose_ResetPlanner();
+            LLM_TunerAbort();
+            Mecanum_ClearCanTxFault();
             result_a = ZDT_Emm_EnableSingleMotor((uint8_t)id, 1U);
             HAL_Delay(5);
             result_b = ZDT_Emm_SetSingleMotorSpeed((uint8_t)id, rpm);
@@ -664,7 +1186,7 @@ static uint8_t LLM_ProcessDebugCommand(const char *command)
     return 0U;
 }
 
-static void LLM_ProcessPoseControl(uint32_t now)
+static void Pose_ProcessControl(uint32_t now)
 {
     float current_ops_x;
     float current_ops_y;
@@ -674,7 +1196,9 @@ static void LLM_ProcessPoseControl(uint32_t now)
     float error_x;
     float error_y;
     float error_yaw;
+    float yaw_reference_deg;
     float distance_mm;
+    float linear_speed;
     float world_vx;
     float world_vy;
     float world_speed;
@@ -684,51 +1208,88 @@ static void LLM_ProcessPoseControl(uint32_t now)
     float body_vy;
     float desired_vz;
     float yaw_limit;
-    float step_linear;
     float step_yaw;
-    float delta_vx;
-    float delta_vy;
-    float delta_v;
-    float target_linear_speed;
-    float current_linear_speed;
+    float yaw_rate;
+    float dt_s;
     float v1, v2, v3, v4;
     uint32_t last_ops_tick;
+    uint32_t elapsed_ms;
+    uint32_t can_error;
+    HAL_CAN_StateTypeDef can_state;
 
-    if (!pose_control_active ||
-        (uint32_t)(now - pose_last_control_time) < LLM_TUNE_CONTROL_PERIOD_MS) {
+    if (!pose_control_active) {
         return;
     }
 
     last_ops_tick = ops9_last_update_tick;
     now = HAL_GetTick();
-    pose_last_control_time += LLM_TUNE_CONTROL_PERIOD_MS;
     current_ops_x = robot_x;
     current_ops_y = robot_y;
     current_yaw = robot_yaw;
+    can_state = HAL_CAN_GetState(&hcan1);
+    can_error = HAL_CAN_GetError(&hcan1);
 
     if (!isfinite(current_ops_x) || !isfinite(current_ops_y) || !isfinite(current_yaw) ||
         ops9_frame_count == 0U ||
         (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS ||
-        (uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) {
+        (current_robot_mode != ROBOT_MODE_TUNE &&
+         (uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) ||
+        (current_robot_mode == ROBOT_MODE_TUNE &&
+         (uint32_t)(now - pose_start_time) > POSE_TUNE_TIMEOUT_MS) ||
+        can_state != HAL_CAN_STATE_LISTENING || can_error != HAL_CAN_ERROR_NONE) {
         pose_control_active = 0U;
+        Pose_ResetPlanner();
         StopAllMotors();
+        (void)G6220_SetEnabled(0U);
+        PID_Reset(&pid_x);
+        PID_Reset(&pid_y);
+        PID_Reset(&pid_yaw);
         printf("# POSE STOP SAFETY\r\n");
         return;
     }
 
-    LLM_OpsToChassisCenter(current_ops_x, current_ops_y, current_yaw,
-                           &current_x, &current_y);
+    Pose_OpsToChassisCenter(current_ops_x, current_ops_y, current_yaw,
+                            &current_x, &current_y);
     error_x = pose_target_center_x_mm - current_x;
     error_y = pose_target_center_y_mm - current_y;
-    error_yaw = LLM_AngleErrorDeg(pose_target_yaw_deg, current_yaw);
+    yaw_reference_deg = (pose_control_phase == POSE_PHASE_TRANSLATE) ?
+                        pose_translation_yaw_deg : pose_target_yaw_deg;
+    error_yaw = Pose_AngleErrorDeg(yaw_reference_deg, current_yaw);
     distance_mm = sqrtf(error_x * error_x + error_y * error_y);
+
+    if (!isfinite(current_x) || !isfinite(current_y) ||
+        !isfinite(error_x) || !isfinite(error_y) || !isfinite(error_yaw) ||
+        !isfinite(distance_mm) ||
+        distance_mm > POSE_RUNTIME_ERROR_HARD_MAX_MM) {
+        pose_control_active = 0U;
+        Pose_ResetPlanner();
+        StopAllMotors();
+        (void)G6220_SetEnabled(0U);
+        PID_Reset(&pid_x);
+        PID_Reset(&pid_y);
+        PID_Reset(&pid_yaw);
+        printf("# POSE STOP SAFETY\r\n");
+        return;
+    }
+
+    /* 安全条件每次主循环都检查；只有正常规划计算受 20 ms 控制周期限制。 */
+    elapsed_ms = (uint32_t)(now - pose_last_control_time);
+    if (elapsed_ms < POSE_CONTROL_PERIOD_MS) return;
+    if (elapsed_ms > POSE_DT_MAX_MS) elapsed_ms = POSE_DT_MAX_MS;
+    dt_s = (float)elapsed_ms / 1000.0f;
+    pose_last_control_time = now;
 
     /* X/Y PID先给出全局速度，再旋转到车体坐标，供树莓派直接下发全局目标位姿。 */
     world_vx = PID_Calc(&pid_x, current_x);
     world_vy = PID_Calc(&pid_y, current_y);
     world_speed = sqrtf(world_vx * world_vx + world_vy * world_vy);
-    linear_limit = LLM_BrakeLimitLinear(distance_mm, LLM_POSE_POSITION_TOL_MM);
+    linear_limit = Pose_BrakeLimitLinear(distance_mm, POSE_POSITION_TOL_MM);
+    /* X/Y 的 PID LIMIT 最终解释为二维平移速度矢量的模长上限。 */
+    if (linear_limit > pid_x.max_out) linear_limit = pid_x.max_out;
     if (linear_limit > pid_y.max_out) linear_limit = pid_y.max_out;
+    if (linear_limit > POSE_SPEED_HARD_MAX_MPS) {
+        linear_limit = POSE_SPEED_HARD_MAX_MPS;
+    }
     if (world_speed > linear_limit && world_speed > 0.0001f) {
         float scale = linear_limit / world_speed;
         world_vx *= scale;
@@ -738,37 +1299,75 @@ static void LLM_ProcessPoseControl(uint32_t now)
     heading_rad = current_yaw * (3.1415926f / 180.0f);
     body_vx = cosf(heading_rad) * world_vx + sinf(heading_rad) * world_vy;
     body_vy = -sinf(heading_rad) * world_vx + cosf(heading_rad) * world_vy;
+    pose_target_vx = body_vx;
+    pose_target_vy = body_vy;
 
     desired_vz = PID_CalcError(&pid_yaw, error_yaw);
-    yaw_limit = LLM_BrakeLimitYaw(error_yaw, LLM_POSE_YAW_TOL_DEG);
-    desired_vz = LLM_ClampFloat(desired_vz, -yaw_limit, yaw_limit);
-
-    target_linear_speed = sqrtf(body_vx * body_vx + body_vy * body_vy);
-    current_linear_speed = sqrtf(pose_output_vx * pose_output_vx +
-                                 pose_output_vy * pose_output_vy);
-    step_linear = (target_linear_speed < current_linear_speed ?
-                   LLM_TUNE_MAX_DECEL_MPS2 : LLM_TUNE_MAX_ACCEL_MPS2) *
-                  ((float)LLM_TUNE_CONTROL_PERIOD_MS / 1000.0f);
-    step_yaw = (fabsf(desired_vz) < fabsf(pose_output_vz) ?
-                LLM_TUNE_YAW_DECEL_RADPS2 : LLM_TUNE_YAW_ACCEL_RADPS2) *
-               ((float)LLM_TUNE_CONTROL_PERIOD_MS / 1000.0f);
-    delta_vx = body_vx - pose_output_vx;
-    delta_vy = body_vy - pose_output_vy;
-    delta_v = sqrtf(delta_vx * delta_vx + delta_vy * delta_vy);
-    if (delta_v > step_linear && delta_v > 0.0001f) {
-        pose_output_vx += delta_vx * step_linear / delta_v;
-        pose_output_vy += delta_vy * step_linear / delta_v;
-    } else {
-        pose_output_vx = body_vx;
-        pose_output_vy = body_vy;
+    yaw_limit = Pose_BrakeLimitYaw(error_yaw, POSE_YAW_TOL_DEG);
+    if (yaw_limit > pid_yaw.max_out) yaw_limit = pid_yaw.max_out;
+    if (yaw_limit > POSE_YAW_SPEED_HARD_MAX_RADPS) {
+        yaw_limit = POSE_YAW_SPEED_HARD_MAX_RADPS;
     }
-    pose_output_vz = LLM_Slew(pose_output_vz, desired_vz, step_yaw);
+    desired_vz = Math_ClampFloat(desired_vz, -yaw_limit, yaw_limit);
+    pose_target_vz = desired_vz;
 
-    if (distance_mm <= LLM_POSE_POSITION_TOL_MM &&
-        fabsf(error_yaw) <= LLM_POSE_YAW_TOL_DEG) {
+    /* 对整个 Vx/Vy 差矢量限幅，保留 PID 给出的平移方向，避免逐轴斜坡扭曲轨迹。 */
+    Pose_SlewVector2D(pose_output_vx, pose_output_vy,
+                      body_vx, body_vy,
+                      pose_motion_profile.linear_accel_mps2,
+                      pose_motion_profile.linear_decel_mps2,
+                      dt_s, &pose_output_vx, &pose_output_vy);
+    yaw_rate = ((fabsf(pose_output_vz) > 0.0001f &&
+                 pose_output_vz * desired_vz <= 0.0f) ||
+                fabsf(desired_vz) < fabsf(pose_output_vz)) ?
+               pose_motion_profile.yaw_decel_radps2 :
+               pose_motion_profile.yaw_accel_radps2;
+    step_yaw = yaw_rate * dt_s;
+    pose_output_vz = Pose_SlewScalar(pose_output_vz, desired_vz, step_yaw);
+    linear_speed = sqrtf(pose_output_vx * pose_output_vx +
+                         pose_output_vy * pose_output_vy);
+
+    if (!isfinite(pose_output_vx) || !isfinite(pose_output_vy) ||
+        !isfinite(pose_output_vz)) {
+        pose_control_active = 0U;
+        Pose_ResetPlanner();
+        StopAllMotors();
+        (void)G6220_SetEnabled(0U);
+        PID_Reset(&pid_x);
+        PID_Reset(&pid_y);
+        PID_Reset(&pid_yaw);
+        printf("# POSE STOP SAFETY\r\n");
+        return;
+    }
+
+    if (pose_control_phase == POSE_PHASE_TRANSLATE &&
+        distance_mm <= POSE_POSITION_TOL_MM &&
+        linear_speed <= POSE_STOP_LINEAR_EPS_MPS &&
+        fabsf(error_yaw) <= POSE_YAW_TOL_DEG &&
+        fabsf(pose_output_vz) <= POSE_STOP_YAW_EPS_RADPS) {
+        /*
+         * 平移阶段保持起始航向；到点且速度接近零后明确停车，再切换到
+         * 原地转向阶段。协议仍只在最终位姿稳定后报告 POSE TARGET。
+         */
+        StopAllMotors();
+        PID_Reset(&pid_x);
+        PID_Reset(&pid_y);
+        PID_Reset(&pid_yaw);
+        Pose_ResetPlanner();
+        pose_control_phase = POSE_PHASE_ROTATE;
+        pose_last_control_time = now;
+        return;
+    }
+
+    if (pose_control_phase == POSE_PHASE_ROTATE &&
+        distance_mm <= POSE_POSITION_TOL_MM &&
+        fabsf(error_yaw) <= POSE_YAW_TOL_DEG &&
+        linear_speed <= POSE_STOP_LINEAR_EPS_MPS &&
+        fabsf(pose_output_vz) <= POSE_STOP_YAW_EPS_RADPS) {
         pose_settle_cycles++;
-        if (pose_settle_cycles >= LLM_POSE_SETTLE_CYCLES) {
+        if (pose_settle_cycles >= POSE_SETTLE_CYCLES) {
             pose_control_active = 0U;
+            Pose_ResetPlanner();
             StopAllMotors();
             printf("# POSE TARGET X=%.2f Y=%.2f YAW=%.2f "
                    "CENTER_X=%.2f CENTER_Y=%.2f ERROR_MM=%.2f ERROR_YAW=%.2f\r\n",
@@ -785,72 +1384,7 @@ static void LLM_ProcessPoseControl(uint32_t now)
     SetAllMotorsSpeed(v1, v2, v3, v4);
 }
 
-static void LLM_StartTuneRound(void)
-{
-    uint32_t last_ops_tick = ops9_last_update_tick;
-    uint32_t now = HAL_GetTick();
-    PID_Controller *pid = LLM_GetTunePid();
-    float center_x;
-    float center_y;
-
-    debug_chassis_active = 0U;
-    pose_control_active = 0U;
-
-    /* 没有新鲜的 OPS 坐标时拒绝启动，避免位置环退化成开环运动。 */
-    if (ops9_frame_count == 0U || (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS) {
-        StopAllMotors();
-        current_tune_state = TUNE_STATE_WAIT;
-        printf("# ERROR OPS NOT READY\r\n");
-        return;
-    }
-
-    if (tune_round_count > 0U) {
-        tune_direction = -tune_direction;
-    }
-    tune_round_count++;
-
-    StopAllMotors();
-    /*
-     * 线性轴调参同时使用另外两个 PID 保持正交位移和起始航向。
-     * 每轮开始必须清空三轴历史，避免上一轮积分/微分状态串入本轮。
-     */
-    PID_Reset(&pid_x);
-    PID_Reset(&pid_y);
-    PID_Reset(&pid_yaw);
-    LLM_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
-    start_x_pos = center_x;
-    start_y_pos = center_y;
-    start_yaw_deg = robot_yaw;
-    /* 调参数据统一归一化为从0向正目标运动，便于正反轮次直接比较。 */
-    PID_SetTarget(pid, current_tune_axis == TUNE_AXIS_YAW ?
-                       LLM_TUNE_TARGET_YAW_DEG : LLM_TUNE_TARGET_MM);
-    tune_output = 0.0f;
-    tune_settle_cycles = 0U;
-    tune_start_time = now;
-    last_control_time = tune_start_time;
-    current_tune_state = TUNE_STATE_RUN;
-    printf("# ROUND START %lu AXIS=%s DIR %.0f X=%.2f Y=%.2f YAW=%.2f "
-           "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
-           (unsigned long)tune_round_count, LLM_TuneAxisName(current_tune_axis), tune_direction,
-           robot_x, robot_y, robot_yaw, center_x, center_y);
-}
-
-static void LLM_StopTuneRound(const char *reason)
-{
-    float center_x;
-    float center_y;
-
-    StopAllMotors();
-    tune_output = 0.0f;
-    current_tune_state = TUNE_STATE_WAIT;
-    LLM_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
-    printf("# ROUND STOP %s AXIS=%s X=%.2f Y=%.2f YAW=%.2f "
-           "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
-           reason, LLM_TuneAxisName(current_tune_axis), robot_x, robot_y, robot_yaw,
-           center_x, center_y);
-}
-
-static void LLM_ProcessCommand(void)
+static void Host_ProcessCommand(void)
 {
     char command[64];
     uint8_t i;
@@ -858,8 +1392,8 @@ static void LLM_ProcessCommand(void)
     float speed_limit_val;
     char axis_name[8];
     PID_Controller *pid;
-    TuneAxis_t requested_axis;
-    float kp_max, ki_max, kd_max, output_hard_max;
+    LLM_TuneAxis_t requested_axis;
+    float kp_max, ki_max, kd_max, output_min, output_hard_max;
 
     if (!pc_command_ready) {
         return;
@@ -877,7 +1411,7 @@ static void LLM_ProcessCommand(void)
     last_host_command_tick = HAL_GetTick();
     __enable_irq();
 
-    if (LLM_ProcessDebugCommand(command)) {
+    if (Host_ProcessOperationalCommand(command)) {
         return;
     }
 
@@ -888,38 +1422,42 @@ static void LLM_ProcessCommand(void)
                pid_y.Kp, pid_y.Ki, pid_y.Kd,
                pid_yaw.Kp, pid_yaw.Ki, pid_yaw.Kd);
     } else if (sscanf(command, "PID LIMIT %7s %f", axis_name, &speed_limit_val) == 2) {
-        if (strcmp(axis_name, "X") == 0) requested_axis = TUNE_AXIS_X;
-        else if (strcmp(axis_name, "Y") == 0) requested_axis = TUNE_AXIS_Y;
-        else if (strcmp(axis_name, "YAW") == 0) requested_axis = TUNE_AXIS_YAW;
+        if (strcmp(axis_name, "X") == 0) requested_axis = LLM_TUNE_AXIS_X;
+        else if (strcmp(axis_name, "Y") == 0) requested_axis = LLM_TUNE_AXIS_Y;
+        else if (strcmp(axis_name, "YAW") == 0) requested_axis = LLM_TUNE_AXIS_YAW;
         else {
             printf("# ERROR PID AXIS X|Y|YAW\r\n");
             return;
         }
-        output_hard_max = requested_axis == TUNE_AXIS_YAW ?
-                          LLM_TUNE_YAW_HARD_MAX_RADPS : LLM_TUNE_SPEED_HARD_MAX_MPS;
-        if (isfinite(speed_limit_val) && speed_limit_val >= 0.02f &&
+        output_min = requested_axis == LLM_TUNE_AXIS_YAW ?
+                     POSE_YAW_SPEED_MIN_RADPS : POSE_SPEED_MIN_MPS;
+        output_hard_max = requested_axis == LLM_TUNE_AXIS_YAW ?
+                          POSE_YAW_SPEED_HARD_MAX_RADPS :
+                          POSE_SPEED_HARD_MAX_MPS;
+        if (isfinite(speed_limit_val) && speed_limit_val >= output_min &&
             speed_limit_val <= output_hard_max) {
-            pid = LLM_GetPidForAxis(requested_axis);
+            pid = LLM_TunerGetPidForAxis(requested_axis);
             pid->max_out = speed_limit_val;
             printf("# PID LIMIT AXIS=%s OUTPUT=%.3f UNIT=%s\r\n",
-                   LLM_TuneAxisName(requested_axis), speed_limit_val,
-                   requested_axis == TUNE_AXIS_YAW ? "RADPS" : "MPS");
+                   LLM_TunerAxisName(requested_axis), speed_limit_val,
+                   requested_axis == LLM_TUNE_AXIS_YAW ? "RADPS" : "MPS");
         } else {
-            printf("# ERROR PID LIMIT OUTPUT 0.02..%.2f\r\n", output_hard_max);
+            printf("# ERROR PID LIMIT OUTPUT %.2f..%.2f\r\n",
+                   output_min, output_hard_max);
         }
     } else if (sscanf(command, "PID SET %7s %f %f %f",
                       axis_name, &p_val, &i_val, &d_val) == 4) {
-        if (strcmp(axis_name, "X") == 0) requested_axis = TUNE_AXIS_X;
-        else if (strcmp(axis_name, "Y") == 0) requested_axis = TUNE_AXIS_Y;
-        else if (strcmp(axis_name, "YAW") == 0) requested_axis = TUNE_AXIS_YAW;
+        if (strcmp(axis_name, "X") == 0) requested_axis = LLM_TUNE_AXIS_X;
+        else if (strcmp(axis_name, "Y") == 0) requested_axis = LLM_TUNE_AXIS_Y;
+        else if (strcmp(axis_name, "YAW") == 0) requested_axis = LLM_TUNE_AXIS_YAW;
         else {
             printf("# ERROR PID AXIS X|Y|YAW\r\n");
             return;
         }
-        pid = LLM_GetPidForAxis(requested_axis);
-        kp_max = requested_axis == TUNE_AXIS_YAW ? LLM_TUNE_YAW_KP_MAX : LLM_TUNE_KP_MAX;
-        ki_max = requested_axis == TUNE_AXIS_YAW ? LLM_TUNE_YAW_KI_MAX : LLM_TUNE_KI_MAX;
-        kd_max = requested_axis == TUNE_AXIS_YAW ? LLM_TUNE_YAW_KD_MAX : LLM_TUNE_KD_MAX;
+        pid = LLM_TunerGetPidForAxis(requested_axis);
+        kp_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KP_MAX : LLM_TUNE_KP_MAX;
+        ki_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KI_MAX : LLM_TUNE_KI_MAX;
+        kd_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KD_MAX : LLM_TUNE_KD_MAX;
         if (isfinite(p_val) && isfinite(i_val) && isfinite(d_val) &&
             p_val >= 0.0f && p_val <= kp_max &&
             i_val >= 0.0f && i_val <= ki_max &&
@@ -929,38 +1467,49 @@ static void LLM_ProcessCommand(void)
             pid->Kd = d_val;
             PID_Reset(pid);
             printf("# PID LOADED AXIS=%s P=%.7f I=%.8f D=%.7f\r\n",
-                   LLM_TuneAxisName(requested_axis), p_val, i_val, d_val);
+                   LLM_TunerAxisName(requested_axis), p_val, i_val, d_val);
         } else {
             printf("# ERROR PID LIMIT P<=%.4f I<=%.5f D<=%.4f\r\n",
                    kp_max, ki_max, kd_max);
         }
     } else if (sscanf(command, "TUNE AXIS %7s", axis_name) == 1) {
-        if (strcmp(axis_name, "X") == 0) current_tune_axis = TUNE_AXIS_X;
-        else if (strcmp(axis_name, "Y") == 0) current_tune_axis = TUNE_AXIS_Y;
-        else if (strcmp(axis_name, "YAW") == 0) current_tune_axis = TUNE_AXIS_YAW;
+        if (strcmp(axis_name, "X") == 0) requested_axis = LLM_TUNE_AXIS_X;
+        else if (strcmp(axis_name, "Y") == 0) requested_axis = LLM_TUNE_AXIS_Y;
+        else if (strcmp(axis_name, "YAW") == 0) requested_axis = LLM_TUNE_AXIS_YAW;
         else {
             printf("# ERROR TUNE AXIS X|Y|YAW\r\n");
             return;
         }
+        /* 兼容现有调参器：TUNE AXIS 同时作为进入独立 TUNE 模式的入口。 */
+        if (current_robot_mode != ROBOT_MODE_TUNE) {
+            Robot_SetMode(ROBOT_MODE_TUNE);
+        }
         pose_control_active = 0U;
-        LLM_StopTuneRound("AXIS");
-        tune_round_count = 0U;
-        tune_direction = 1.0f;
+        Pose_ResetPlanner();
+        LLM_TunerSetAxis(requested_axis);
+        LLM_TunerStopRound("AXIS");
+        LLM_TunerResetSession();
         printf("# TUNE AXIS %s UNIT_IN=%s UNIT_OUT=%s\r\n",
-               LLM_TuneAxisName(current_tune_axis),
-               current_tune_axis == TUNE_AXIS_YAW ? "DEG" : "MM",
-               current_tune_axis == TUNE_AXIS_YAW ? "RADPS" : "MPS");
+               LLM_TunerAxisName(requested_axis),
+               requested_axis == LLM_TUNE_AXIS_YAW ? "DEG" : "MM",
+               requested_axis == LLM_TUNE_AXIS_YAW ? "RADPS" : "MPS");
     } else if (sscanf(command, "TUNE LIMIT %f", &speed_limit_val) == 1) {
-        pid = LLM_GetTunePid();
-        output_hard_max = current_tune_axis == TUNE_AXIS_YAW ?
+        if (current_robot_mode != ROBOT_MODE_TUNE) {
+            printf("# ERROR MODE REQUIRED=TUNE CURRENT=%s\r\n",
+                   RobotMode_Name(current_robot_mode));
+            return;
+        }
+        requested_axis = LLM_TunerGetAxis();
+        pid = LLM_TunerGetPid();
+        output_hard_max = requested_axis == LLM_TUNE_AXIS_YAW ?
                           LLM_TUNE_YAW_HARD_MAX_RADPS : LLM_TUNE_SPEED_HARD_MAX_MPS;
         /* 工作速度上限由上位机统一配置；这里保留独立硬上限作为最终安全边界。 */
         if (isfinite(speed_limit_val) && speed_limit_val >= 0.02f &&
             speed_limit_val <= output_hard_max) {
             pid->max_out = speed_limit_val;
             printf("# TUNE LIMIT AXIS=%s OUTPUT=%.3f UNIT=%s HARD_MAX=%.3f\r\n",
-                   LLM_TuneAxisName(current_tune_axis), pid->max_out,
-                   current_tune_axis == TUNE_AXIS_YAW ? "RADPS" : "MPS",
+                   LLM_TunerAxisName(requested_axis), pid->max_out,
+                   requested_axis == LLM_TUNE_AXIS_YAW ? "RADPS" : "MPS",
                    output_hard_max);
         } else {
             printf("# ERROR TUNE LIMIT 0.02..%.2f\r\n", output_hard_max);
@@ -969,10 +1518,16 @@ static void LLM_ProcessCommand(void)
         (sscanf(command, "SET KP:%f KI:%f KD:%f", &p_val, &i_val, &d_val) == 3) ||
         (sscanf(command, "PID %f %f %f", &p_val, &i_val, &d_val) == 3) ||
         (sscanf(command, "P:%f,I:%f,D:%f", &p_val, &i_val, &d_val) == 3)) {
-        pid = LLM_GetTunePid();
-        kp_max = current_tune_axis == TUNE_AXIS_YAW ? LLM_TUNE_YAW_KP_MAX : LLM_TUNE_KP_MAX;
-        ki_max = current_tune_axis == TUNE_AXIS_YAW ? LLM_TUNE_YAW_KI_MAX : LLM_TUNE_KI_MAX;
-        kd_max = current_tune_axis == TUNE_AXIS_YAW ? LLM_TUNE_YAW_KD_MAX : LLM_TUNE_KD_MAX;
+        if (current_robot_mode != ROBOT_MODE_TUNE) {
+            printf("# ERROR MODE REQUIRED=TUNE CURRENT=%s\r\n",
+                   RobotMode_Name(current_robot_mode));
+            return;
+        }
+        requested_axis = LLM_TunerGetAxis();
+        pid = LLM_TunerGetPid();
+        kp_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KP_MAX : LLM_TUNE_KP_MAX;
+        ki_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KI_MAX : LLM_TUNE_KI_MAX;
+        kd_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KD_MAX : LLM_TUNE_KD_MAX;
         if (isfinite(p_val) && isfinite(i_val) && isfinite(d_val) &&
             p_val >= 0.0f && p_val <= kp_max &&
             i_val >= 0.0f && i_val <= ki_max &&
@@ -981,30 +1536,48 @@ static void LLM_ProcessCommand(void)
             pid->Ki = i_val;
             pid->Kd = d_val;
             printf("# PID UPDATED AXIS=%s P=%.7f I=%.8f D=%.7f\r\n",
-                   LLM_TuneAxisName(current_tune_axis), p_val, i_val, d_val);
-            LLM_StartTuneRound();
+                   LLM_TunerAxisName(requested_axis), p_val, i_val, d_val);
+            debug_chassis_active = 0U;
+            pose_control_active = 0U;
+            Pose_ResetPlanner();
+            Mecanum_ClearCanTxFault();
+            LLM_TunerStartRound();
         } else {
             printf("# ERROR PID LIMIT P<=%.4f I<=%.5f D<=%.4f\r\n",
                    kp_max, ki_max, kd_max);
         }
     } else if (strcmp(command, "STATUS") == 0) {
-        pid = LLM_GetTunePid();
-        printf("# STATUS AXIS=%s P=%.7f I=%.8f D=%.7f MAX_OUT=%.3f STATE=%u PROTO=%s OPS_FRAMES=%lu\r\n",
-               LLM_TuneAxisName(current_tune_axis), pid->Kp, pid->Ki, pid->Kd, pid->max_out,
-               (unsigned int)current_tune_state,
+        requested_axis = LLM_TunerGetAxis();
+        pid = LLM_TunerGetPid();
+        printf("# STATUS MODE=%s HOST_PROTO=%u AXIS=%s P=%.7f I=%.8f D=%.7f MAX_OUT=%.3f "
+               "STATE=%u PLOT=%u MOTOR_PROTO=%s OPS_FRAMES=%lu UART_TX_OK=%lu UART_TX_ERR=%lu\r\n",
+               RobotMode_Name(current_robot_mode), HOST_PROTOCOL_VERSION,
+               LLM_TunerAxisName(requested_axis),
+               pid->Kp, pid->Ki, pid->Kd, pid->max_out,
+               (unsigned int)LLM_TunerGetState(),
+               telemetry_mask != 0U,
                ZDT_Emm_GetProtocol() == ZDT_PROTOCOL_X ? "X" : "EMM",
-               (unsigned long)ops9_frame_count);
+               (unsigned long)ops9_frame_count,
+               (unsigned long)host_uart_tx_ok,
+               (unsigned long)host_uart_tx_error);
     } else if (strcmp(command, "RESET") == 0) {
-        PID_Reset(LLM_GetTunePid());
+        PID_Reset(LLM_TunerGetPid());
         pose_control_active = 0U;
-        tune_round_count = 0U;
-        tune_direction = 1.0f;
-        LLM_StopTuneRound("RESET");
+        Pose_ResetPlanner();
+        LLM_TunerResetSession();
+        LLM_TunerStopRound("RESET");
     } else if (strcmp(command, "STOP") == 0) {
-        debug_motor_active = 0U;
-        debug_chassis_active = 0U;
-        pose_control_active = 0U;
-        LLM_StopTuneRound("HOST");
+        if (current_robot_mode == ROBOT_MODE_TUNE && LLM_TunerIsRunning()) {
+            debug_motor_active = 0U;
+            debug_chassis_active = 0U;
+            pose_control_active = 0U;
+            Pose_ResetPlanner();
+            (void)G6220_SetEnabled(0U);
+            LLM_TunerStopRound("HOST");
+        } else {
+            Robot_StopAllMotion();
+            printf("# STOP MODE=%s\r\n", RobotMode_Name(current_robot_mode));
+        }
     } else {
         printf("# ERROR UNKNOWN COMMAND\r\n");
     }
@@ -1047,18 +1620,31 @@ int main(void)
   MX_TIM3_Init();
   MX_USART2_UART_Init();
   MX_TIM4_Init();
+  MX_CAN2_Init();
   /* USER CODE BEGIN 2 */
   // 声明外部的接收缓存变量
   extern uint8_t ops9_rx_byte;
+  DM_G6220_Result_t g6220_result;
   // 开启 USART2 单字节中断接收
   HAL_UART_Receive_IT(&huart2, &ops9_rx_byte, 1);
-  // 开启 USART1 单字节中断接收 (接收 LLM 发来的参数)
+  // 开启 USART1 单字节中断接收（接收树莓派或 PC 发来的主机命令）
     HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
   // 1. 初始化 CAN 和过滤器
   ZDT_CAN_ConfigFilter();
 
   // 2. 注册回调
   ZDT_CAN_RegisterCallback(ZDT_Emm_RxHandler);
+
+  // G6220 独占 CAN2 (1 Mbit/s)：初始化软件对象、过滤器和 FIFO0 中断。
+  g6220_result = DM_G6220_Init(&g6220_motor, &hcan2,
+                               G6220_CAN_ID, G6220_MASTER_ID);
+  if (g6220_result == DM_G6220_OK) {
+      g6220_result = DM_G6220_StartCan(&g6220_motor,
+                                      G6220_CAN2_FILTER_BANK,
+                                      G6220_SLAVE_FILTER_START);
+  }
+  g6220_last_result = g6220_result;
+  g6220_initialized = (g6220_result == DM_G6220_OK) ? 1U : 0U;
 
   // 3. 初始化 4 个电机
   ZDT_Emm_InitAll();
@@ -1075,8 +1661,7 @@ int main(void)
   ZDT_Emm_EnableByID(4);
   HAL_Delay(100);  // 等待使能完成
 
-  // 5.启动定时器（用于定时读取速度）
-  HAL_TIM_Base_Start_IT(&htim3);
+  // 5. TIM3/TIM4 当前未使用，不启动定时器。
 
   // 6. 初始化里程计计时器
     last_odom_tick = HAL_GetTick();
@@ -1084,18 +1669,34 @@ int main(void)
 
   //7.初始化PID参数
   // 注意：坐标单位是 mm，误差 1000mm 时，乘以 Kp=0.001，算出的速度正好是 1.0 m/s
-    PID_Init(&pid_x,   0.001f, 0.0f, 0.0f, LLM_TUNE_MAX_SPEED_MPS, 5000.0f);
-    PID_Init(&pid_y,   0.001f, 0.0f, 0.0f, LLM_TUNE_MAX_SPEED_MPS, 5000.0f);
-    PID_Init(&pid_yaw, 0.01f,  0.0f, 0.0f, LLM_TUNE_YAW_MAX_RADPS, 1000.0f);
+    Pose_InitMotionProfile();
+    PID_Init(&pid_x,   0.001f, 0.0f, 0.0f, POSE_SPEED_DEFAULT_MPS, 5000.0f);
+    PID_Init(&pid_y,   0.001f, 0.0f, 0.0f, POSE_SPEED_DEFAULT_MPS, 5000.0f);
+    PID_Init(&pid_yaw, 0.01f,  0.0f, 0.0f, POSE_YAW_SPEED_DEFAULT_RADPS, 1000.0f);
+    LLM_TunerInit(&pid_x, &pid_y, &pid_yaw);
 
     StopAllMotors();
+    if (g6220_initialized) {
+        /* 厂商建议 CAN 初始化后等待约 1 秒再使能，并留 30~100 ms 收命令。 */
+        HAL_Delay(G6220_STARTUP_DELAY_MS);
+        g6220_result = G6220_SetEnabled(1U);
+        HAL_Delay(G6220_COMMAND_DELAY_MS);
+    }
     printf("# STM32F407 MECANUM X/Y/YAW PID CONTROLLER READY\r\n");
+    printf("# PROTO VERSION=%u MODES=WORK,TUNE,PLOT LEGACY_POSE=1\r\n",
+           HOST_PROTOCOL_VERSION);
+    printf("# MODE WORK PLOT=0 MOTION=STOPPED\r\n");
+    printf("# G6220 INIT=%u ENABLE_REQ=%u RESULT=%u CAN_ID=0x%02X MASTER_ID=0x%03X\r\n",
+           g6220_initialized, g6220_enable_requested,
+           (unsigned int)g6220_last_result,
+           (unsigned int)G6220_CAN_ID, (unsigned int)G6220_MASTER_ID);
     printf("# CSV timestamp,setpoint,input,output,error,p,i,d,ops_x_mm,ops_y_mm,yaw_deg,"
            "cross_mm,yaw_delta_deg,hold_cross,hold_yaw,center_x_mm,center_y_mm;"
            " UNIT BY AXIS\r\n");
     printf("# MOTOR PROTOCOL DEFAULT EMM; SEND HELP FOR DEBUG COMMANDS\r\n");
     printf("# SEND OPS STATUS OR OPS MONITOR ON TO CHECK OPS-9 LINK\r\n");
-    printf("# TUNE SPEED SET BY HOST; HARD LIMIT %.2fMPS; OPS/HOST LOSS STOPS MOTORS\r\n",
+    printf("# TUNE NO PING ROUND=5S POSE=15S ROUNDS=%lu; HARD LIMIT %.2fMPS; SAFETY FAULT STOPS MOTORS\r\n",
+           (unsigned long)LLM_TUNE_MAX_SESSION_ROUNDS,
            LLM_TUNE_SPEED_HARD_MAX_MPS);
   /* USER CODE END 2 */
 
@@ -1107,220 +1708,42 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
       uint32_t now = HAL_GetTick();
-      LLM_ProcessCommand();
-      LLM_ProcessMotorFeedback();
+      Host_ProcessCommand();
+      Motor_ProcessFeedback();
 
       /* 命令处理和串口中断可能更新时间戳，超时判断前必须刷新当前时间。 */
       now = HAL_GetTick();
-      LLM_ProcessPoseControl(now);
+      ChassisSafety_Process(now);
+      Pose_ProcessControl(now);
 
-      if (ops_monitor_enabled && (uint32_t)(now - ops_monitor_last_tick) >= 1000U)
-      {
-          ops_monitor_last_tick = now;
-          LLM_PrintOpsStatus();
+      /* 鎺у埗鍜岃秴鏃朵紭鍏堬紱涓插彛杞涓庨仴娴嬫斁鍦ㄦ湰杞湯灏俱€?*/
+      if (current_robot_mode == ROBOT_MODE_TUNE) {
+          LLM_TunerProcess(now);
       }
 
       if (debug_motor_active && (int32_t)(now - debug_motor_stop_tick) >= 0)
       {
-          ZDT_Emm_SetSingleMotorSpeed(debug_motor_id, 0.0f);
+          Mecanum_ReportCanTxResult(
+              ZDT_Emm_SetSingleMotorSpeed(debug_motor_id, 0.0f));
           printf("# MOTOR AUTO STOP ID=%u\r\n", debug_motor_id);
           debug_motor_active = 0U;
       }
 
       if (debug_chassis_active && (int32_t)(now - debug_chassis_stop_tick) >= 0)
       {
-          StopAllMotors();
+          (void)StopAllMotors();
           printf("# MOVE AUTO STOP\r\n");
           debug_chassis_active = 0U;
       }
 
-      if (current_tune_state == TUNE_STATE_RUN &&
-          (uint32_t)(now - last_control_time) >= LLM_TUNE_CONTROL_PERIOD_MS)
+      if (ops_monitor_enabled && (uint32_t)(now - ops_monitor_last_tick) >= 1000U)
       {
-          float current_ops_x = robot_x;
-          float current_ops_y = robot_y;
-          float current_x;
-          float current_y;
-          float current_yaw = robot_yaw;
-          float dx;
-          float dy;
-          float start_heading_rad;
-          float body_right_mm;
-          float body_forward_mm;
-          float yaw_delta_deg;
-          float normalized_input;
-          float normalized_error;
-          float yaw_error;
-          float cross_track_mm;
-          float target_value;
-          float tolerance;
-          float brake_limit;
-          float desired_output;
-          float hold_cross_output = 0.0f;
-          float hold_yaw_output = 0.0f;
-          float max_output_step;
-          float command_vx = 0.0f;
-          float command_vy = 0.0f;
-          float command_vz = 0.0f;
-          float V1, V2, V3, V4;
-          PID_Controller *pid = LLM_GetTunePid();
-          uint32_t last_ops_tick;
-
-          /* OPS时间戳由中断更新：先快照它，再读取当前时间。 */
-          last_ops_tick = ops9_last_update_tick;
-          now = HAL_GetTick();
-          last_control_time += LLM_TUNE_CONTROL_PERIOD_MS;
-          if (!isfinite(current_ops_x) || !isfinite(current_ops_y) ||
-              !isfinite(current_yaw) ||
-              ops9_frame_count == 0U ||
-              (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS) {
-              LLM_StopTuneRound("OPS LOST");
-              continue;
-          }
-          if ((uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) {
-              LLM_StopTuneRound("HOST LOST");
-              continue;
-          }
-          if ((uint32_t)(now - tune_start_time) >= LLM_TUNE_DURATION_MS) {
-              LLM_StopTuneRound("TIMEOUT");
-              continue;
-          }
-
-          LLM_OpsToChassisCenter(current_ops_x, current_ops_y, current_yaw,
-                                 &current_x, &current_y);
-          dx = current_x - start_x_pos;
-          dy = current_y - start_y_pos;
-          start_heading_rad = start_yaw_deg * (3.1415926f / 180.0f);
-          body_right_mm = cosf(start_heading_rad) * dx + sinf(start_heading_rad) * dy;
-          body_forward_mm = -sinf(start_heading_rad) * dx + cosf(start_heading_rad) * dy;
-          yaw_delta_deg = LLM_AngleErrorDeg(current_yaw, start_yaw_deg);
-          yaw_error = LLM_AngleErrorDeg(current_yaw, start_yaw_deg);
-
-          if (current_tune_axis == TUNE_AXIS_X) {
-              normalized_input = tune_direction * body_right_mm;
-              cross_track_mm = body_forward_mm;
-              target_value = LLM_TUNE_TARGET_MM;
-              tolerance = LLM_TUNE_POSITION_TOL_MM;
-          } else if (current_tune_axis == TUNE_AXIS_YAW) {
-              normalized_input = tune_direction * yaw_delta_deg;
-              cross_track_mm = sqrtf(dx * dx + dy * dy);
-              target_value = LLM_TUNE_TARGET_YAW_DEG;
-              tolerance = LLM_TUNE_YAW_TOL_DEG;
-          } else {
-              normalized_input = tune_direction * body_forward_mm;
-              cross_track_mm = body_right_mm;
-              target_value = LLM_TUNE_TARGET_MM;
-              tolerance = LLM_TUNE_POSITION_TOL_MM;
-          }
-          normalized_error = target_value - normalized_input;
-
-          /* 运动方向明显相反通常意味着轮序/极性错误，不能继续靠 PID 拉回。 */
-          if (normalized_input < -(current_tune_axis == TUNE_AXIS_YAW ?
-                                   3.0f : LLM_TUNE_WRONG_DIR_MM)) {
-              LLM_StopTuneRound("WRONG DIR");
-              continue;
-          }
-
-          /* 航向大幅偏离优先按底盘故障处理，避免用位置环硬压机械问题。 */
-          if (current_tune_axis != TUNE_AXIS_YAW &&
-              fabsf(yaw_error) > LLM_TUNE_MAX_YAW_ERROR_DEG) {
-              LLM_StopTuneRound("YAW LIMIT");
-              continue;
-          }
-
-          if (current_tune_axis == TUNE_AXIS_YAW) {
-              if (cross_track_mm > LLM_TUNE_YAW_TRANSLATION_MM) {
-                  LLM_StopTuneRound("TRANSLATION LIMIT");
-                  continue;
-              }
-          } else if (fabsf(cross_track_mm) > LLM_TUNE_CROSS_TRACK_MM) {
-              LLM_StopTuneRound("CROSS TRACK");
-              continue;
-          }
-
-          if (normalized_input > target_value +
-              (current_tune_axis == TUNE_AXIS_YAW ? 10.0f : LLM_TUNE_OVERTRAVEL_MM)) {
-              LLM_StopTuneRound("OVERTRAVEL");
-              continue;
-          }
-
-          if (fabsf(normalized_error) <= tolerance) {
-              tune_settle_cycles++;
-              if (tune_settle_cycles >= LLM_TUNE_SETTLE_CYCLES) {
-                  LLM_StopTuneRound("TARGET");
-                  continue;
-              }
-          } else {
-              tune_settle_cycles = 0U;
-          }
-
-          desired_output = PID_Calc(pid, normalized_input);
-          if (current_tune_axis == TUNE_AXIS_YAW) {
-              brake_limit = LLM_BrakeLimitYaw(normalized_error,
-                                              LLM_TUNE_YAW_TOL_DEG);
-          } else {
-              brake_limit = LLM_BrakeLimitLinear(normalized_error,
-                                                 LLM_TUNE_POSITION_TOL_MM);
-          }
-          if (brake_limit < pid->max_out) {
-              desired_output = LLM_ClampFloat(desired_output, -brake_limit, brake_limit);
-          }
-          desired_output *= tune_direction;
-
-          /* 软件斜坡限制每个20ms周期的速度变化，避免电机突然起停。 */
-          max_output_step = (current_tune_axis == TUNE_AXIS_YAW ?
-                            (fabsf(desired_output) < fabsf(tune_output) ?
-                             LLM_TUNE_YAW_DECEL_RADPS2 : LLM_TUNE_YAW_ACCEL_RADPS2) :
-                            (fabsf(desired_output) < fabsf(tune_output) ?
-                             LLM_TUNE_MAX_DECEL_MPS2 : LLM_TUNE_MAX_ACCEL_MPS2)) *
-                            ((float)LLM_TUNE_CONTROL_PERIOD_MS / 1000.0f);
-          tune_output = LLM_Slew(tune_output, desired_output, max_output_step);
-
-          if (current_tune_axis == TUNE_AXIS_X) {
-              command_vx = tune_output;
-              /*
-               * X 横移时，Y 环把相对起点的车体前向位移压回 0，
-               * YAW 环保持起始航向；保持量单独限幅，避免抢占主轴控制权。
-               */
-              hold_cross_output = PID_CalcError(&pid_y, -body_forward_mm);
-              hold_yaw_output = PID_CalcError(&pid_yaw, -yaw_delta_deg);
-              command_vy = LLM_ClampFloat(hold_cross_output,
-                                          -LLM_TUNE_HOLD_LINEAR_MPS,
-                                          LLM_TUNE_HOLD_LINEAR_MPS);
-              command_vz = LLM_ClampFloat(hold_yaw_output,
-                                          -LLM_TUNE_HOLD_YAW_RADPS,
-                                          LLM_TUNE_HOLD_YAW_RADPS);
-          } else if (current_tune_axis == TUNE_AXIS_Y) {
-              command_vy = tune_output;
-              /* Y 前进时对称地保持车体横向位移和起始航向。 */
-              hold_cross_output = PID_CalcError(&pid_x, -body_right_mm);
-              hold_yaw_output = PID_CalcError(&pid_yaw, -yaw_delta_deg);
-              command_vx = LLM_ClampFloat(hold_cross_output,
-                                          -LLM_TUNE_HOLD_LINEAR_MPS,
-                                          LLM_TUNE_HOLD_LINEAR_MPS);
-              command_vz = LLM_ClampFloat(hold_yaw_output,
-                                          -LLM_TUNE_HOLD_YAW_RADPS,
-                                          LLM_TUNE_HOLD_YAW_RADPS);
-          } else {
-              /*
-               * 原地旋转时不启用 X/Y 保持：OPS 若偏离几何旋转中心会测到弧线位移，
-               * 此时强行消除“平移”反而会给底盘注入真实的平移指令。
-               */
-              command_vz = tune_output;
-          }
-          Mecanum_Kinematics(command_vx, command_vy, command_vz, &V1, &V2, &V3, &V4);
-          SetAllMotorsSpeed(V1, V2, V3, V4);
-          printf("%lu,%.2f,%.2f,%.4f,%.2f,%.7f,%.8f,%.7f,"
-                 "%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.2f,%.2f\r\n",
-                 (unsigned long)(now - tune_start_time),
-                 target_value, normalized_input,
-                 tune_direction * tune_output, normalized_error,
-                 pid->Kp, pid->Ki, pid->Kd,
-                 current_ops_x, current_ops_y, current_yaw,
-                 cross_track_mm, yaw_delta_deg,
-                 current_tune_axis == TUNE_AXIS_Y ? command_vx : command_vy,
-                 command_vz, current_x, current_y);
+          ops_monitor_last_tick = now;
+          Ops_PrintStatus();
       }
+
+      Motor_ProcessFeedbackPolling(now);
+      Telemetry_Process(now);
 
       HAL_Delay(1);
 
@@ -1377,21 +1800,35 @@ void SystemClock_Config(void)
 // CAN 接收中断回调
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
-    ZDT_CAN_RxFIFO0_Handler(hcan);
+    if (hcan->Instance == CAN1) {
+        ZDT_CAN_RxFIFO0_Handler(hcan);
+    } else if (hcan->Instance == CAN2) {
+        DM_G6220_RxFIFO0_Handler(&g6220_motor);
+    }
 }
 int _write(int file, char *ptr, int len)
 {
-    // 注意：假设你连接电脑的串口是 USART1。如果是其他串口，请修改 &huart1
-    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, len, HAL_MAX_DELAY);
-    return len;
-}
-// 定时器中断回调 (10ms 一次)
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM3) {
-        // 如果需要绘图，可以在这里置标志位
-        // flag_plot_10ms = 1;
+    HAL_StatusTypeDef status;
+    (void)file;
+
+    if (ptr == NULL || len <= 0 || len > 0xFFFF) {
+        host_uart_tx_error++;
+        return -1;
     }
+
+    /*
+     * 115200 8-N-1 下150字节约需13 ms。20 ms足够发送正常CSV行，
+     * 同时避免USART异常时HAL_MAX_DELAY永久卡死主循环和安全停车逻辑。
+     * 此处不能printf报告失败，否则会递归进入_write。
+     */
+    status = HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len,
+                               HOST_UART_TX_TIMEOUT_MS);
+    if (status != HAL_OK) {
+        host_uart_tx_error++;
+        return -1;
+    }
+    host_uart_tx_ok++;
+    return len;
 }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -1400,7 +1837,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 	    {
 	        OPS9_UART_RxCpltCallback(huart);
 	    }
-	    // 2. 处理 PC 端大模型发来的指令 (USART1)
+	    // 2. 处理树莓派或 PC 发来的主机指令 (USART1)
 	    else if (huart->Instance == USART1)
 	    {
 	        // ISR 只组帧；浮点解析和状态切换放到主循环执行。

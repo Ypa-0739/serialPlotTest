@@ -21,7 +21,14 @@
 #include "tim.h"
 
 /* USER CODE BEGIN 0 */
-
+/*
+ * 定时器使用说明（CubeMX 生成的外设，代码勿删，重新生成时会恢复）：
+ * - TIM3：10 ms 时基中断，当前固件未使用（里程计走 HAL_GetTick），
+ *   不要调用 HAL_TIM_Base_Start_IT(&htim3)，避免空转中断抢时间片。
+ * - TIM4：CH1 (PD12) PWM，84 MHz / 84 / 20000 = 50 Hz，当前未启动。
+ *   如需蜂鸣器/舵机类 50 Hz 外设，调用 HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1)
+ *   并写 __HAL_TIM_SET_COMPARE 即可。
+ */
 /* USER CODE END 0 */
 
 TIM_HandleTypeDef htim3;

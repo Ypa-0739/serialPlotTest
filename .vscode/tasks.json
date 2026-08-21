@@ -4,10 +4,12 @@
         {
             "label": "STM32: Build Debug",
             "type": "process",
-            "command": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe",
+            "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
             "args": [
-                "-j8",
-                "all"
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "chcp 65001 > $null; & 'E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe' -j8 all"
             ],
             "options": {
                 "cwd": "${workspaceFolder}\\Debug",
@@ -15,9 +17,11 @@
                     "PATH": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\\tools\\bin;${env:PATH}"
                 }
             },
-            "problemMatcher": ["$gcc"],
+            "problemMatcher": [
+                "$gcc"
+            ],
             "group": {
-                "kind": "build",
+                "kind": "test",
                 "isDefault": true
             },
             "presentation": {
@@ -29,8 +33,13 @@
         {
             "label": "STM32: Clean Debug",
             "type": "process",
-            "command": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe",
-            "args": ["clean"],
+            "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "args": [
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "chcp 65001 > $null; & 'E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe' clean"
+            ],
             "options": {
                 "cwd": "${workspaceFolder}\\Debug",
                 "env": {
@@ -45,6 +54,36 @@
             "dependsOn": [
                 "STM32: Clean Debug",
                 "STM32: Build Debug"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "STM32: Flash Debug (ST-LINK)",
+            "type": "process",
+            "command": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+            "args": [
+                "-c",
+                "port=SWD",
+                "mode=UR",
+                "reset=HWrst",
+                "-w",
+                "${workspaceFolder}\\Debug\\serialPlotTest.elf",
+                "-v",
+                "-rst"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            }
+        },
+        {
+            "label": "STM32: Build & Flash Debug (ST-LINK)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "STM32: Build Debug",
+                "STM32: Flash Debug (ST-LINK)"
             ],
             "problemMatcher": []
         }

@@ -1,0 +1,10 @@
+# pi-brain 核心依赖（第一阶段：串口桥 + 协议 + 单测）
+pyserial>=3.5
+numpy>=1.24
+opencv-python>=4.8    # 视觉阶段使用（当前未 import）
+matplotlib>=3.7       # 跨平台四轮/OPS/POSE实时曲线工具
+
+# 可选（Pi 5 上按需安装，不要放这里）：
+#   python3-picamera2   -> sudo apt install -y python3-picamera2（APT 安装，非 pip）
+#   ultralytics         -> 训练/导出用
+#   onnxruntime / ncnn  -> 推理后端（NCNN 优先，见 vision/backends/）

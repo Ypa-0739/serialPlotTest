@@ -15,6 +15,8 @@
 #include "zdtEmm.h"
 #include <math.h>
 
+static volatile uint8_t can_tx_fault_latched = 0U;
+
 void Mecanum_Kinematics(float Vx, float Vy, float Vz, float *V_bl, float *V_fl, float *V_fr, float *V_br) {
     float L = (ROBOT_H / 2.0f) + (ROBOT_W / 2.0f);
 
@@ -36,9 +38,10 @@ float MsToRpm(float v_ms) {
 /*
  * @brief  设置 4 个轮子速度并下发至 CAN 节点
  */
-void SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
+uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
     float max_abs = fabsf(V_bl);
     float scale;
+    uint8_t result = 0U;
 
     if (fabsf(V_fl) > max_abs) max_abs = fabsf(V_fl);
     if (fabsf(V_fr) > max_abs) max_abs = fabsf(V_fr);
@@ -52,10 +55,12 @@ void SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
         V_br *= scale;
     }
 
-    ZDT_Emm_SetSpeedByID(1, MsToRpm(V_bl));  // ID 1: 左后
-    ZDT_Emm_SetSpeedByID(2, MsToRpm(V_fl));  // ID 2: 左前
-    ZDT_Emm_SetSpeedByID(3, MsToRpm(V_fr));  // ID 3: 右前
-    ZDT_Emm_SetSpeedByID(4, MsToRpm(V_br));  // ID 4: 右后
+    result |= ZDT_Emm_SetSpeedByID(1, MsToRpm(V_bl));  // ID 1: 左后
+    result |= ZDT_Emm_SetSpeedByID(2, MsToRpm(V_fl));  // ID 2: 左前
+    result |= ZDT_Emm_SetSpeedByID(3, MsToRpm(V_fr));  // ID 3: 右前
+    result |= ZDT_Emm_SetSpeedByID(4, MsToRpm(V_br));  // ID 4: 右后
+    if (result != 0U) can_tx_fault_latched = 1U;
+    return result;
 }
 
 /*
@@ -71,8 +76,25 @@ void ReadAllMotorsSpeed(void) {
 /*
  * @brief  紧急停止所有电机
  */
-void StopAllMotors(void) {
-    SetAllMotorsSpeed(0.0f, 0.0f, 0.0f, 0.0f);
+uint8_t StopAllMotors(void) {
+    return SetAllMotorsSpeed(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+uint8_t Mecanum_ConsumeCanTxFault(void)
+{
+    uint8_t fault = can_tx_fault_latched;
+    can_tx_fault_latched = 0U;
+    return fault;
+}
+
+void Mecanum_ClearCanTxFault(void)
+{
+    can_tx_fault_latched = 0U;
+}
+
+void Mecanum_ReportCanTxResult(uint8_t result)
+{
+    if (result != 0U) can_tx_fault_latched = 1U;
 }
 
 

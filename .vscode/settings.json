@@ -3,5 +3,20 @@
     "cmake.configureOnOpen": false,
     "files.associations": {
         "*.h": "c"
-    }
+    },
+    "VsCodeTaskButtons.showCounter": false,
+    "VsCodeTaskButtons.tasks": [
+        {
+            "label": "$(tools) Build",
+            "task": "STM32: Build Debug",
+            "alignment": "left",
+            "tooltip": "编译 STM32 Debug 工程"
+        },
+        {
+            "label": "$(rocket) Flash",
+            "task": "STM32: Flash Debug (ST-LINK)",
+            "alignment": "left",
+            "tooltip": "通过 ST-LINK 烧录 Debug/serialPlotTest.elf"
+        }
+    ]
 }

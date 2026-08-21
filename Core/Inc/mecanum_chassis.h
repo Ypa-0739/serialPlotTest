@@ -26,9 +26,12 @@
 /* 外部调用函数声明 */
 void Mecanum_Kinematics(float Vx, float Vy, float Vz, float *V_bl, float *V_fl, float *V_fr, float *V_br);
 float MsToRpm(float v_ms);
-void SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br);
+uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br);
 void ReadAllMotorsSpeed(void);
-void StopAllMotors(void);
+uint8_t StopAllMotors(void);
+uint8_t Mecanum_ConsumeCanTxFault(void);
+void Mecanum_ClearCanTxFault(void);
+void Mecanum_ReportCanTxResult(uint8_t result);
 
 
 
