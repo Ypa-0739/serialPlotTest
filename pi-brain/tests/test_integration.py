@@ -2,7 +2,7 @@
 """端到端集成测试：串口桥 + 启动状态机 + FakeFirmware 协作。
 
 覆盖用户验收要点：
-  - 完整自检成功路径：STOP -> MODE WORK -> STATUS -> OPS -> CAN ->
+  - 完整自检成功路径：STOP -> HOST LINK RPI -> STOP -> MODE WORK -> STATUS -> OPS -> CAN ->
     PID SET X/Y/YAW -> PID LIMIT X/Y/YAW -> PID STATUS ALL -> READY
   - OPS 异常（LINK=STALE）-> FAULT
   - 运行中断线 -> FAULT
@@ -23,6 +23,8 @@ from app.state_machine import StartupConfig, StartupStateMachine
 
 # 自检成功路径的期望命令序列（固件真实命令格式）
 EXPECTED_SEQUENCE = [
+    "STOP",
+    "HOST LINK RPI",
     "STOP",
     "MODE WORK",
     "STATUS",
@@ -53,7 +55,7 @@ def pump(bridge, startup, *, until, timeout=3.0, step=0.02):
 
 class StartupIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.firmware = FakeFirmware()
+        self.firmware = FakeFirmware(host_owner=None)
         self.bridge = SerialBridgeThread(
             lambda: self.firmware, ping_interval=0.05, backoff_seconds=0.05
         )
@@ -122,6 +124,18 @@ class StartupIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(ok, "应进入 FAULT")
         self.assertIn("CAN", self.startup.fault_reason)
+
+    def test_rpi_handshake_safely_replaces_previous_com_declaration(self):
+        """单根 USB 线重新接入 RPI 时允许切换，但仍须从完整自检开始。"""
+        self.firmware.host_owner = "COM"
+        self.startup.start()
+        ok = pump(
+            self.bridge,
+            self.startup,
+            until=lambda: self.startup.is_ready,
+        )
+        self.assertTrue(ok, f"RPI 切换后应完成自检: {self.startup.fault_reason}")
+        self.assertEqual(self.firmware.host_owner, "RPI")
 
     def test_fault_on_disconnect_then_recover(self):
         """运行中断线 -> FAULT；桥自动重连 -> 从 STOP 重新自检 -> READY。"""

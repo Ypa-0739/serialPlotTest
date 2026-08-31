@@ -9,6 +9,8 @@ from app.protocol import (
     CsvTelemetry,
     Event,
     FaultReason,
+    HostLinkAcknowledged,
+    HostStatus,
     OpsStatus,
     ModeChanged,
     PidLimitSet,
@@ -28,6 +30,7 @@ from app.protocol import (
     UnknownError,
     WheelTelemetry,
     encode_command,
+    encode_host_link,
     encode_ping,
     encode_pose_set,
     encode_status,
@@ -46,6 +49,12 @@ class EncodeTests(unittest.TestCase):
 
     def test_encode_status(self):
         self.assertEqual(encode_status(), b"STATUS\n")
+
+    def test_encode_host_link(self):
+        self.assertEqual(encode_host_link("rpi"), b"HOST LINK RPI\n")
+        self.assertEqual(encode_host_link("COM"), b"HOST LINK COM\n")
+        with self.assertRaises(ValueError):
+            encode_host_link("OTHER")
 
     def test_encode_pose_set(self):
         self.assertEqual(encode_pose_set(100, 200, 30), b"POSE SET 100.00 200.00 30.00\n")
@@ -214,6 +223,22 @@ class ParseStatusTests(unittest.TestCase):
 
 
 class ParseStartupAckTests(unittest.TestCase):
+    def test_host_link_ack(self):
+        ev = parse_line("# HOST LINK RPI OK")
+        self.assertIsInstance(ev, HostLinkAcknowledged)
+        self.assertEqual(ev.host, "RPI")
+
+    def test_host_status(self):
+        ev = parse_line(
+            "# HOST STATUS STATE=WAITING OWNER=NONE MOTOR_EN=0 HEARTBEAT=OFF "
+            "WAIT_MS=60001 TIMEOUT_MS=60000"
+        )
+        self.assertIsInstance(ev, HostStatus)
+        self.assertEqual(ev.state, "WAITING")
+        self.assertFalse(ev.motor_enabled)
+        self.assertEqual(ev.heartbeat, "OFF")
+        self.assertEqual(ev.timeout_ms, 60000)
+
     def test_stop_ack(self):
         ev = parse_line("# STOP MODE=WORK")
         self.assertIsInstance(ev, StopAcknowledged)

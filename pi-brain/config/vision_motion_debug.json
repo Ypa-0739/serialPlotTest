@@ -1,0 +1,18 @@
+{
+  "map_note": "坐标来自固定场地图纸，描述车体中心；默认目标等于标准起点，因此不会产生位移。",
+  "nominal_start_center": [0.0, 0.0, 0.0],
+  "map_goal_center": {
+    "name": "green_debug_goal",
+    "pose": [0.0, 0.0, 0.0],
+    "timeout_s": 15.0,
+    "profile": "precise"
+  },
+  "ops_offset_body_mm": [0.0, 25.0],
+  "vision": {
+    "target_type": "material:4",
+    "target_id": "4",
+    "minimum_confidence": 0.8,
+    "maximum_age_s": 0.5,
+    "source": "gripper"
+  }
+}

@@ -40,7 +40,8 @@ class FakeFirmware:
         pid_y=(0.0033, 0.0, 0.0),
         pid_yaw=(0.02, 0.0, 0.0),
         mode: str = "WORK",
-        host_proto: int = 2,
+        host_proto: int = 3,
+        host_owner: Optional[str] = "RPI",
         # ---- POSE 仿真参数 ----
         pose_start_delay_s: float = 0.0,  # POSE SET -> # POSE START 延迟
         pose_reached_delay_s: float = 0.3,  # # POSE START -> # POSE TARGET 延迟
@@ -59,6 +60,7 @@ class FakeFirmware:
         self.pids = {"X": pid_x, "Y": pid_y, "YAW": pid_yaw}
         self.mode = mode
         self.host_proto = host_proto
+        self.host_owner = host_owner
         self.pose_start_delay_s = pose_start_delay_s
         self.pose_reached_delay_s = pose_reached_delay_s
         self.pose_start_ok = pose_start_ok
@@ -117,9 +119,26 @@ class FakeFirmware:
     def _respond(self, command: str) -> None:
         if command == "PING":
             self._responses.append("# PONG")
+        elif command.startswith("HOST LINK "):
+            self._host_link(command)
+        elif command == "HOST STATUS":
+            state = (
+                "LINKED" if self.host_owner is not None
+                else "WAITING"
+            )
+            owner = self.host_owner or "NONE"
+            self._responses.append(
+                f"# HOST STATUS STATE={state} OWNER={owner} MOTOR_EN="
+                f"{int(self.host_owner is not None)} HEARTBEAT="
+                f"{'REQUIRED' if self.host_owner == 'RPI' else 'OFF'} "
+                "WAIT_MS=0 TIMEOUT_MS=60000"
+            )
         elif command == "STOP":
+            self._pose_pending.clear()
             if self.ack_stop:
                 self._responses.append(f"# STOP MODE={self.mode}")
+        elif self.host_owner is None:
+            self._responses.append("# ERROR HOST NOT LINKED")
         elif command.startswith("POSE SET "):
             self._pose_set(command)
         elif command == "POSE STOP":
@@ -140,7 +159,7 @@ class FakeFirmware:
         elif command == "STATUS":
             axis, pid = list(self.pids.items())[0]
             self._responses.append(
-                f"# STATUS MODE={self.mode} HOST_PROTO={self.host_proto} "
+                f"# STATUS MODE={self.mode} HOST_PROTO={self.host_proto} HOST={self.host_owner} "
                 f"AXIS={axis} P={pid[0]:.7f} I={pid[1]:.8f} D={pid[2]:.7f} "
                 f"MAX_OUT=0.200 STATE=0 PLOT=0 MOTOR_PROTO=EMM "
                 f"OPS_FRAMES={self.ops_frames} UART_TX_OK=0 UART_TX_ERR=0"
@@ -185,6 +204,20 @@ class FakeFirmware:
             self._responses.append(f"# ERROR UNKNOWN COMMAND")
         else:
             self._responses.append("# ERROR UNKNOWN COMMAND")
+
+    def _host_link(self, command: str) -> None:
+        parts = command.split()
+        requested = parts[2] if len(parts) == 3 else ""
+        if requested not in {"COM", "RPI"}:
+            self._responses.append("# ERROR HOST LINK COM|RPI")
+            return
+        # 单根 USB 线：允许 COM/RPI 重新声明；切换前清除所有旧运动响应。
+        self.host_owner = requested
+        self._pose_pending.clear()
+        self._responses.append(
+            f"# HOST LINK {requested} OK HEARTBEAT="
+            f"{'REQUIRED' if requested == 'RPI' else 'OFF'}"
+        )
 
     def _pose_set(self, command: str) -> None:
         """POSE SET：安排延迟的 # POSE START / # POSE TARGET / 安全停车。"""

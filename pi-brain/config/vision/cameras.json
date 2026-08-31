@@ -1,0 +1,26 @@
+{
+  "platform": "raspberry_pi_5",
+  "front": {
+    "camera_num": 0,
+    "role": "front_navigation",
+    "frame_size": [640, 480],
+    "format": "RGB888",
+    "fps": 30,
+    "buffer_count": 3,
+    "controls": {"AwbEnable": true},
+    "qr_confirmations": 2
+  },
+  "gripper": {
+    "camera_num": 1,
+    "role": "gripper_material",
+    "frame_size": [640, 480],
+    "format": "RGB888",
+    "fps": 15,
+    "buffer_count": 3,
+    "controls": {"AwbEnable": true},
+    "grip_center": [320, 240],
+    "alignment_tolerance_pixels": [18, 18],
+    "require_global_ready": false,
+    "require_global_ready_note": "false表示近距离只见单件物料时，confirmed+aligned且画面不歧义即可由任务层评估；它不代表自动执行抓取"
+  }
+}

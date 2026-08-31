@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""树莓派启动自检状态机：STOP -> SELF_CHECK -> PID重载 -> READY。"""
+"""树莓派启动自检状态机：HOST LINK RPI -> STOP -> 自检 -> READY。"""
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Protocol
 
+from .models import Pose
 from .protocol import (
     CanError,
     CanStatus,
     Event,
+    HostLinkAcknowledged,
     ModeChanged,
     OpsStatus,
     PidLimitSet,
@@ -23,6 +25,8 @@ from .protocol import (
     Status,
     StopAcknowledged,
     UnknownError,
+    PRIORITY_CONFIG,
+    PRIORITY_STOP,
 )
 from .serial_bridge import SerialConnected, SerialDisconnected
 
@@ -41,6 +45,7 @@ class BridgePort(Protocol):
 class StartupState(str, Enum):
     BOOT = "BOOT"
     WAIT_CONNECTION = "WAIT_CONNECTION"
+    WAIT_HOST_LINK = "WAIT_HOST_LINK"
     WAIT_STOP = "WAIT_STOP"
     WAIT_MODE_WORK = "WAIT_MODE_WORK"
     WAIT_STATUS = "WAIT_STATUS"
@@ -76,7 +81,7 @@ class StartupConfig:
     limit_y: float = 0.20
     limit_yaw: float = 0.25
     step_timeout: float = 1.5
-    minimum_protocol: int = 2
+    minimum_protocol: int = 3
 
 
 class StartupStateMachine:
@@ -98,6 +103,7 @@ class StartupStateMachine:
         self._clock = clock
         self.state = StartupState.BOOT
         self.fault_reason = ""
+        self.ops_pose: Pose | None = None
         self._deadline: float | None = None
 
     @property
@@ -107,9 +113,10 @@ class StartupStateMachine:
     def start(self) -> None:
         """开始或重新开始自检；首先锁存急停并清除旧命令。"""
         self.fault_reason = ""
+        self.ops_pose = None
         self.bridge.emergency_stop()
         if self.bridge.is_connected:
-            self._enter(StartupState.WAIT_STOP)
+            self._request_host_link()
         else:
             self._enter(StartupState.WAIT_CONNECTION, timeout=False)
 
@@ -126,6 +133,9 @@ class StartupStateMachine:
         if isinstance(event, (SafetyFault, CanError, UnknownError)):
             self._fail(event.raw or type(event).__name__)
             return
+        if self.state == StartupState.READY and isinstance(event, ModeChanged):
+            self._fail(f"mode changed after READY: {event.raw}")
+            return
         if isinstance(event, SerialConnected):
             if self.state in (StartupState.BOOT, StartupState.WAIT_CONNECTION, StartupState.FAULT):
                 self.start()
@@ -134,6 +144,7 @@ class StartupStateMachine:
             return
 
         handlers = {
+            StartupState.WAIT_HOST_LINK: self._on_host_link,
             StartupState.WAIT_STOP: self._on_stop,
             StartupState.WAIT_MODE_WORK: self._on_mode,
             StartupState.WAIT_STATUS: self._on_status,
@@ -150,6 +161,20 @@ class StartupStateMachine:
         handler = handlers.get(self.state)
         if handler is not None:
             handler(event)
+
+    def _request_host_link(self) -> None:
+        self.bridge.send("HOST LINK RPI", priority=PRIORITY_CONFIG)
+        self._enter(StartupState.WAIT_HOST_LINK)
+
+    def _on_host_link(self, event: Event) -> None:
+        if not isinstance(event, HostLinkAcknowledged):
+            return
+        if event.host != "RPI":
+            self._fail(f"unexpected host link acknowledgement: {event.raw}")
+            return
+        # 握手只确认所有权；再次 STOP，确保随后自检从确定的静止状态开始。
+        self.bridge.send("STOP", priority=PRIORITY_STOP)
+        self._enter(StartupState.WAIT_STOP)
 
     def _on_stop(self, event: Event) -> None:
         stopped = isinstance(event, StopAcknowledged) or (
@@ -186,6 +211,7 @@ class StartupStateMachine:
         if event.link != "OK" or event.frames <= 0:
             self._fail(f"OPS not ready: {event.raw}")
             return
+        self.ops_pose = Pose(event.x, event.y, event.yaw)
         self.bridge.send("CAN STATUS")
         self._enter(StartupState.WAIT_CAN)
 
@@ -276,6 +302,7 @@ class StartupStateMachine:
 
     def _fail(self, reason: str) -> None:
         self.fault_reason = reason
+        self.ops_pose = None
         self.state = StartupState.FAULT
         self._deadline = None
         self.bridge.emergency_stop()

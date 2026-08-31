@@ -17,7 +17,13 @@ from typing import Iterable
 
 import serial
 
-from app.protocol import Pong, PoseTelemetry, WheelTelemetry
+from app.protocol import (
+    HostLinkAcknowledged,
+    ModeChanged,
+    Pong,
+    PoseTelemetry,
+    WheelTelemetry,
+)
 from app.serial_bridge import SerialBridgeThread, SerialConnected, SerialDisconnected
 
 
@@ -112,16 +118,18 @@ def main() -> int:
     recorder = CsvRecorder(args.csv_dir)
     running = threading.Event()
     running.set()
+    host_owned = threading.Event()
+    host_ready = threading.Event()
 
     def serial_factory():
         return serial.Serial(
             args.port, args.baud, timeout=0.05, write_timeout=0.1
         )
 
-    # TUNE按固件设计不依赖心跳；WORK和PLOT必须持续维持心跳。
+    # HOST LINK COM 明确免心跳；PC 工具不发送周期 PING。
     bridge = SerialBridgeThread(
         serial_factory,
-        heartbeat_enabled=args.mode != "tune",
+        heartbeat_enabled=False,
         ping_interval=0.4,
     )
 
@@ -130,10 +138,28 @@ def main() -> int:
             # 控制/安全事件优先；遥测使用独立有界队列并一次排空，不能反压心跳。
             event = bridge.get_event(timeout=0.01)
             if isinstance(event, SerialConnected):
+                host_owned.clear()
+                host_ready.clear()
+                bridge.emergency_stop()
+                bridge.send("HOST LINK COM", priority=30)
+                print(f"[LINK] connected {args.port}; requesting COM ownership")
+            elif isinstance(event, HostLinkAcknowledged) and event.host == "COM":
+                # 取得所有权后再次 STOP，再切换模式；ModeChanged 前不开放控制台。
+                host_owned.set()
+                bridge.emergency_stop()
                 bridge.send(f"MODE {args.mode.upper()}", priority=30)
+            elif (
+                isinstance(event, ModeChanged)
+                and host_owned.is_set()
+                and event.mode == args.mode.upper()
+            ):
                 bridge.send("TELEM BOTH", priority=30)
-                print(f"[LINK] connected {args.port}; mode={args.mode.upper()}")
+                bridge.release_emergency_stop()
+                host_ready.set()
+                print(f"[LINK] COM ownership confirmed; mode={args.mode.upper()}")
             elif isinstance(event, SerialDisconnected):
+                host_owned.clear()
+                host_ready.clear()
                 print("[LINK] disconnected; motion gate is latched")
             elif event is not None and not isinstance(event, Pong):
                 print(event.raw or str(event))
@@ -159,6 +185,8 @@ def main() -> int:
                 return
             if command.upper() == "STOP":
                 bridge.emergency_stop()
+            elif not host_ready.is_set():
+                print("[SEND] HOST LINK COM and mode confirmation not complete")
             else:
                 try:
                     bridge.send(command)

@@ -1,0 +1,18 @@
+{
+  "input_color_order": "RGB",
+  "black_threshold": 55,
+  "minimum_area_px": 180,
+  "maximum_area_px": 40000,
+  "minimum_aspect_ratio": 0.35,
+  "maximum_aspect_ratio": 1.6,
+  "roi_top_fraction": 0.25,
+  "physical_radius_mm": 35.0,
+  "projection_uncertainty_mm": 25.0,
+  "homography_image_to_base": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+  "tracking": {
+    "confirmations_required": 3,
+    "matching_distance_mm": 120.0,
+    "retention_seconds": 0.5
+  },
+  "calibration_required": true
+}

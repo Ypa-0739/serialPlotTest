@@ -117,6 +117,11 @@ class Navigator:
     def active_goal_id(self) -> Optional[int]:
         return self._req.goal_id if self._req is not None else None
 
+    @property
+    def active_target(self) -> Optional[Pose]:
+        """当前活动目标的位姿（无活动目标时为 None）。供日志等只读消费者使用。"""
+        return self._req.target if self._req is not None else None
+
     def set_ready(self, ready: bool) -> None:
         """由主循环在 StartupState 进入/离开 READY 时调用（门禁开关）。"""
         self._gate_open = ready

@@ -36,6 +36,14 @@ def encode_status() -> bytes:
     return b"STATUS\n"
 
 
+def encode_host_link(host: str) -> bytes:
+    """申请主机所有权；host 只能是 COM 或 RPI。"""
+    normalized = host.strip().upper()
+    if normalized not in {"COM", "RPI"}:
+        raise ValueError("host must be COM or RPI")
+    return f"HOST LINK {normalized}\n".encode("ascii")
+
+
 def encode_pose_set(x_mm: float, y_mm: float, yaw_deg: float) -> bytes:
     """POSE SET：OPS 原始目标坐标（mm/mm/deg）。"""
     return f"POSE SET {x_mm:.2f} {y_mm:.2f} {yaw_deg:.2f}\n".encode("ascii")
@@ -131,6 +139,21 @@ class RawMessage(Event):
 @dataclass(frozen=True)
 class Pong(Event):
     pass
+
+
+@dataclass(frozen=True)
+class HostLinkAcknowledged(Event):
+    host: str = ""
+
+
+@dataclass(frozen=True)
+class HostStatus(Event):
+    state: str = ""
+    owner: str = ""
+    motor_enabled: bool = False
+    heartbeat: str = ""
+    wait_ms: int = 0
+    timeout_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -582,6 +605,23 @@ def parse_line(line: str) -> Optional[Event]:
         return _parse_csv(text)
     if text == "# PONG":
         return Pong(raw=text)
+    if text.startswith("# HOST LINK "):
+        parts = text.split()
+        requested = parts[3] if len(parts) > 3 else ""
+        if len(parts) > 4 and parts[4] == "OK":
+            return HostLinkAcknowledged(raw=text, host=requested)
+        return RawMessage(raw=text)
+    if text.startswith("# HOST STATUS "):
+        kv = _kv(text)
+        return HostStatus(
+            raw=text,
+            state=kv.get("STATE", ""),
+            owner=kv.get("OWNER", ""),
+            motor_enabled=bool(_i(kv.get("MOTOR_EN"))),
+            heartbeat=kv.get("HEARTBEAT", ""),
+            wait_ms=_i(kv.get("WAIT_MS")),
+            timeout_ms=_i(kv.get("TIMEOUT_MS")),
+        )
     if text == "# POSE STOP":
         return PoseStopped(raw=text)
     if text.startswith("# STOP MODE="):

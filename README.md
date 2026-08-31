@@ -35,6 +35,9 @@ OPS9 安装在车体中心前方 25 mm。固件保留原始 OPS 坐标，同时�
 常用命令：
 
 ```text
+HOST LINK COM
+HOST LINK RPI
+HOST STATUS
 MODE WORK
 MODE TUNE
 MODE PLOT
@@ -59,6 +62,18 @@ G6220 ENABLE
 G6220 DISABLE
 ```
 
+固件完成 UART、CAN、OPS 和执行器通信初始化后进入 `HOST WAIT`。四轮闭环
+步进电机保持使能且目标速度为零，利用保持力矩防止外力造成车轮旋转或车体偏移；
+G6220 保持失能。等待 60 秒只会输出一次超时提示，之后仍保持安全等待，绝不
+自动进入运行态。PC 工具必须先发送 `HOST LINK COM`，树莓派必须先发送
+`HOST LINK RPI`；握手成功后才开放原有命令和执行器。
+
+`HOST LINK` 用于声明当前 USB 接入端类型，不做多主机争抢锁定。由于实际只有
+一根 USB 线，后续 `HOST LINK COM/RPI` 可以安全切换类型；每次声明都会先停车、
+清除旧运动状态并回到 `WORK`，绝不恢复上一连接的目标。`COM` 用于有人看护的
+电脑调试，不要求周期心跳；`RPI` 用于比赛自主运行，`WORK/PLOT` 运动仍受
+1.5 秒 `HOST LOST` 保护。
+
 `TUNE` 模式不要求发送 `PING`：自动调参单轮最多运行 5 秒，每个调参会话最多
 20 轮；用于返回起点的 `POSE SET` 最多运行 15 秒。主循环持续判定这些上限，
 不使用阻塞 `while` 或 `HAL_Delay`；CAN 故障、OPS 丢失、方向错误、横向漂移、航向异常和越界保护
@@ -73,7 +88,7 @@ G6220 只使用电机内部闭环的“位置-速度模式”，STM32 不实现�
 
 ## 独立运行模式
 
-固件上电默认进入 `WORK`，三种模式通过同一套安全切换函数管理。每次切换都会先停止四轮、取消当前 POSE/调参/调试运动并清空 PID 内部历史，避免不同用途互相串扰：
+固件上电预置 `WORK`，但在 `HOST LINK` 成功前由独立等待门禁禁止所有业务和运动命令。三种模式通过同一套安全切换函数管理。每次切换都会先停止四轮、取消当前 POSE/调参/调试运动并清空 PID 内部历史，避免不同用途互相串扰：
 
 - `MODE WORK`：正常工作模式。用于正式 `POSE SET`、PID 加载和状态查询；不允许 `MOTOR RUN`、`MOVE`、`TURN` 调试命令。
 - `MODE TUNE`：PID 调参模式。允许调参轮次、返回起点的 `POSE SET`及调试运动；不要求心跳，但不豁免其他安全故障。
@@ -83,7 +98,9 @@ G6220 只使用电机内部闭环的“位置-速度模式”，STM32 不实现�
 
 为兼容现有命令，`TUNE AXIS X|Y|YAW`会自动切换到 `TUNE`；`PLOT ON`等价于进入 `PLOT`并开启两组遥测，`PLOT OFF`关闭遥测并返回 `WORK`。`STOP`只停止运动，不改变当前模式。正式运行前建议显式发送 `MODE WORK`。
 
-当前主机文本协议版本为 `2`，可发送 `PROTO VERSION`查询。`PID SET`和`PID LIMIT`是跨模式的非运动配置命令，便于WORK启动自检和TUNE装载参数；`TUNE LIMIT`以及会启动调参轮次的`SET P:... I:... D:...`仅允许在TUNE模式执行。`STATUS`的V2格式增加了 `MODE`、`HOST_PROTO`、`PLOT`和USART1发送统计字段。
+当前主机文本协议版本为 `3`，可发送 `PROTO VERSION` 查询。V3 新增强制
+`HOST LINK COM|RPI` 所有权握手；握手后原有 V2 业务命令格式保持不变。
+`PID SET`和`PID LIMIT`是跨模式的非运动配置命令，便于WORK启动自检和TUNE装载参数；`TUNE LIMIT`以及会启动调参轮次的`SET P:... I:... D:...`仅允许在TUNE模式执行。`STATUS`保留 `MODE`、`HOST_PROTO`、`PLOT`和USART1发送统计字段，并增加当前 `HOST`。
 
 ## POSE 梯形速度规划
 
@@ -120,6 +137,38 @@ OPS/HOST 丢失、CAN1 故障、非有限数值或行程越界同样直接清除
 不会经过减速斜坡，也不会在故障恢复后继续旧目标。PID 状态清理不会修改 Kp/Ki/Kd。
 
 USART1 的 `printf` 发送采用 20 ms 有限超时，不使用 `HAL_MAX_DELAY`；串口异常只会累计发送错误，不会永久卡住主循环。主循环执行顺序为接收命令 → 统一安全监督 → POSE/TUNE 控制与运动超时 → 电机反馈轮询 → 遥测发送。TUNE 使用实际经过时间计算斜坡并把异常间隔限制在 100 ms 内，避免串口阻塞造成固定 20 ms 步进漂移。
+
+## 树莓派视觉联调
+
+树莓派可通过 SSH 运行视觉只读调试，不连接 STM32、也不产生运动命令：
+
+```bash
+cd pi-brain
+python3 -m tools.vision_debug
+```
+
+需要验证“识别结果 → 地图航点 → 底盘闭环”时，使用联调入口：
+
+```bash
+python3 -m tools.vision_motion_debug --port /dev/serial/by-id/<STM32设备>
+python3 -m tools.vision_motion_debug --port /dev/serial/by-id/<STM32设备> --armed
+```
+
+地图标准起点、车体中心目标和视觉条件位于
+`pi-brain/config/vision_motion_debug.json`。程序用启动自检读到的实际 OPS 位姿
+锚定固定地图；默认目标与标准起点相同，因此默认配置不会产生位移。未指定
+`--armed` 时只能观察；指定后也不会自动发车，仍须自检进入 `READY`、视觉结果
+满足类型/编号/来源/置信度/新鲜度门禁，并由现场人员输入 `go`。交互命令为：
+
+- `status`：查看自检、路线和视觉健康状态；
+- `go`：经 `RouteRunner → Navigator → SerialBridgeThread` 提交一个地图目标；
+- `cancel`：取消当前路线并等待 STM32 停止确认；
+- `estop`：锁存软件急停，必须重启程序并重新自检后才能再运动；
+- `quit`：退出前先发送 STOP，再关闭相机和串口线程。
+
+联调进程使用 `HOST LINK RPI` 和 1.5 秒固件心跳监督，且必须是摄像头和 STM32
+串口的唯一所有者；不要同时运行另一份 `pi-brain`、绘图工具或串口助手。视觉
+只选择固定地图目标，不直接发送 `POSE SET`，也不发送四轮速度。
 
 ## Python 两组 8 通道实时波形
 

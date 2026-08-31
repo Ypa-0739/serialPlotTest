@@ -26,9 +26,13 @@ class PoseGoal:
     """预标定航点（第五阶段任务路由用）。
 
     route = [
-        PoseGoal("pick_approach", 800, 300, 0, 10),
+        PoseGoal("pick_approach", 800, 300, 0, 10, profile="cruise"),
         PoseGoal("pick_align", 950, 300, 0, 5),
     ]
+
+    profile 指定本航点使用的速度档（app/speed_profile.py 中的档名）：
+      - "cruise"：巡航档，外圈宽车道长距离转移
+      - "precise"：定位停车档（默认，安全兜底），窄巷/对位/启停区停车
     """
 
     name: str
@@ -36,6 +40,7 @@ class PoseGoal:
     y_mm: float
     yaw_deg: float
     timeout_s: float = 30.0  # 初期联调留足余量；从收到 PoseStarted 起算
+    profile: str = "precise"  # 缺省低速档：宁可慢不可越线
 
 
 class NavState(str, Enum):

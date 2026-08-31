@@ -94,8 +94,9 @@
 #define TELEMETRY_MASK_POSE          0x02U
 #define TELEMETRY_MASK_BOTH          (TELEMETRY_MASK_WHEEL | TELEMETRY_MASK_POSE)
 #define MOTOR_FEEDBACK_POLL_MS       10U
-#define HOST_PROTOCOL_VERSION        2U
+#define HOST_PROTOCOL_VERSION        3U
 #define HOST_UART_TX_TIMEOUT_MS      20U
+#define HOST_WAIT_TIMEOUT_MS         60000U
 #define G6220_CAN_ID                 0x01U
 #define G6220_MASTER_ID              0x00U
 #define G6220_CAN2_FILTER_BANK       14U
@@ -138,6 +139,12 @@ typedef enum {
 } RobotMode_t;
 
 typedef enum {
+    HOST_LINK_NONE = 0,
+    HOST_LINK_COM,
+    HOST_LINK_RPI
+} HostLink_t;
+
+typedef enum {
     POSE_PHASE_IDLE = 0,
     POSE_PHASE_TRANSLATE,
     POSE_PHASE_ROTATE
@@ -167,6 +174,10 @@ uint32_t debug_chassis_stop_tick = 0U;
 uint8_t ops_monitor_enabled = 0U;
 uint32_t ops_monitor_last_tick = 0U;
 uint32_t last_host_command_tick = 0U;
+HostLink_t active_host_link = HOST_LINK_NONE;
+uint32_t host_wait_start_tick = 0U;
+uint8_t host_wait_timeout_reported = 0U;
+uint8_t chassis_motors_enabled = 0U;
 uint8_t pose_control_active = 0U;
 PoseControlPhase_t pose_control_phase = POSE_PHASE_IDLE;
 float pose_target_x_mm = 0.0f;
@@ -223,6 +234,10 @@ static void Pose_InitMotionProfile(void);
 static void Pose_ResetPlanner(void);
 static void Robot_StopAllMotion(void);
 static void Robot_SetMode(RobotMode_t mode);
+static const char *HostLink_Name(HostLink_t link);
+static uint8_t HostLink_ProcessCommand(const char *command);
+static void HostLink_ProcessWait(uint32_t now);
+static void HostLink_SetChassisEnabled(uint8_t enable);
 
 /* USER CODE END PFP */
 
@@ -238,6 +253,13 @@ static const char *RobotMode_Name(RobotMode_t mode)
     if (mode == ROBOT_MODE_TUNE) return "TUNE";
     if (mode == ROBOT_MODE_PLOT) return "PLOT";
     return "WORK";
+}
+
+static const char *HostLink_Name(HostLink_t link)
+{
+    if (link == HOST_LINK_COM) return "COM";
+    if (link == HOST_LINK_RPI) return "RPI";
+    return "NONE";
 }
 
 static DM_G6220_Result_t G6220_SetEnabled(uint8_t enable)
@@ -269,6 +291,68 @@ static void Robot_StopAllMotion(void)
     PID_Reset(&pid_x);
     PID_Reset(&pid_y);
     PID_Reset(&pid_yaw);
+}
+
+static void HostLink_SetChassisEnabled(uint8_t enable)
+{
+    uint8_t id;
+    uint8_t all_ok = 1U;
+    uint8_t result;
+
+    /* 四轮闭环驱动器按顺序切换使能状态；使能且零速时提供静止保持力矩。 */
+    for (id = 1U; id <= 4U; id++) {
+        result = ZDT_Emm_EnableSingleMotor(id, enable);
+        Mecanum_ReportCanTxResult(result);
+        if (result != 0U) all_ok = 0U;
+        HAL_Delay(10U);
+    }
+    chassis_motors_enabled = (enable && all_ok) ? 1U : 0U;
+}
+
+static uint8_t HostLink_ProcessCommand(const char *command)
+{
+    HostLink_t requested = HOST_LINK_NONE;
+
+    if (strcmp(command, "HOST LINK COM") == 0) requested = HOST_LINK_COM;
+    else if (strcmp(command, "HOST LINK RPI") == 0) requested = HOST_LINK_RPI;
+    else if (strncmp(command, "HOST LINK ", 10U) == 0) {
+        printf("# ERROR HOST LINK COM|RPI\r\n");
+        return 1U;
+    }
+    else if (strcmp(command, "HOST STATUS") == 0) {
+        printf("# HOST STATUS STATE=%s OWNER=%s MOTOR_EN=%u HEARTBEAT=%s WAIT_MS=%lu TIMEOUT_MS=%lu\r\n",
+               active_host_link == HOST_LINK_NONE ? "WAITING" : "LINKED",
+               HostLink_Name(active_host_link),
+               chassis_motors_enabled,
+               active_host_link == HOST_LINK_RPI ? "REQUIRED" : "OFF",
+               (unsigned long)(HAL_GetTick() - host_wait_start_tick),
+               (unsigned long)HOST_WAIT_TIMEOUT_MS);
+        return 1U;
+    } else {
+        return 0U;
+    }
+
+    /* 每次声明或切换主机都先停车、清旧状态，绝不恢复上一个主机的目标。 */
+    Robot_StopAllMotion();
+    LLM_TunerResetSession();
+    telemetry_mask = 0U;
+    current_robot_mode = ROBOT_MODE_WORK;
+    active_host_link = requested;
+    last_host_command_tick = HAL_GetTick();
+    if (!chassis_motors_enabled) HostLink_SetChassisEnabled(1U);
+    printf("# HOST LINK %s OK HEARTBEAT=%s\r\n",
+           HostLink_Name(active_host_link),
+           active_host_link == HOST_LINK_RPI ? "REQUIRED" : "OFF");
+    return 1U;
+}
+
+static void HostLink_ProcessWait(uint32_t now)
+{
+    if (active_host_link != HOST_LINK_NONE || host_wait_timeout_reported) return;
+    if ((uint32_t)(now - host_wait_start_tick) >= HOST_WAIT_TIMEOUT_MS) {
+        host_wait_timeout_reported = 1U;
+        printf("# HOST WAIT TIMEOUT STATE=WAITING\r\n");
+    }
 }
 
 static void Robot_SetMode(RobotMode_t mode)
@@ -379,8 +463,9 @@ static void ChassisSafety_Process(uint32_t now)
         return;
     }
 
-    /* 只有TUNE豁免心跳；WORK和PLOT中的任何运动仍由HOST LOST保护。 */
-    needs_host = (current_robot_mode != ROBOT_MODE_TUNE) ? 1U : 0U;
+    /* 只有 RPI 在 WORK/PLOT 运动时要求心跳；COM 调试由操作者直接看护。 */
+    needs_host = (active_host_link == HOST_LINK_RPI &&
+                  current_robot_mode != ROBOT_MODE_TUNE) ? 1U : 0U;
     if (needs_host &&
         (uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) {
         ChassisSafety_Stop(motion, "HOST LOST");
@@ -522,6 +607,7 @@ static float Pose_BrakeLimitYaw(float error_deg, float tolerance_deg)
 
 static void Host_PrintHelp(void)
 {
+    printf("# HELP HOST LINK COM|RPI | HOST STATUS (COM no heartbeat; RPI heartbeat required)\r\n");
     printf("# HELP PROTO VERSION | MODE WORK|TUNE|PLOT | MODE STATUS (default WORK; switching stops motion)\r\n");
     printf("# HELP STATUS | PING | STOP | RESET | OPS STATUS | OPS MONITOR ON|OFF | OPS ZERO\r\n");
     printf("# HELP PROTO EMM|X | CAN STATUS | MOTOR EN|DIS <id>\r\n");
@@ -704,8 +790,13 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         return 1U;
     }
 
+    if (strcmp(command, "HELP") == 0) {
+        Host_PrintHelp();
+        return 1U;
+    }
+
     if (strcmp(command, "PROTO VERSION") == 0) {
-        printf("# PROTO VERSION=%u MODES=WORK,TUNE,PLOT LEGACY_POSE=1\r\n",
+        printf("# PROTO VERSION=%u MODES=WORK,TUNE,PLOT LEGACY_POSE=1 HOST_LINK=REQUIRED\r\n",
                HOST_PROTOCOL_VERSION);
         return 1U;
     }
@@ -1232,7 +1323,8 @@ static void Pose_ProcessControl(uint32_t now)
     if (!isfinite(current_ops_x) || !isfinite(current_ops_y) || !isfinite(current_yaw) ||
         ops9_frame_count == 0U ||
         (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS ||
-        (current_robot_mode != ROBOT_MODE_TUNE &&
+        (active_host_link == HOST_LINK_RPI &&
+         current_robot_mode != ROBOT_MODE_TUNE &&
          (uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) ||
         (current_robot_mode == ROBOT_MODE_TUNE &&
          (uint32_t)(now - pose_start_time) > POSE_TUNE_TIMEOUT_MS) ||
@@ -1408,8 +1500,29 @@ static void Host_ProcessCommand(void)
     }
     command[sizeof(command) - 1U] = '\0';
     pc_command_ready = 0U;
-    last_host_command_tick = HAL_GetTick();
     __enable_irq();
+
+    /* HOST LINK 在所有业务命令之前处理；抢占失败不能刷新当前主机心跳。 */
+    if (HostLink_ProcessCommand(command)) {
+        return;
+    }
+
+    if (active_host_link == HOST_LINK_NONE) {
+        /* 等待期间只开放无运动副作用的探测和停车命令。 */
+        if (strcmp(command, "PING") == 0 ||
+            strcmp(command, "PROTO VERSION") == 0 ||
+            strcmp(command, "HELP") == 0) {
+            (void)Host_ProcessOperationalCommand(command);
+        } else if (strcmp(command, "STOP") == 0) {
+            Robot_StopAllMotion();
+            printf("# STOP MODE=%s HOST=WAITING\r\n", RobotMode_Name(current_robot_mode));
+        } else {
+            printf("# ERROR HOST NOT LINKED\r\n");
+        }
+        return;
+    }
+
+    last_host_command_tick = HAL_GetTick();
 
     if (Host_ProcessOperationalCommand(command)) {
         return;
@@ -1549,9 +1662,10 @@ static void Host_ProcessCommand(void)
     } else if (strcmp(command, "STATUS") == 0) {
         requested_axis = LLM_TunerGetAxis();
         pid = LLM_TunerGetPid();
-        printf("# STATUS MODE=%s HOST_PROTO=%u AXIS=%s P=%.7f I=%.8f D=%.7f MAX_OUT=%.3f "
+        printf("# STATUS MODE=%s HOST_PROTO=%u HOST=%s AXIS=%s P=%.7f I=%.8f D=%.7f MAX_OUT=%.3f "
                "STATE=%u PLOT=%u MOTOR_PROTO=%s OPS_FRAMES=%lu UART_TX_OK=%lu UART_TX_ERR=%lu\r\n",
                RobotMode_Name(current_robot_mode), HOST_PROTOCOL_VERSION,
+               HostLink_Name(active_host_link),
                LLM_TunerAxisName(requested_axis),
                pid->Kp, pid->Ki, pid->Kd, pid->max_out,
                (unsigned int)LLM_TunerGetState(),
@@ -1649,17 +1763,11 @@ int main(void)
   // 3. 初始化 4 个电机
   ZDT_Emm_InitAll();
 
-  // 4. 使能所有电机（必须使能才能响应速度命令）
-  // 依据：P48 5.3.2 电机使能控制
+  // 4. 上电等待阶段四轮保持零速使能，用闭环保持力矩防止外力造成车体偏移。
   HAL_Delay(100);
-  ZDT_Emm_EnableByID(1);
-  HAL_Delay(10);
-  ZDT_Emm_EnableByID(2);
-  HAL_Delay(10);
-  ZDT_Emm_EnableByID(3);
-  HAL_Delay(10);
-  ZDT_Emm_EnableByID(4);
-  HAL_Delay(100);  // 等待使能完成
+  StopAllMotors();
+  HostLink_SetChassisEnabled(1U);
+  HAL_Delay(100);
 
   // 5. TIM3/TIM4 当前未使用，不启动定时器。
 
@@ -1677,15 +1785,19 @@ int main(void)
 
     StopAllMotors();
     if (g6220_initialized) {
-        /* 厂商建议 CAN 初始化后等待约 1 秒再使能，并留 30~100 ms 收命令。 */
+        /* 厂商建议 CAN 初始化后等待约 1 秒；等待态仍保持 G6220 失能。 */
         HAL_Delay(G6220_STARTUP_DELAY_MS);
-        g6220_result = G6220_SetEnabled(1U);
+        g6220_result = G6220_SetEnabled(0U);
         HAL_Delay(G6220_COMMAND_DELAY_MS);
     }
-    printf("# STM32F407 MECANUM X/Y/YAW PID CONTROLLER READY\r\n");
-    printf("# PROTO VERSION=%u MODES=WORK,TUNE,PLOT LEGACY_POSE=1\r\n",
+    host_wait_start_tick = HAL_GetTick();
+    last_host_command_tick = host_wait_start_tick;
+    printf("# STM32F407 MECANUM X/Y/YAW PID CONTROLLER HOST WAIT\r\n");
+    printf("# PROTO VERSION=%u MODES=WORK,TUNE,PLOT LEGACY_POSE=1 HOST_LINK=REQUIRED\r\n",
            HOST_PROTOCOL_VERSION);
-    printf("# MODE WORK PLOT=0 MOTION=STOPPED\r\n");
+    printf("# HOST WAIT STATE=WAITING TIMEOUT_MS=%lu ACCEPT=COM,RPI\r\n",
+           (unsigned long)HOST_WAIT_TIMEOUT_MS);
+    printf("# MODE WORK PLOT=0 MOTION=STOPPED HOST=WAITING\r\n");
     printf("# G6220 INIT=%u ENABLE_REQ=%u RESULT=%u CAN_ID=0x%02X MASTER_ID=0x%03X\r\n",
            g6220_initialized, g6220_enable_requested,
            (unsigned int)g6220_last_result,
@@ -1713,6 +1825,7 @@ int main(void)
 
       /* 命令处理和串口中断可能更新时间戳，超时判断前必须刷新当前时间。 */
       now = HAL_GetTick();
+      HostLink_ProcessWait(now);
       ChassisSafety_Process(now);
       Pose_ProcessControl(now);
 
@@ -1742,8 +1855,10 @@ int main(void)
           Ops_PrintStatus();
       }
 
-      Motor_ProcessFeedbackPolling(now);
-      Telemetry_Process(now);
+      if (active_host_link != HOST_LINK_NONE) {
+          Motor_ProcessFeedbackPolling(now);
+          Telemetry_Process(now);
+      }
 
       HAL_Delay(1);
 

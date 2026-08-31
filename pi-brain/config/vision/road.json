@@ -1,0 +1,12 @@
+{
+  "input_color_order": "RGB",
+  "roi_top_fraction": 0.45,
+  "central_corridor_fraction": 0.35,
+  "minimum_drivable_fraction": 0.35,
+  "minimum_central_drivable_fraction": 0.55,
+  "maximum_forbidden_fraction": 0.08,
+  "gray_hsv": {"lower": [0, 0, 45], "upper": [179, 70, 210]},
+  "yellow_hsv": {"lower": [15, 80, 80], "upper": [40, 255, 255]},
+  "white_hsv": {"lower": [0, 0, 190], "upper": [179, 65, 255]},
+  "calibration_required": true
+}
