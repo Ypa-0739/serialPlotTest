@@ -13,7 +13,17 @@ FakeFirmware 模拟 STM32 的串口行为：收到一行命令后立即生成对
 from __future__ import annotations
 
 import time
+import struct
 from typing import Optional
+
+from .binary_protocol import (
+    Command as BinaryCommand,
+    EventCode,
+    Frame,
+    FrameDecoder,
+    MessageType,
+    ResponseStatus,
+)
 
 
 class FakeFirmware:
@@ -70,14 +80,17 @@ class FakeFirmware:
         self.pose_safety_after_s = pose_safety_after_s
         self.pose_stopped_delay_s = pose_stopped_delay_s
         self.ack_stop = ack_stop
-        self._responses: list[str] = []  # 即时响应 FIFO
-        self._pose_pending: list[tuple[float, str]] = []  # (due, text) 按到期排序
+        self._responses: list[str | bytes] = []  # 即时响应 FIFO
+        self._pose_pending: list[tuple[float, str | bytes]] = []
         self.is_open = True
         self.closed = False
         self.timeout = 0.05
         self.write_timeout = 0.1
         self.received: list[str] = []  # 收到的命令记录（按序）
         self._fail = False
+        self._binary_decoder = FrameDecoder()
+        self._binary_tx_sequence = 0
+        self._binary_goal_id = 0
 
     def fail(self) -> None:
         """模拟物理断线。"""
@@ -94,9 +107,9 @@ class FakeFirmware:
         now = time.monotonic()
         for index, (due, _) in enumerate(self._pose_pending):
             if due <= now:
-                return self._pose_pending.pop(index)[1].encode("utf-8")
+                return self._wire(self._pose_pending.pop(index)[1])
         if self._responses:
-            return self._responses.pop(0).encode("utf-8")
+            return self._wire(self._responses.pop(0))
         return b""
 
     def write(self, data) -> int:
@@ -104,11 +117,79 @@ class FakeFirmware:
             raise OSError("write on closed serial")
         if self._fail:
             raise OSError("simulated write failure")
-        text = bytes(data).decode("utf-8", errors="replace").strip()
+        raw = bytes(data)
+        if raw.startswith(b"\xA5\x5A"):
+            for frame in self._binary_decoder.feed(raw):
+                self._respond_binary(frame)
+            return len(data)
+        text = raw.decode("utf-8", errors="replace").strip()
         if text:
             self.received.append(text)
             self._respond(text)
         return len(data)
+
+    @staticmethod
+    def _wire(value: str | bytes) -> bytes:
+        return value if isinstance(value, bytes) else value.encode("utf-8")
+
+    def _binary_frame(self, message_type: MessageType, payload: bytes) -> bytes:
+        frame = Frame(message_type, self._binary_tx_sequence, payload).encode()
+        self._binary_tx_sequence = (self._binary_tx_sequence + 1) & 0xFF
+        return frame
+
+    def _respond_binary(self, frame: Frame) -> None:
+        if frame.message_type != MessageType.COMMAND or not frame.payload:
+            return
+        command = frame.payload[0]
+        self.received.append(f"BINARY 0x{command:02X}")
+        status = ResponseStatus.OK
+        if command == BinaryCommand.SET_POSE_GOAL and len(frame.payload) == 21:
+            goal_id, x_mm, y_mm, yaw_mrad, _ = struct.unpack_from(
+                "<IiiiI", frame.payload, 1
+            )
+            self._binary_goal_id = goal_id
+            start_at = time.monotonic() + self.pose_start_delay_s
+            if self.pose_start_ok:
+                payload = bytes((EventCode.POSE_STARTED,)) + struct.pack("<I", goal_id)
+                self._pose_pending.append(
+                    (start_at, self._binary_frame(MessageType.EVENT, payload))
+                )
+            if self.pose_reached_ok:
+                payload = bytes((EventCode.POSE_REACHED,)) + struct.pack(
+                    "<Iiiiii",
+                    goal_id,
+                    x_mm,
+                    y_mm,
+                    yaw_mrad,
+                    round(self.pose_error_mm),
+                    round(self.pose_error_yaw * 17.45329252),
+                )
+                self._pose_pending.append(
+                    (
+                        start_at + self.pose_reached_delay_s,
+                        self._binary_frame(MessageType.EVENT, payload),
+                    )
+                )
+        elif command == BinaryCommand.CANCEL_POSE_GOAL and len(frame.payload) == 5:
+            goal_id = struct.unpack_from("<I", frame.payload, 1)[0]
+            self._pose_pending.clear()
+            payload = bytes((EventCode.POSE_CANCELLED,)) + struct.pack("<I", goal_id)
+            self._responses.append(self._binary_frame(MessageType.EVENT, payload))
+        elif command == BinaryCommand.STOP_ALL:
+            self._pose_pending.clear()
+            if self._binary_goal_id:
+                payload = bytes((EventCode.POSE_CANCELLED,)) + struct.pack(
+                    "<I", self._binary_goal_id
+                )
+                self._responses.append(self._binary_frame(MessageType.EVENT, payload))
+        elif command not in (
+            BinaryCommand.PING,
+            BinaryCommand.QUERY_POSE_GOAL,
+            BinaryCommand.SET_SPEED_LIMITS,
+        ):
+            status = ResponseStatus.UNKNOWN_COMMAND
+        response = bytes((frame.sequence, command, status))
+        self._responses.insert(0, self._binary_frame(MessageType.RESPONSE, response))
 
     def close(self) -> None:
         self.is_open = False
@@ -119,6 +200,8 @@ class FakeFirmware:
     def _respond(self, command: str) -> None:
         if command == "PING":
             self._responses.append("# PONG")
+        elif command == "HOST BINARY START":
+            self._responses.append("# HOST BINARY READY")
         elif command.startswith("HOST LINK "):
             self._host_link(command)
         elif command == "HOST STATUS":

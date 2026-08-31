@@ -121,7 +121,8 @@ typedef enum {
     RPI_CMD_STOP_ALL = 0x02,
     RPI_CMD_SET_POSE_GOAL = 0x80,
     RPI_CMD_CANCEL_POSE_GOAL = 0x81,
-    RPI_CMD_QUERY_POSE_GOAL = 0x82
+    RPI_CMD_QUERY_POSE_GOAL = 0x82,
+    RPI_CMD_SET_SPEED_LIMITS = 0x83
 } RpiCommand_t;
 
 typedef enum {
@@ -179,8 +180,8 @@ volatile uint8_t pc_command_ready = 0;
 RpiProtocolParser rpi_binary_parser;
 volatile uint8_t rpi_binary_candidate = 0U;
 volatile uint8_t rpi_binary_active = 0U;
-volatile uint8_t rpi_binary_frame_ready = 0U;
-RpiFrame rpi_binary_pending_frame;
+volatile uint8_t rpi_binary_armed = 0U;
+RpiFrameQueue rpi_binary_rx_queue;
 uint8_t rpi_binary_tx_sequence = 0U;
 uint32_t rpi_binary_goal_id = 0U;
 uint32_t rpi_binary_goal_timeout_ms = POSE_WORK_TIMEOUT_MS;
@@ -297,13 +298,19 @@ static void Pose_InitMotionProfile(void);
 static void Pose_ResetPlanner(void);
 static void Robot_StopAllMotion(void);
 static void RpiBinary_Process(void);
+static void RpiBinary_ProcessSessionTimeout(uint32_t now);
 static void RpiBinary_OnFrame(const RpiFrame *frame, void *context);
 static void RpiBinary_SendFault(uint16_t reason);
+static uint8_t RpiBinary_DequeueFrame(RpiFrame *frame);
+static void RpiBinary_ResetRxQueue(void);
 static void Robot_SetMode(RobotMode_t mode);
 static const char *HostLink_Name(HostLink_t link);
 static uint8_t HostLink_ProcessCommand(const char *command);
 static void HostLink_ProcessWait(uint32_t now);
 static void HostLink_SetChassisEnabled(uint8_t enable);
+static ChassisMotionType_t ChassisSafety_GetActiveMotion(void);
+static uint8_t ChassisSafety_CanReady(void);
+static uint8_t ChassisSafety_OpsReady(uint32_t now);
 
 /* USER CODE END PFP */
 
@@ -379,6 +386,24 @@ static uint8_t HostLink_ProcessCommand(const char *command)
 {
     HostLink_t requested = HOST_LINK_NONE;
 
+    if (strcmp(command, "HOST BINARY START") == 0) {
+        uint32_t now = HAL_GetTick();
+        if (active_host_link != HOST_LINK_RPI ||
+            current_robot_mode != ROBOT_MODE_WORK ||
+            ChassisSafety_GetActiveMotion() != CHASSIS_MOTION_NONE ||
+            !chassis_motors_enabled ||
+            !ChassisSafety_CanReady() ||
+            !ChassisSafety_OpsReady(now)) {
+            rpi_binary_armed = 0U;
+            printf("# ERROR HOST BINARY NOT READY\r\n");
+            return 1U;
+        }
+        rpi_binary_armed = 1U;
+        last_host_command_tick = now;
+        printf("# HOST BINARY READY\r\n");
+        return 1U;
+    }
+
     if (strcmp(command, "HOST LINK COM") == 0) requested = HOST_LINK_COM;
     else if (strcmp(command, "HOST LINK RPI") == 0) requested = HOST_LINK_RPI;
     else if (strncmp(command, "HOST LINK ", 10U) == 0) {
@@ -404,6 +429,11 @@ static uint8_t HostLink_ProcessCommand(const char *command)
     telemetry_mask = 0U;
     current_robot_mode = ROBOT_MODE_WORK;
     active_host_link = requested;
+    rpi_binary_armed = 0U;
+    rpi_binary_active = 0U;
+    rpi_binary_candidate = 0U;
+    RpiBinary_ResetRxQueue();
+    RpiProtocol_ParserReset(&rpi_binary_parser);
     last_host_command_tick = HAL_GetTick();
     if (!chassis_motors_enabled) HostLink_SetChassisEnabled(1U);
     printf("# HOST LINK %s OK HEARTBEAT=%s\r\n",
@@ -716,19 +746,56 @@ static void RpiBinary_WriteI32(uint8_t *output, int32_t value)
 
 static void RpiBinary_OnFrame(const RpiFrame *frame, void *context)
 {
-    uint16_t index;
+    uint8_t urgent;
     (void)context;
-    if (frame == NULL || rpi_binary_frame_ready) return;
-    rpi_binary_pending_frame.version = frame->version;
-    rpi_binary_pending_frame.message_type = frame->message_type;
-    rpi_binary_pending_frame.sequence = frame->sequence;
-    rpi_binary_pending_frame.payload_length = frame->payload_length;
-    for (index = 0U; index < frame->payload_length; ++index) {
-        rpi_binary_pending_frame.payload[index] = frame->payload[index];
-    }
-    rpi_binary_frame_ready = 1U;
+    if (frame == NULL) return;
+
+    /* STOP has a dedicated latch and can never be displaced by ordinary frames. */
+    urgent = (frame->message_type == RPI_MSG_COMMAND &&
+              frame->payload_length == 1U &&
+              frame->payload[0] == RPI_CMD_STOP_ALL) ? 1U : 0U;
+    (void)RpiProtocol_QueuePush(&rpi_binary_rx_queue, frame, urgent);
     rpi_binary_candidate = 1U;
-    if (active_host_link != HOST_LINK_COM) rpi_binary_active = 1U;
+    if (rpi_binary_armed && active_host_link == HOST_LINK_RPI) {
+        rpi_binary_active = 1U;
+        last_host_command_tick = HAL_GetTick();
+    }
+}
+
+static uint8_t RpiBinary_DequeueFrame(RpiFrame *frame)
+{
+    uint8_t available;
+    if (frame == NULL) return 0U;
+    __disable_irq();
+    available = RpiProtocol_QueuePop(&rpi_binary_rx_queue, frame);
+    __enable_irq();
+    return available;
+}
+
+static void RpiBinary_ResetRxQueue(void)
+{
+    __disable_irq();
+    RpiProtocol_QueueReset(&rpi_binary_rx_queue);
+    __enable_irq();
+}
+
+static void RpiBinary_ProcessSessionTimeout(uint32_t now)
+{
+    if (!rpi_binary_active ||
+        (uint32_t)(now - last_host_command_tick) <= LLM_TUNE_HOST_TIMEOUT_MS) {
+        return;
+    }
+    /* Link loss never resumes the old binary goal; return to ASCII self-check. */
+    Robot_StopAllMotion();
+    rpi_binary_active = 0U;
+    rpi_binary_armed = 0U;
+    rpi_binary_candidate = 0U;
+    rpi_binary_goal_id = 0U;
+    rpi_binary_pose_state = RPI_POSE_IDLE;
+    active_host_link = HOST_LINK_NONE;
+    host_wait_start_tick = now;
+    RpiBinary_ResetRxQueue();
+    RpiProtocol_ParserReset(&rpi_binary_parser);
 }
 
 static HAL_StatusTypeDef RpiBinary_Send(uint8_t message_type,
@@ -809,27 +876,20 @@ static void RpiBinary_Process(void)
     uint32_t timeout_ms;
     uint8_t send_cancelled = 0U;
     PoseStartResult_t start_result;
+    float linear_limit;
+    float yaw_limit;
 
-    if (!rpi_binary_frame_ready) return;
-    __disable_irq();
-    frame = rpi_binary_pending_frame;
-    rpi_binary_frame_ready = 0U;
-    __enable_irq();
+    if (!RpiBinary_DequeueFrame(&frame)) return;
 
-    if (active_host_link == HOST_LINK_COM) {
-        command = frame.payload_length > 0U ? frame.payload[0] : 0U;
+    command = frame.payload_length > 0U ? frame.payload[0] : 0U;
+    if ((!rpi_binary_armed || active_host_link != HOST_LINK_RPI) &&
+        command != RPI_CMD_STOP_ALL) {
         RpiBinary_SendResponse(frame.sequence, command, RPI_STATUS_BUSY, NULL, 0U);
         rpi_binary_candidate = 0U;
         RpiProtocol_ParserReset(&rpi_binary_parser);
         return;
     }
-    if (active_host_link == HOST_LINK_NONE) {
-        Robot_StopAllMotion();
-        current_robot_mode = ROBOT_MODE_WORK;
-        active_host_link = HOST_LINK_RPI;
-        if (!chassis_motors_enabled) HostLink_SetChassisEnabled(1U);
-    }
-    rpi_binary_active = 1U;
+    if (rpi_binary_armed) rpi_binary_active = 1U;
     last_host_command_tick = HAL_GetTick();
 
     if (frame.message_type != RPI_MSG_COMMAND || frame.payload_length == 0U) {
@@ -911,6 +971,25 @@ static void RpiBinary_Process(void)
         RpiBinary_WriteI32(&response_data[13], (int32_t)lroundf(robot_yaw * 17.45329252f));
         RpiBinary_WriteU16(&response_data[17], rpi_binary_fault_reason);
         response_length = sizeof(response_data);
+        break;
+    case RPI_CMD_SET_SPEED_LIMITS:
+        if (frame.payload_length != 9U || pose_control_active) {
+            status = frame.payload_length != 9U ?
+                     RPI_STATUS_INVALID_LENGTH : RPI_STATUS_BUSY;
+            break;
+        }
+        linear_limit = (float)RpiBinary_ReadI32(&frame.payload[1]) / 1000000.0f;
+        yaw_limit = (float)RpiBinary_ReadI32(&frame.payload[5]) / 1000000.0f;
+        if (linear_limit < POSE_SPEED_MIN_MPS ||
+            linear_limit > POSE_SPEED_HARD_MAX_MPS ||
+            yaw_limit < POSE_YAW_SPEED_MIN_RADPS ||
+            yaw_limit > POSE_YAW_SPEED_HARD_MAX_RADPS) {
+            status = RPI_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        pid_x.max_out = linear_limit;
+        pid_y.max_out = linear_limit;
+        pid_yaw.max_out = yaw_limit;
         break;
     default:
         status = RPI_STATUS_UNKNOWN_COMMAND;
@@ -2083,6 +2162,7 @@ int main(void)
   HAL_UART_Receive_IT(&huart2, &ops9_rx_byte, 1);
   // 开启 USART1 单字节中断接收（接收树莓派或 PC 发来的主机命令）
     RpiProtocol_ParserInit(&rpi_binary_parser, RpiBinary_OnFrame, NULL);
+    RpiProtocol_QueueReset(&rpi_binary_rx_queue);
     HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
   // 1. 初始化 CAN 和过滤器
   ZDT_CAN_ConfigFilter();
@@ -2169,6 +2249,7 @@ int main(void)
       now = HAL_GetTick();
       HostLink_ProcessWait(now);
       ChassisSafety_Process(now);
+      RpiBinary_ProcessSessionTimeout(now);
       Pose_ProcessControl(now);
 
       /* 鎺у埗鍜岃秴鏃朵紭鍏堬紱涓插彛杞涓庨仴娴嬫斁鍦ㄦ湰杞湯灏俱€?*/
@@ -2355,7 +2436,9 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         pc_rx_idx = 0U;
         rpi_binary_candidate = 0U;
         rpi_binary_active = 0U;
-        rpi_binary_frame_ready = 0U;
+        rpi_binary_armed = 0U;
+        /* Already in USART ISR: reset indices directly, never re-enable IRQ here. */
+        RpiProtocol_QueueReset(&rpi_binary_rx_queue);
         RpiProtocol_ParserReset(&rpi_binary_parser);
         HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
     }

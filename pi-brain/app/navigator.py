@@ -57,7 +57,11 @@ from .protocol import (
     UnknownError,
     encode_pose_set,
 )
-from .serial_bridge import MotionCommandRejected, SerialDisconnected
+from .serial_bridge import (
+    BinaryCommandRejected,
+    MotionCommandRejected,
+    SerialDisconnected,
+)
 
 
 class NavigationRejected(RuntimeError):
@@ -170,11 +174,22 @@ class Navigator:
         )
         self.state = NavState.WAIT_POSE_START
         try:
-            self.bridge.send(
-                encode_pose_set(x_mm, y_mm, yaw_deg).decode("ascii").strip(),
-                priority=PRIORITY_MOTION,
-            )
-        except MotionCommandRejected as exc:
+            if getattr(self.bridge, "is_binary_mode", False):
+                self.bridge.send_pose_goal(
+                    goal_id,
+                    x_mm,
+                    y_mm,
+                    yaw_deg,
+                    effective_motion_timeout,
+                    priority=PRIORITY_MOTION,
+                )
+            else:
+                # 测试替身及人工 COM 调试仍可复用既有 ASCII 路径。
+                self.bridge.send(
+                    encode_pose_set(x_mm, y_mm, yaw_deg).decode("ascii").strip(),
+                    priority=PRIORITY_MOTION,
+                )
+        except (MotionCommandRejected, ValueError) as exc:
             # 竞态：检查后急停被锁存。回退到 IDLE，绝不重试。
             self._req = None
             self.state = NavState.IDLE
@@ -198,8 +213,10 @@ class Navigator:
             return False
         self.state = NavState.CANCELLING
         self._req.cancel_deadline = self._clock() + self._cancel_confirm_timeout
-        # POSE STOP 不是运动命令，急停锁存期间也可发送
-        self.bridge.send("POSE STOP", priority=PRIORITY_STOP)
+        if getattr(self.bridge, "is_binary_mode", False):
+            self.bridge.cancel_pose_goal(goal_id, priority=PRIORITY_STOP)
+        else:
+            self.bridge.send("POSE STOP", priority=PRIORITY_STOP)
         return True
 
     def reset(self) -> None:
@@ -213,6 +230,14 @@ class Navigator:
     # ------------------------------------------------------------------
 
     def handle_event(self, event: Event) -> None:
+        event_goal_id = getattr(event, "goal_id", None)
+        if (
+            self._req is not None
+            and event_goal_id is not None
+            and event_goal_id != self._req.goal_id
+        ):
+            return  # 严格忽略旧目标的迟到事件
+
         # 全局故障优先：无论什么状态立即失败并急停
         if isinstance(event, SafetyFault):
             self._abort(GotoReason.SAFETY_FAULT, emergency=True)
@@ -221,6 +246,9 @@ class Navigator:
             self._abort(GotoReason.CAN_ERROR, emergency=True)
             return
         if isinstance(event, UnknownError):
+            self._abort(GotoReason.UNKNOWN_ERROR, emergency=True)
+            return
+        if isinstance(event, BinaryCommandRejected):
             self._abort(GotoReason.UNKNOWN_ERROR, emergency=True)
             return
         if isinstance(event, SerialDisconnected):

@@ -138,3 +138,48 @@ void RpiProtocol_FeedByte(RpiProtocolParser *parser, uint8_t byte)
         break;
     }
 }
+
+void RpiProtocol_QueueReset(RpiFrameQueue *queue)
+{
+    if (queue == 0) return;
+    queue->head = 0U;
+    queue->tail = 0U;
+    queue->count = 0U;
+    queue->urgent_ready = 0U;
+    queue->dropped = 0U;
+}
+
+uint8_t RpiProtocol_QueuePush(RpiFrameQueue *queue,
+                              const RpiFrame *frame,
+                              uint8_t urgent)
+{
+    if (queue == 0 || frame == 0) return 0U;
+    if (urgent) {
+        queue->urgent_frame = *frame;
+        queue->urgent_ready = 1U;
+        return 1U;
+    }
+    if (queue->count >= RPI_PROTOCOL_QUEUE_CAPACITY) {
+        queue->dropped++;
+        return 0U;
+    }
+    queue->frames[queue->head] = *frame;
+    queue->head = (uint8_t)((queue->head + 1U) % RPI_PROTOCOL_QUEUE_CAPACITY);
+    queue->count++;
+    return 1U;
+}
+
+uint8_t RpiProtocol_QueuePop(RpiFrameQueue *queue, RpiFrame *frame)
+{
+    if (queue == 0 || frame == 0) return 0U;
+    if (queue->urgent_ready) {
+        *frame = queue->urgent_frame;
+        queue->urgent_ready = 0U;
+        return 1U;
+    }
+    if (queue->count == 0U) return 0U;
+    *frame = queue->frames[queue->tail];
+    queue->tail = (uint8_t)((queue->tail + 1U) % RPI_PROTOCOL_QUEUE_CAPACITY);
+    queue->count--;
+    return 1U;
+}

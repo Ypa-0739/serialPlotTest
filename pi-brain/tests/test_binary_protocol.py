@@ -16,6 +16,7 @@ from app.binary_protocol import (
     crc16_ccitt,
     decode_frame,
     decode_pose_event,
+    speed_limits_data,
 )
 
 
@@ -59,6 +60,11 @@ class BinaryProtocolTests(unittest.TestCase):
         stale = decode_pose_event(bytes((EventCode.POSE_STARTED,)) + struct.pack("<I", 41))
         self.assertEqual(started.goal_id, 42)
         self.assertNotEqual(stale.goal_id, started.goal_id)
+
+    def test_speed_limits_layout_and_bounds(self):
+        self.assertEqual(struct.unpack("<ii", speed_limits_data(0.25, 0.12)), (250000, 120000))
+        with self.assertRaises(ValueError):
+            speed_limits_data(0.31, 0.12)
 
 
 if __name__ == "__main__":

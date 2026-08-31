@@ -12,6 +12,7 @@ extern "C" {
 #define RPI_PROTOCOL_MAX_FRAME     (2U + 5U + RPI_PROTOCOL_MAX_PAYLOAD + 2U)
 #define RPI_PROTOCOL_SOF_1         0xA5U
 #define RPI_PROTOCOL_SOF_2         0x5AU
+#define RPI_PROTOCOL_QUEUE_CAPACITY 4U
 
 typedef enum {
     RPI_MSG_COMMAND = 0x10,
@@ -28,6 +29,16 @@ typedef struct {
 } RpiFrame;
 
 typedef void (*RpiFrameCallback)(const RpiFrame *frame, void *context);
+
+typedef struct {
+    RpiFrame frames[RPI_PROTOCOL_QUEUE_CAPACITY];
+    RpiFrame urgent_frame;
+    uint8_t head;
+    uint8_t tail;
+    uint8_t count;
+    uint8_t urgent_ready;
+    uint32_t dropped;
+} RpiFrameQueue;
 
 typedef enum {
     RPI_PARSE_SOF_1 = 0,
@@ -65,6 +76,11 @@ void RpiProtocol_ParserInit(RpiProtocolParser *parser,
                             void *callback_context);
 void RpiProtocol_ParserReset(RpiProtocolParser *parser);
 void RpiProtocol_FeedByte(RpiProtocolParser *parser, uint8_t byte);
+void RpiProtocol_QueueReset(RpiFrameQueue *queue);
+uint8_t RpiProtocol_QueuePush(RpiFrameQueue *queue,
+                              const RpiFrame *frame,
+                              uint8_t urgent);
+uint8_t RpiProtocol_QueuePop(RpiFrameQueue *queue, RpiFrame *frame);
 
 #ifdef __cplusplus
 }

@@ -147,6 +147,13 @@ class HostLinkAcknowledged(Event):
 
 
 @dataclass(frozen=True)
+class BinaryReady(Event):
+    """STM32 已通过运行前门禁，允许串口桥切换到二进制协议。"""
+
+    pass
+
+
+@dataclass(frozen=True)
 class HostStatus(Event):
     state: str = ""
     owner: str = ""
@@ -186,6 +193,7 @@ class PoseStarted(Event):
     center_y: float = 0.0
     tol_mm: float = 0.0
     tol_yaw: float = 0.0
+    goal_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -199,13 +207,14 @@ class PoseReached(Event):
     center_y: float = 0.0
     error_mm: float = 0.0
     error_yaw: float = 0.0
+    goal_id: int | None = None
 
 
 @dataclass(frozen=True)
 class PoseStopped(Event):
     """POSE STOP 命令的确认。"""
 
-    pass
+    goal_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +279,7 @@ class SafetyFault(Event):
     """安全停车事件。reason 映射固件原因，raw 保留原始行。"""
 
     reason: FaultReason = FaultReason.UNKNOWN
+    goal_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -605,6 +615,8 @@ def parse_line(line: str) -> Optional[Event]:
         return _parse_csv(text)
     if text == "# PONG":
         return Pong(raw=text)
+    if text == "# HOST BINARY READY":
+        return BinaryReady(raw=text)
     if text.startswith("# HOST LINK "):
         parts = text.split()
         requested = parts[3] if len(parts) > 3 else ""

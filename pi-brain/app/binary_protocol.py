@@ -2,9 +2,9 @@
 """STM32/Raspberry Pi binary pose-goal protocol.
 
 This transport is intentionally separate from :mod:`app.protocol`: the legacy
-ASCII codec remains available for COM/TUNE sessions, while a Raspberry Pi can
-switch the shared UART to framed binary messages by sending a valid A5 5A
-frame. All multi-byte fields are little-endian.
+ASCII codec remains available for COM/TUNE and startup self-check sessions.
+The Raspberry Pi switches the shared UART only after the firmware explicitly
+acknowledges ``HOST BINARY START``. All multi-byte fields are little-endian.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ class Command(IntEnum):
     SET_POSE_GOAL = 0x80
     CANCEL_POSE_GOAL = 0x81
     QUERY_POSE_GOAL = 0x82
+    SET_SPEED_LIMITS = 0x83
 
 
 class ResponseStatus(IntEnum):
@@ -252,3 +253,14 @@ def cancel_goal_data(goal_id: int) -> bytes:
     if not 1 <= goal_id <= 0xFFFFFFFF:
         raise ValueError("goal_id must be non-zero uint32")
     return struct.pack("<I", goal_id)
+
+
+def speed_limits_data(linear_mps: float, yaw_radps: float) -> bytes:
+    """Encode the runtime X/Y linear and yaw speed limits as microunits."""
+    if not 0.02 <= linear_mps <= 0.30:
+        raise ValueError("linear_mps must be in 0.02..0.30")
+    if not 0.02 <= yaw_radps <= 0.80:
+        raise ValueError("yaw_radps must be in 0.02..0.80")
+    return struct.pack(
+        "<ii", round(linear_mps * 1_000_000), round(yaw_radps * 1_000_000)
+    )

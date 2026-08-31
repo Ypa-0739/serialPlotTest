@@ -20,6 +20,8 @@ from app.serial_bridge import (
     SerialDisconnected,
 )
 from app.state_machine import StartupConfig, StartupStateMachine
+from app.navigator import Navigator
+from app.models import GotoReason
 
 # 自检成功路径的期望命令序列（固件真实命令格式）
 EXPECTED_SEQUENCE = [
@@ -37,6 +39,7 @@ EXPECTED_SEQUENCE = [
     "PID LIMIT Y 0.20",
     "PID LIMIT YAW 0.25",
     "PID STATUS ALL",
+    "HOST BINARY START",
 ]
 
 
@@ -76,7 +79,7 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertEqual(commands, EXPECTED_SEQUENCE)
         # 急停已解除（bridge 不再拒绝运动命令）
         self.assertFalse(self.bridge.is_emergency_stopped)
-        self.bridge.send("POSE SET 100 200 0")  # 不抛异常即通过
+        self.bridge.send_pose_goal(1, 100, 200, 0, 5.0, priority=10)
 
     def test_ready_after_release_allows_motion(self):
         """READY 后运动命令不再被拒绝。"""
@@ -86,9 +89,57 @@ class StartupIntegrationTests(unittest.TestCase):
             f"自检未完成: {self.startup.fault_reason}",
         )
         try:
-            self.bridge.send("MOVE FWD 0.1 500")
+            self.bridge.send_pose_goal(1, 100, 200, 0, 5.0, priority=10)
         except Exception as exc:  # noqa: BLE001
             self.fail(f"READY 后运动命令仍被拒绝: {exc}")
+
+    def test_binary_goal_round_trip_keeps_goal_id(self):
+        self.startup.start()
+        self.assertTrue(
+            pump(self.bridge, self.startup, until=lambda: self.startup.is_ready)
+        )
+        navigator = Navigator(self.bridge)
+        navigator.set_ready(True)
+        goal_id = navigator.goto_pose(100, 200, 30, motion_timeout_s=2.0)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and navigator.last_result is None:
+            event = self.bridge.get_event(timeout=0.02)
+            if event is not None:
+                self.startup.handle_event(event)
+                navigator.handle_event(event)
+            navigator.tick()
+        self.assertIsNotNone(navigator.last_result)
+        self.assertEqual(navigator.last_result.goal_id, goal_id)
+        self.assertEqual(navigator.last_result.reason, GotoReason.REACHED)
+
+    def test_binary_disconnect_returns_to_ascii_self_check(self):
+        self.startup.start()
+        self.assertTrue(
+            pump(self.bridge, self.startup, until=lambda: self.startup.is_ready)
+        )
+        self.assertTrue(self.bridge.is_binary_mode)
+        self.firmware.fail()
+        self.assertTrue(
+            pump(
+                self.bridge,
+                self.startup,
+                until=lambda: self.startup.state.value == "FAULT",
+                timeout=2.0,
+            )
+        )
+        self.firmware.is_open = True
+        self.firmware._fail = False
+        self.firmware._responses.clear()
+        self.assertTrue(
+            pump(
+                self.bridge,
+                self.startup,
+                until=lambda: self.startup.is_ready,
+                timeout=5.0,
+            ),
+            self.startup.fault_reason,
+        )
+        self.assertTrue(self.bridge.is_binary_mode)
 
     def test_fault_when_ops_stale(self):
         """OPS LINK=STALE 时进入 FAULT 并再次锁存急停。"""
@@ -171,7 +222,7 @@ class StartupIntegrationTests(unittest.TestCase):
         # 重连后从 STOP 重新开始（完整序列再次出现，过滤 PING 心跳）
         commands = [c for c in self.firmware.received if c != "PING"]
         self.assertGreaterEqual(commands.count("STOP"), 2)
-        self.assertEqual(commands[-1], "PID STATUS ALL")
+        self.assertEqual(commands[-1], "HOST BINARY START")
 
 
 class StartupTimeoutTests(unittest.TestCase):

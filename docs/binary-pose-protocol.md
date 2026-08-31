@@ -21,10 +21,17 @@ USART1 remains at 115200 8-N-1. A frame is:
 CRC parameters are polynomial `0x1021`, initial value `0xFFFF`, no reflection,
 and no final xor. The standard `123456789` vector produces `0x29B1`.
 
-The firmware keeps the ASCII parser available for PC/TUNE use. If USART1 is not
-owned by `HOST LINK COM`, the first valid binary frame claims the RPI host link.
-From that point until reset/UART recovery, `printf` output is suppressed so text
-cannot corrupt binary frames. Binary `PING` refreshes the existing host watchdog.
+The firmware keeps the ASCII parser available for PC/TUNE and RPI startup
+self-check. Binary frames cannot claim the host link. The Pi must first complete
+the existing `HOST LINK RPI -> STOP -> WORK -> STATUS -> OPS -> CAN -> PID/LIMIT`
+self-check and then send the ASCII command `HOST BINARY START`. The firmware
+answers `# HOST BINARY READY` only while idle with fresh OPS, healthy CAN and
+enabled chassis motors. The serial bridge switches codecs after that reply.
+
+While binary mode is active, `printf` output is suppressed so text cannot corrupt
+binary frames. Binary `PING` refreshes the existing host watchdog. Link timeout
+stops all motion, clears the old goal and returns USART1 to the ASCII self-check
+state; reconnect never resumes a previous goal.
 
 ## Commands
 
@@ -37,10 +44,15 @@ The first payload byte is the opcode.
 | `80` | SET_POSE_GOAL: `<IiiiI` = goal id, x mm, y mm, yaw mrad, timeout ms |
 | `81` | CANCEL_POSE_GOAL: `<I` goal id |
 | `82` | QUERY_POSE_GOAL: empty |
+| `83` | SET_SPEED_LIMITS: `<ii` = linear µm/s, yaw µrad/s |
 
 Goal timeouts must be 1–60000 ms. Existing OPS freshness, CAN health, 10 m
 relative travel, and host-heartbeat safety gates are still enforced by STM32.
 Only one goal may move at a time.
+
+The ISR places ordinary frames in a four-entry bounded FIFO. `STOP_ALL` uses a
+separate urgent latch, remains admissible when that FIFO is full, and is always
+processed before ordinary frames.
 
 A response payload starts with request sequence, opcode, and status. Status is
 `00 OK`, `01 UNKNOWN_COMMAND`, `02 INVALID_LENGTH`, `03 INVALID_ARGUMENT`,
