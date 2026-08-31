@@ -25,6 +25,7 @@ class FakeBridge:
         self.commands = []
         self.is_emergency_stopped = False
         self.release_count = 0
+        self.binary_enabled = False
 
     def send(self, command, priority=None):
         self.commands.append(command)
@@ -37,6 +38,9 @@ class FakeBridge:
     def release_emergency_stop(self):
         self.is_emergency_stopped = False
         self.release_count += 1
+
+    def enable_binary_mode(self):
+        self.binary_enabled = True
 
 
 GOOD_LINES = (
@@ -57,6 +61,7 @@ GOOD_LINES = (
     "# PID ALL X=0.0033000,0.00000000,0.0000000 "
     "Y=0.0033000,0.00000000,0.0000000 "
     "YAW=0.0200000,0.00000000,0.0000000",
+    "# HOST BINARY READY",
 )
 
 
@@ -82,6 +87,7 @@ class StartupStateMachineTests(unittest.TestCase):
         self.assertEqual(machine.ops_pose, Pose(1.0, 2.0, 3.0))
         self.assertFalse(bridge.is_emergency_stopped)
         self.assertEqual(bridge.release_count, 1)
+        self.assertTrue(bridge.binary_enabled)
         self.assertEqual(
             bridge.commands,
             [
@@ -99,6 +105,7 @@ class StartupStateMachineTests(unittest.TestCase):
                 "PID LIMIT Y 0.20",
                 "PID LIMIT YAW 0.25",
                 "PID STATUS ALL",
+                "HOST BINARY START",
             ],
         )
 

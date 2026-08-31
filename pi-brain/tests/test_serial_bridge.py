@@ -4,6 +4,8 @@
 import time
 import unittest
 
+from app.binary_protocol import Command as BinaryCommand, decode_frame
+
 from app.serial_bridge import (
     LinkState,
     MotionCommandRejected,
@@ -213,6 +215,37 @@ class PriorityTests(BridgeTestCase):
         writes = serials[0].writes
         self.assertNotIn(b"POSE SET 10 20 0\n", writes)
         self.assertIn(b"POSE SET 30 40 0\n", writes)
+
+
+class BinaryModeTests(BridgeTestCase):
+    def test_runtime_commands_use_single_writer_binary_frames(self):
+        serials = []
+        bridge = self.start_bridge(
+            _factory_tracked(serials), heartbeat_enabled=False
+        )
+        self.assertTrue(self.wait_until(lambda: bool(serials)))
+        bridge.enable_binary_mode()
+        bridge.release_emergency_stop()
+        bridge.set_speed_limits(0.25, 0.12, priority=10)
+        bridge.send_pose_goal(42, 1000, 500, 90, 5.0, priority=10)
+        self.assertTrue(self.wait_until(lambda: len(serials[0].writes) >= 2))
+        bridge.emergency_stop()
+        self.assertTrue(self.wait_until(lambda: len(serials[0].writes) >= 3))
+        bridge.stop()
+
+        frames = [decode_frame(wire) for wire in serials[0].writes]
+        commands = [frame.payload[0] for frame in frames]
+        self.assertEqual(
+            commands,
+            [
+                BinaryCommand.SET_SPEED_LIMITS,
+                BinaryCommand.SET_POSE_GOAL,
+                BinaryCommand.STOP_ALL,
+            ],
+        )
+        self.assertTrue(
+            all(name == "serial-bridge" for name in serials[0].write_threads)
+        )
 
 
 class DisconnectTests(BridgeTestCase):

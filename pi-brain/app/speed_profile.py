@@ -9,12 +9,11 @@
   - 色环放置 1 环 15 分要求毫米级偏差、启停区 300×300 对 300×300 的车
     几乎零余量 → 定位停车档低速收敛
 
-实现方式（不改固件协议）：
-  - 复用固件现有 `PID LIMIT X|Y|YAW` 运行时配置命令（硬边界：
+实现方式：
+  - 通过串口桥发送一条原子的二进制速度档命令（硬边界：
     线速度 0.02~0.30 m/s、角速度 0.02~0.80 rad/s，与 main.c 一致）
-  - PID LIMIT 是非运动配置命令，但必须与随后的 POSE SET 同用
-    PRIORITY_MOTION：唯一写者队列同优先级按序写出，保证
-    "先切档、后发车"，绝不允许 POSE SET 先于限速命令到达固件
+  - 速度档命令与随后的位姿目标同用 PRIORITY_MOTION：唯一写者队列
+    同优先级按序写出，保证“先切档、后发车”
   - mark_unknown()：断线重连或重新自检后调用；自检流程会重载默认限速，
     此时本地"当前档"缓存作废，下一次发车前必须重发
 """
@@ -88,16 +87,22 @@ class SpeedProfileController:
         self._validate(profile)
         if self._current == name:
             return False
-        # 同优先级 FIFO：三条 LIMIT 先于随后的 POSE SET 写出（见模块 docstring）
-        self._bridge.send(
-            f"PID LIMIT X {profile.linear_mps:.3f}", priority=PRIORITY_MOTION
-        )
-        self._bridge.send(
-            f"PID LIMIT Y {profile.linear_mps:.3f}", priority=PRIORITY_MOTION
-        )
-        self._bridge.send(
-            f"PID LIMIT YAW {profile.yaw_radps:.3f}", priority=PRIORITY_MOTION
-        )
+        if getattr(self._bridge, "is_binary_mode", False):
+            self._bridge.set_speed_limits(
+                profile.linear_mps,
+                profile.yaw_radps,
+                priority=PRIORITY_MOTION,
+            )
+        else:
+            self._bridge.send(
+                f"PID LIMIT X {profile.linear_mps:.3f}", priority=PRIORITY_MOTION
+            )
+            self._bridge.send(
+                f"PID LIMIT Y {profile.linear_mps:.3f}", priority=PRIORITY_MOTION
+            )
+            self._bridge.send(
+                f"PID LIMIT YAW {profile.yaw_radps:.3f}", priority=PRIORITY_MOTION
+            )
         self._current = name
         return True
 

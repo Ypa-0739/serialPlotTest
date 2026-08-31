@@ -11,6 +11,7 @@ from typing import Callable, Protocol
 
 from .models import Pose
 from .protocol import (
+    BinaryReady,
     CanError,
     CanStatus,
     Event,
@@ -41,6 +42,8 @@ class BridgePort(Protocol):
 
     def release_emergency_stop(self) -> None: ...
 
+    def enable_binary_mode(self) -> None: ...
+
 
 class StartupState(str, Enum):
     BOOT = "BOOT"
@@ -58,6 +61,7 @@ class StartupState(str, Enum):
     WAIT_LIMIT_Y = "WAIT_LIMIT_Y"
     WAIT_LIMIT_YAW = "WAIT_LIMIT_YAW"
     WAIT_PID_VERIFY = "WAIT_PID_VERIFY"
+    WAIT_BINARY_READY = "WAIT_BINARY_READY"
     READY = "READY"
     FAULT = "FAULT"
 
@@ -157,6 +161,7 @@ class StartupStateMachine:
             StartupState.WAIT_LIMIT_Y: lambda ev: self._on_limit(ev, "Y", StartupState.WAIT_LIMIT_YAW),
             StartupState.WAIT_LIMIT_YAW: lambda ev: self._on_limit(ev, "YAW", StartupState.WAIT_PID_VERIFY),
             StartupState.WAIT_PID_VERIFY: self._on_pid_verify,
+            StartupState.WAIT_BINARY_READY: self._on_binary_ready,
         }
         handler = handlers.get(self.state)
         if handler is not None:
@@ -265,6 +270,14 @@ class StartupStateMachine:
         ):
             self._fail(f"PID verification mismatch: {event.raw}")
             return
+        # PID/CAN/OPS 全部验证后再请求切换；收到固件确认前仍保持急停门禁。
+        self.bridge.send("HOST BINARY START", priority=PRIORITY_CONFIG)
+        self._enter(StartupState.WAIT_BINARY_READY)
+
+    def _on_binary_ready(self, event: Event) -> None:
+        if not isinstance(event, BinaryReady):
+            return
+        self.bridge.enable_binary_mode()
         self.bridge.release_emergency_stop()
         self._deadline = None
         self.state = StartupState.READY

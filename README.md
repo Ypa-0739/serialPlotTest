@@ -102,6 +102,13 @@ G6220 只使用电机内部闭环的“位置-速度模式”，STM32 不实现�
 `HOST LINK COM|RPI` 所有权握手；握手后原有 V2 业务命令格式保持不变。
 `PID SET`和`PID LIMIT`是跨模式的非运动配置命令，便于WORK启动自检和TUNE装载参数；`TUNE LIMIT`以及会启动调参轮次的`SET P:... I:... D:...`仅允许在TUNE模式执行。`STATUS`保留 `MODE`、`HOST_PROTO`、`PLOT`和USART1发送统计字段，并增加当前 `HOST`。
 
+正式 Raspberry Pi 位姿事务还可使用带 CRC、请求序号和 `goal_id` 的
+[二进制协议](docs/binary-pose-protocol.md)。PC/TUNE 文本命令保持不变；RPI
+必须先完成现有 ASCII 启动自检，再通过 `HOST BINARY START`/`# HOST BINARY READY`
+显式切换。切换后 `SerialBridgeThread` 仍是串口唯一写者，统一发送二进制心跳、
+速度档、位姿、取消和 STOP；Mission、RouteRunner 与 Navigator 不直接接触串口。
+链路丢失会停车、清除旧目标并退回 ASCII 自检状态，绝不恢复旧运动。
+
 ## POSE 梯形速度规划
 
 `POSE SET` 的控制链为：车体中心位姿误差 → X/Y/YAW PID → 主动制动速度上限 →
