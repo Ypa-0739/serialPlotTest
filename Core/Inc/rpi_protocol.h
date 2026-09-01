@@ -6,19 +6,13 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include "rpi_protocol_generated.h"
 
-#define RPI_PROTOCOL_VERSION       1U
-#define RPI_PROTOCOL_MAX_PAYLOAD   64U
 #define RPI_PROTOCOL_MAX_FRAME     (2U + 5U + RPI_PROTOCOL_MAX_PAYLOAD + 2U)
 #define RPI_PROTOCOL_SOF_1         0xA5U
 #define RPI_PROTOCOL_SOF_2         0x5AU
 #define RPI_PROTOCOL_QUEUE_CAPACITY 4U
-
-typedef enum {
-    RPI_MSG_COMMAND = 0x10,
-    RPI_MSG_RESPONSE = 0x11,
-    RPI_MSG_EVENT = 0x22
-} RpiMessageType;
+#define RPI_PROTOCOL_TX_CAPACITY    8U
 
 typedef struct {
     uint8_t version;
@@ -39,6 +33,24 @@ typedef struct {
     uint8_t urgent_ready;
     uint32_t dropped;
 } RpiFrameQueue;
+
+typedef struct {
+    uint16_t length;
+    uint8_t bytes[RPI_PROTOCOL_MAX_FRAME];
+} RpiEncodedFrame;
+
+typedef struct {
+    RpiEncodedFrame frames[RPI_PROTOCOL_TX_CAPACITY];
+    RpiEncodedFrame urgent_frame;
+    RpiEncodedFrame telemetry_frame;
+    uint8_t head;
+    uint8_t tail;
+    uint8_t count;
+    uint8_t urgent_ready;
+    uint8_t telemetry_ready;
+    uint32_t dropped_critical;
+    uint32_t replaced_telemetry;
+} RpiTxQueue;
 
 typedef enum {
     RPI_PARSE_SOF_1 = 0,
@@ -81,6 +93,12 @@ uint8_t RpiProtocol_QueuePush(RpiFrameQueue *queue,
                               const RpiFrame *frame,
                               uint8_t urgent);
 uint8_t RpiProtocol_QueuePop(RpiFrameQueue *queue, RpiFrame *frame);
+void RpiProtocol_TxQueueReset(RpiTxQueue *queue);
+uint8_t RpiProtocol_TxQueuePush(RpiTxQueue *queue,
+                                const uint8_t *bytes,
+                                uint16_t length,
+                                uint8_t priority);
+uint8_t RpiProtocol_TxQueuePop(RpiTxQueue *queue, RpiEncodedFrame *frame);
 
 #ifdef __cplusplus
 }

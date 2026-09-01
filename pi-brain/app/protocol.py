@@ -63,6 +63,7 @@ class Command:
 
 # 优先级约定（PING 由 SerialBridgeThread 直接按 deadline 调度，不进队列）
 PRIORITY_STOP = 0
+PRIORITY_QUERY = 5
 PRIORITY_PING = 10
 PRIORITY_MOTION = 20
 PRIORITY_CONFIG = 30
@@ -150,7 +151,8 @@ class HostLinkAcknowledged(Event):
 class BinaryReady(Event):
     """STM32 已通过运行前门禁，允许串口桥切换到二进制协议。"""
 
-    pass
+    version: int = 0
+    capabilities: int = 0
 
 
 @dataclass(frozen=True)
@@ -615,8 +617,13 @@ def parse_line(line: str) -> Optional[Event]:
         return _parse_csv(text)
     if text == "# PONG":
         return Pong(raw=text)
-    if text == "# HOST BINARY READY":
-        return BinaryReady(raw=text)
+    if text.startswith("# HOST BINARY READY"):
+        kv = _kv(text)
+        return BinaryReady(
+            raw=text,
+            version=_i(kv.get("VERSION")),
+            capabilities=_i(kv.get("CAPS")),
+        )
     if text.startswith("# HOST LINK "):
         parts = text.split()
         requested = parts[3] if len(parts) > 3 else ""

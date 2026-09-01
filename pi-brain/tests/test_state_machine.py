@@ -39,7 +39,7 @@ class FakeBridge:
         self.is_emergency_stopped = False
         self.release_count += 1
 
-    def enable_binary_mode(self):
+    def enable_binary_mode(self, linear_mps=0.20, yaw_radps=0.25):
         self.binary_enabled = True
 
 
@@ -47,7 +47,7 @@ GOOD_LINES = (
     "# HOST LINK RPI OK",
     "# STOP MODE=WORK",
     "# MODE WORK PLOT=0 CHANGED=0",
-    "# STATUS MODE=WORK HOST_PROTO=3 HOST=RPI AXIS=Y P=0.0010000 I=0.00000000 "
+    "# STATUS MODE=WORK HOST_PROTO=4 HOST=RPI AXIS=Y P=0.0010000 I=0.00000000 "
     "D=0.0000000 MAX_OUT=0.150 STATE=0 PLOT=0 MOTOR_PROTO=EMM "
     "OPS_FRAMES=10 UART_TX_OK=5 UART_TX_ERR=0",
     "# OPS LINK=OK X=1.00 Y=2.00 YAW=3.00 CENTER_X=1.00 CENTER_Y=2.00 FRAMES=10",
@@ -61,7 +61,7 @@ GOOD_LINES = (
     "# PID ALL X=0.0033000,0.00000000,0.0000000 "
     "Y=0.0033000,0.00000000,0.0000000 "
     "YAW=0.0200000,0.00000000,0.0000000",
-    "# HOST BINARY READY",
+    "# HOST BINARY READY VERSION=2 CAPS=0x0000003F",
 )
 
 
@@ -205,6 +205,30 @@ class StartupStateMachineTests(unittest.TestCase):
             SafetyFault(reason=FaultReason.OPS_LOST, raw="# ROUND STOP OPS LOST")
         )
         self.assertEqual(machine.state, StartupState.FAULT)
+        self.assertTrue(bridge.is_emergency_stopped)
+
+    def test_binary_capability_mismatch_stays_faulted(self):
+        machine, bridge, _ = self.make_machine()
+        machine.start()
+        for line in GOOD_LINES[:-1]:
+            machine.handle_event(parse_line(line))
+        machine.handle_event(
+            parse_line("# HOST BINARY READY VERSION=2 CAPS=0x0000001F")
+        )
+        self.assertEqual(machine.state, StartupState.FAULT)
+        self.assertIn("capabilities", machine.fault_reason)
+        self.assertTrue(bridge.is_emergency_stopped)
+
+    def test_binary_wire_version_mismatch_stays_faulted(self):
+        machine, bridge, _ = self.make_machine()
+        machine.start()
+        for line in GOOD_LINES[:-1]:
+            machine.handle_event(parse_line(line))
+        machine.handle_event(
+            parse_line("# HOST BINARY READY VERSION=1 CAPS=0x0000003F")
+        )
+        self.assertEqual(machine.state, StartupState.FAULT)
+        self.assertIn("unsupported", machine.fault_reason)
         self.assertTrue(bridge.is_emergency_stopped)
 
 

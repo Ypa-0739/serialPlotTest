@@ -183,3 +183,75 @@ uint8_t RpiProtocol_QueuePop(RpiFrameQueue *queue, RpiFrame *frame)
     queue->count--;
     return 1U;
 }
+
+void RpiProtocol_TxQueueReset(RpiTxQueue *queue)
+{
+    if (queue == 0) return;
+    queue->head = 0U;
+    queue->tail = 0U;
+    queue->count = 0U;
+    queue->urgent_ready = 0U;
+    queue->telemetry_ready = 0U;
+    queue->dropped_critical = 0U;
+    queue->replaced_telemetry = 0U;
+}
+
+static void copy_encoded_frame(RpiEncodedFrame *frame,
+                               const uint8_t *bytes,
+                               uint16_t length)
+{
+    uint16_t index;
+    frame->length = length;
+    for (index = 0U; index < length; ++index) frame->bytes[index] = bytes[index];
+}
+
+uint8_t RpiProtocol_TxQueuePush(RpiTxQueue *queue,
+                                const uint8_t *bytes,
+                                uint16_t length,
+                                uint8_t priority)
+{
+    if (queue == 0 || bytes == 0 || length == 0U ||
+        length > RPI_PROTOCOL_MAX_FRAME) return 0U;
+    /* 2=urgent safety latch, 1=control FIFO, 0=latest telemetry. */
+    if (priority >= 2U) {
+        copy_encoded_frame(&queue->urgent_frame, bytes, length);
+        queue->urgent_ready = 1U;
+        return 1U;
+    }
+    if (priority == 0U) {
+        if (queue->telemetry_ready) queue->replaced_telemetry++;
+        copy_encoded_frame(&queue->telemetry_frame, bytes, length);
+        queue->telemetry_ready = 1U;
+        return 1U;
+    }
+    if (queue->count >= RPI_PROTOCOL_TX_CAPACITY) {
+        queue->dropped_critical++;
+        return 0U;
+    }
+    copy_encoded_frame(&queue->frames[queue->head], bytes, length);
+    queue->head = (uint8_t)((queue->head + 1U) % RPI_PROTOCOL_TX_CAPACITY);
+    queue->count++;
+    return 1U;
+}
+
+uint8_t RpiProtocol_TxQueuePop(RpiTxQueue *queue, RpiEncodedFrame *frame)
+{
+    if (queue == 0 || frame == 0) return 0U;
+    if (queue->urgent_ready) {
+        *frame = queue->urgent_frame;
+        queue->urgent_ready = 0U;
+        return 1U;
+    }
+    if (queue->count != 0U) {
+        *frame = queue->frames[queue->tail];
+        queue->tail = (uint8_t)((queue->tail + 1U) % RPI_PROTOCOL_TX_CAPACITY);
+        queue->count--;
+        return 1U;
+    }
+    if (queue->telemetry_ready) {
+        *frame = queue->telemetry_frame;
+        queue->telemetry_ready = 0U;
+        return 1U;
+    }
+    return 0U;
+}

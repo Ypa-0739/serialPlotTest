@@ -148,7 +148,7 @@ class RouteRunner:
     def _submit_current(self) -> None:
         """提交当前航点；门禁关闭/急停锁存导致的拒绝会中止整条路线。"""
         goal = self._goals[self._index]
-        # 先切速度档再发车：PID LIMIT 与 POSE SET 同优先级按序写出。
+        # 先选择速度档再发车；二进制桥把限速与目标合成原子事务。
         # 档名非法或数值越界直接中止路线，绝不在错误限速下发车。
         if self.profiles is not None and goal.profile:
             try:

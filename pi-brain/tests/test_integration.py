@@ -75,7 +75,10 @@ class StartupIntegrationTests(unittest.TestCase):
         self.assertTrue(ok, f"自检未完成，状态={self.startup.state} 故障={self.startup.fault_reason}")
         self.assertEqual(self.startup.state.value, "READY")
         # 命令按序发出（过滤掉桥线程周期性的 PING 心跳）
-        commands = [c for c in self.firmware.received if c != "PING"]
+        commands = [
+            c for c in self.firmware.received
+            if c not in ("PING", "BINARY 0x03")
+        ]
         self.assertEqual(commands, EXPECTED_SEQUENCE)
         # 急停已解除（bridge 不再拒绝运动命令）
         self.assertFalse(self.bridge.is_emergency_stopped)

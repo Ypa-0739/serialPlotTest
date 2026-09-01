@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>物流小车项目 · 主要文件函数参考手册</title>
+<style>
+  :root{
+    --fw:#B45309; --fw-bg:#FFF4E6;      /* 下位机 */
+    --pi:#1971C2; --pi-bg:#E7F1FF;      /* 上位机 */
+    --safe:#C92A2A; --safe-bg:#FFF5F5;  /* 安全 */
+    --ok:#2B8A3E; --warn:#E8590C; --gray:#6B7280;
+  }
+  *{box-sizing:border-box}
+  body{font-family:"Microsoft YaHei","PingFang SC","Noto Sans CJK SC",sans-serif;
+       margin:0;background:#F8FAFC;color:#1F2937;line-height:1.55}
+  .wrap{max-width:1280px;margin:0 auto;padding:24px 28px 80px}
+  h1{font-size:24px;border-bottom:3px solid #1F2937;padding-bottom:10px}
+  h2{font-size:20px;margin-top:44px;border-left:6px solid #1F2937;padding-left:10px}
+  h3{font-size:16px;margin-top:28px;color:#111827}
+  .sub{color:var(--gray);font-size:13px}
+  table{border-collapse:collapse;width:100%;margin:12px 0 20px;background:#fff;
+        font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  th,td{border:1px solid #D1D5DB;padding:7px 10px;vertical-align:top;text-align:left}
+  th{background:#111827;color:#fff;font-weight:600;white-space:nowrap}
+  tr:nth-child(even) td{background:#F9FAFB}
+  code{font-family:Consolas,"Courier New",monospace;font-size:12.5px;
+       background:#EEF2F7;padding:1px 5px;border-radius:4px;word-break:break-all}
+  .fn{font-family:Consolas,monospace;font-weight:600;color:#0F172A;white-space:nowrap}
+  .badge{display:inline-block;font-size:11px;font-weight:700;padding:1px 8px;
+         border-radius:10px;margin-right:4px;white-space:nowrap}
+  .fw{background:var(--fw-bg);color:var(--fw);border:1px solid var(--fw)}
+  .pi{background:var(--pi-bg);color:var(--pi);border:1px solid var(--pi)}
+  .safe{background:var(--safe-bg);color:var(--safe);border:1px solid var(--safe)}
+  .ok{color:var(--ok);font-weight:700}
+  .warn{color:var(--warn);font-weight:700}
+  .st{display:inline-block;font-family:Consolas,monospace;font-size:12px;font-weight:700;
+      padding:1px 7px;border-radius:5px;background:#E5E7EB;color:#111827;white-space:nowrap}
+  .st.term{background:#FEE2E2;color:#B91C1C}
+  .st.run{background:#DBEAFE;color:#1D4ED8}
+  .st.okk{background:#D1FAE5;color:#047857}
+  .note{background:#FFFBEB;border:1px solid #F59E0B;border-radius:8px;padding:10px 14px;
+        font-size:13px;margin:10px 0}
+  .danger{background:var(--safe-bg);border:1px solid var(--safe);border-radius:8px;
+          padding:10px 14px;font-size:13px;margin:10px 0}
+  nav{background:#fff;border:1px solid #D1D5DB;border-radius:8px;padding:12px 18px;
+      font-size:13px;columns:2;column-gap:40px}
+  nav a{color:var(--pi);text-decoration:none;display:block;padding:1px 0}
+  nav a:hover{text-decoration:underline}
+  .loc{color:var(--gray);font-size:11.5px;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>物流小车项目 · 主要文件函数参考手册</h1>
+<p class="sub">STM32F407 下位机 + 树莓派上位机（工创赛智能物流搬运）。
+当前工作树基于提交 <code>39ec12c "Merge PR #2: versioned binary pose-goal protocol"</code>，
+已修订为主机协议 V4 + 二进制 wire v2 + 能力协商/原子目标/异步遥测；视觉与任务层职责不变，184/184 测试通过。
+图例：<span class="badge fw">下位机</span><span class="badge pi">上位机</span><span class="badge safe">安全关键</span></p>
+
+<nav>
+  <a href="#fw-main">一、下位机 main.c —— 主循环调度</a>
+  <a href="#fw-hostlink">二、下位机 HOST LINK 握手协议 V4 ★</a>
+  <a href="#fw-mode">三、下位机 模式状态机 WORK/TUNE/PLOT</a>
+  <a href="#fw-pose">四、下位机 POSE 二阶段状态机 ★</a>
+  <a href="#fw-safety">五、下位机 统一安全监督 ChassisSafety ★</a>
+  <a href="#fw-cmd">六、下位机 命令处理要点</a>
+  <a href="#fw-tel">七、下位机 遥测 / 反馈 / 中断底层</a>
+  <a href="#fw-mec">八、下位机 mecanum_chassis.c</a>
+  <a href="#fw-pid">九、下位机 pid.c</a>
+  <a href="#fw-tuner">十、下位机 llm_tuner.c（调参状态机）★</a>
+  <a href="#fw-drv">十一、下位机 驱动层（zdt/zdtCan/ops9/g6220）</a>
+  <a href="#fw-binary">十二、下位机 二进制位姿协议与会话（wire v2）★</a>
+  <a href="#pi-bridge">十三、上位机 serial_bridge.py（双编解码唯一写者）★</a>
+  <a href="#pi-bincodedec">十四、上位机 binary_protocol.py 与协议生成 ★</a>
+  <a href="#pi-startup">十五、上位机 启动自检状态机（握手→自检→二进制会话）★</a>
+  <a href="#pi-nav">十六、上位机 navigator.py 单航点状态机（goal_id 事务）★</a>
+  <a href="#pi-route">十七、上位机 route_runner.py 多航点状态机 ★</a>
+  <a href="#pi-mission">十八、上位机 mission.py 比赛任务状态机 ★</a>
+  <a href="#pi-speed">十九、上位机 speed_profile.py 双速度档</a>
+  <a href="#pi-proto">二十、上位机 protocol.py ASCII 协议层（V4）</a>
+  <a href="#pi-misc">二十一、上位机 其余模块</a>
+  <a href="#pi-vision">二十二、上位机 app/vision 视觉感知包 ★</a>
+  <a href="#pi-vision-stm">二十三、视觉内部小状态机 ★</a>
+  <a href="#pi-vision-int">二十四、vision_integration.py 观察→任务桥 ★</a>
+  <a href="#pi-vision-cfg">二十五、config/vision 配置与 vision_debug 工具</a>
+  <a href="#pi-mapframe">二十六、map_frame.py 固定地图启动锚定 ★</a>
+  <a href="#pi-motiondbg">二十七、vision_motion_debug.py SSH 人工联调 ★</a>
+  <a href="#project-status">附录、项目状态与验证基线</a>
+</nav>
+
+<!-- ================================================================ -->
+<h2 id="fw-main">一、下位机 main.c —— 主循环与调度</h2>
+<p class="sub">文件：Core/Src/main.c（运行时实现；协议数值权威源已迁移到 protocol/rpi_binary_protocol.json，当前 HOST_PROTOCOL_VERSION=4）。主循环顺序固定，安全优先：</p>
+<p><code>HostLink_ProcessUartFault(锁存故障停车) → RpiBinary_Process(二进制 RX) → RpiBinary_TxProcess(DMA TX) →
+Host_ProcessCommand(ASCII) → Motor_ProcessFeedback → 刷新tick → HostLink_ProcessWait → ChassisSafety_Process →
+RpiBinary_ProcessSessionTimeout → Pose_ProcessControl → TUNE/调试超时 → 电机反馈轮询* → Telemetry_Process* → HAL_Delay(1)</code><br>
+<span class="sub">* 反馈轮询与遥测仅在主机链路已声明（COM/RPI）时运行；HOST WAIT 期间静默。</span></p>
+
+<table>
+<tr><th>函数</th><th>位置</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">main</td><td class="loc">L~2247</td><td>外设初始化、二进制 RX/TX 队列初始化、四轮<b>零速使能</b>（保持力矩防外力推动）、G6220 保持失能、进入 HOST WAIT，随后无限主循环</td><td><span class="badge safe">安全</span> 上电即静止保持，绝不自动进入运行态</td></tr>
+<tr><td class="fn">Host_ProcessCommand</td><td class="loc">L~2020</td><td>从 ISR 双缓冲取 ASCII 命令（关中断快照），先经 HostLink_ProcessCommand，再按 HOST WAIT 门禁放行业务命令</td><td><span class="badge safe">安全</span> 见第二章门禁表</td></tr>
+<tr><td class="fn">Host_ProcessOperationalCommand</td><td class="loc">L~1345</td><td>PING/PROTO/HELP/MODE/TELEM/OPS/CAN/G6220/POSE/MOVE/TURN/MOTOR 等运行命令解析与应答</td><td>未知命令 → # ERROR UNKNOWN COMMAND</td></tr>
+<tr><td class="fn">Motor_ProcessFeedback / …Polling</td><td class="loc">L~643/544</td><td>CAN RX 事件排空打印；W8 开启时每 10ms 轮询一台电机速度</td><td>排在安全与控制之后</td></tr>
+<tr><td class="fn">Telemetry_Process</td><td class="loc">L~1179</td><td>ASCII 模式输出 @W/@P；二进制 active 时输出 WHEEL/POSE CRC 帧并每秒附 LINK_STATS（BOTH 25ms 交错，单组20Hz）</td><td>armed 未 active 时保持关闭，切换窗口不泄漏 ASCII 遥测</td></tr>
+<tr><td class="fn">RpiBinary_TxProcess</td><td class="loc">L~830</td><td>从分级有界 TX 队列取帧，经 USART1 DMA 单写者发送；DMA 完成回调释放稳定缓冲</td><td><span class="badge safe">安全</span> fault &gt; control &gt; latest telemetry</td></tr>
+<tr><td class="fn">_write</td><td class="loc">L~2472</td><td>ASCII printf 底层：USART1 阻塞发送，20ms 有限超时；<b>二进制 active 期间直接抑制（return len）</b>，防止文本破坏帧边界与 CRC</td><td>仅服务 COM/TUNE/自检文本；二进制帧走 DMA 队列</td></tr>
+<tr><td class="fn">HAL_UART_RxCpltCallback / ErrorCallback / TxCpltCallback</td><td class="loc">L~2499/2550/2574</td><td>USART2→OPS；USART1 自动分流 ASCII 双缓冲/二进制增量解析；UART 错误 ISR 仅锁存，下一主循环停车拆会话；DMA 完成释放 TX active</td><td><span class="badge safe">安全</span> ISR 不执行阻塞停车/发送</td></tr>
+<tr><td class="fn">HAL_CAN_RxFifo0MsgPendingCallback</td><td class="loc">L~1868</td><td>CAN1→ZDT 电机；CAN2→G6220</td><td>中断内仅入队</td></tr>
+<tr><td class="fn">Robot_StopAllMotion</td><td class="loc">L~259</td><td>全局停止原语：四轮零速 + 清 debug/pose/planner + LLM_TunerAbort + G6220 失能 + 三轴 PID_Reset</td><td><span class="badge safe">安全</span> 只清历史不改 Kp/Ki/Kd</td></tr>
+<tr><td class="fn">Robot_SetMode</td><td class="loc">L~340</td><td>模式切换：先停车清状态再切，回 # MODE …CHANGED=1</td><td><span class="badge safe">安全</span> 切换即清旧运动</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-hostlink">二、下位机 HOST LINK 握手协议 V4 ★</h2>
+<p class="sub">V4 保留 V3 的 HOST WAIT/主机身份门禁，并为 RPI 二进制会话增加 <b>wire version + capability bitmap</b> 协商。单根 USB 线，COM/RPI 可随时重新声明，<b>每次声明即停车清状态，绝不恢复上一主机的目标</b>。</p>
+
+<h3>2.1 所有权状态机（HostLink_t）</h3>
+<table>
+<tr><th>当前状态</th><th>触发</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">NONE</span>（上电）</td><td>—</td><td>四轮零速使能保持力矩；G6220 失能；仅放行探测/停车命令（见 2.2）；60s 输出一次 # HOST WAIT TIMEOUT 后继续等待</td><td><span class="st">NONE</span>（等待）</td></tr>
+<tr><td><span class="st">NONE</span> / <span class="st run">COM</span> / <span class="st okk">RPI</span></td><td><code>HOST LINK COM</code> 或 <code>HOST LINK RPI</code></td><td>Robot_StopAllMotion + LLM_TunerResetSession + 遥测关 + 回 WORK + 零速使能四轮 → 回 <code># HOST LINK x OK HEARTBEAT=…</code></td><td><span class="st run">COM</span> / <span class="st okk">RPI</span></td></tr>
+<tr><td><span class="st run">COM</span> / <span class="st okk">RPI</span></td><td>对方声明（如 RPI 运行中收到 HOST LINK COM）</td><td>同上：先停车清状态再切换所有权</td><td>新身份</td></tr>
+<tr><td>任意</td><td><code>HOST STATUS</code></td><td>回 STATE/OWNER/MOTOR_EN/HEARTBEAT/WAIT_MS/TIMEOUT_MS（等待态也可查询）</td><td>不变</td></tr>
+</table>
+
+<h3>2.2 HOST WAIT 门禁（HostLink_ProcessCommand 之后的命令分流）</h3>
+<table>
+<tr><th>链路状态</th><th>放行命令</th><th>其余命令</th><th>心跳时间戳</th></tr>
+<tr><td><span class="st">NONE</span>（等待）</td><td>PING / PROTO VERSION / HELP；STOP（特殊分支：Robot_StopAllMotion → <code># STOP MODE=… HOST=WAITING</code>）；HOST LINK / HOST STATUS</td><td class="warn">一律 <code># ERROR HOST NOT LINKED</code></td><td>不刷新（声明失败不能喂狗）</td></tr>
+<tr><td><span class="st run">COM</span> / <span class="st okk">RPI</span></td><td>全部业务命令</td><td>—</td><td>每条命令消费时刷新 last_host_command_tick</td></tr>
+</table>
+
+<h3>2.3 心跳（HOST LOST）语义变化</h3>
+<table>
+<tr><th>链路</th><th>WORK/PLOT 运动心跳要求</th><th>理由</th></tr>
+<tr><td><span class="st okk">RPI</span></td><td class="warn">必须，1.5s 超时 → HOST LOST 停车</td><td>比赛自主运行，PC 断连必须自停</td></tr>
+<tr><td><span class="st run">COM</span></td><td class="warn">豁免（含 WORK 的 POSE）</td><td>有人看护的串口助手调试；剩余保护：POSE 超时 35s / OPS 300ms / CAN / 越界 / STOP</td></tr>
+<tr><td><span class="st">NONE</span></td><td>无运动可发起（门禁拦截）</td><td>—</td></tr>
+</table>
+<div class="note">配套变化：上电四轮零速使能（保持力矩）、G6220 等待态失能、PROTO VERSION 增加 HOST_LINK=REQUIRED、
+STATUS 增加 HOST= 字段、HELP 增加握手说明。Pi 侧 StartupStateMachine minimum_protocol=4；二进制 READY 还必须满足 wire v2 和 CAPS=0x0000003F，旧固件或能力缺失均保持 FAULT。</div>
+
+<!-- ================================================================ -->
+<h2 id="fw-mode">三、模式状态机（WORK / TUNE / PLOT）</h2>
+<p class="sub">上电预置 WORK，但 HOST LINK 成功前由等待门禁拦截全部业务/运动命令；三种模式切换均先停车清状态。</p>
+<table>
+<tr><th>状态</th><th>允许的运动</th><th>心跳(HOST)要求</th><th>OPS 要求</th><th>典型用途</th></tr>
+<tr><td><span class="st">WORK</span></td><td>仅 POSE SET</td><td class="warn">RPI 链路必须；COM 豁免</td><td>必须</td><td>正式导航、PID 加载、状态查询</td></tr>
+<tr><td><span class="st">TUNE</span></td><td>调参轮次、POSE SET、调试运动</td><td class="ok">豁免（任何链路）</td><td>必须（MOTOR RUN 豁免）</td><td>PID 调参</td></tr>
+<tr><td><span class="st">PLOT</span></td><td>POSE SET、MOVE、TURN、MOTOR RUN</td><td class="warn">RPI 必须；COM 豁免</td><td>除 MOTOR RUN 外必须</td><td>曲线测试 + TELEM BOTH</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-pose">四、main.c —— POSE 二阶段状态机 ★（20ms，Pose_ProcessControl）</h2>
+<table>
+<tr><th>当前状态</th><th>触发 / 条件</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">IDLE</span></td><td><code>POSE SET x y yaw</code>（值有限、OPS 新鲜、行程≤10m、链路已声明）</td><td>换算车体中心目标（+Y25 旋转补偿）→ 停旧运动 → 回 # POSE START</td><td><span class="st run">TRANSLATE</span></td></tr>
+<tr><td><span class="st run">TRANSLATE</span></td><td>每周期</td><td>X/Y PID 全局速度矢量 → 制动限幅 √(2as) 与 max_out → 车体坐标旋转 → 二维矢量梯形；YAW 保持起始航向</td><td>继续</td></tr>
+<tr><td><span class="st run">TRANSLATE</span></td><td>距离≤2mm 且 v≤0.005 且 航向误差≤0.5° 且 |Vz|≤0.010</td><td>停车 + PID_Reset + ResetPlanner</td><td><span class="st run">ROTATE</span></td></tr>
+<tr><td><span class="st run">ROTATE</span></td><td>每周期</td><td>目标航向 PID → 制动角限幅 → 独立角加减速斜坡原地转</td><td>继续</td></tr>
+<tr><td><span class="st run">ROTATE</span></td><td>到位且稳定 25 周期</td><td>停车 → <code># POSE TARGET … ERROR_MM/ERROR_YAW</code>（唯一到位终态）</td><td><span class="st okk">IDLE</span></td></tr>
+<tr><td>任意阶段</td><td class="warn">OPS 丢失 / HOST LOST(RPI) / CAN 故障 / 越界&gt;10500mm / 非有限 / 超时(TUNE 15s, WORK 35s)</td><td class="warn">直接零速 + G6220 失能 + PID_Reset → # POSE STOP SAFETY</td><td><span class="st term">IDLE</span>（清除目标不恢复）</td></tr>
+</table>
+<p class="sub">辅助函数（不变）：Pose_InitMotionProfile / ResetPlanner / SlewVector2D / SlewScalar /
+BrakeLimitLinear·Yaw / AngleErrorDeg / OpsToChassisCenter / Math_ClampFloat。心跳条件现为
+<code>active_host_link==RPI &amp;&amp; mode!=TUNE</code>。</p>
+
+<!-- ================================================================ -->
+<h2 id="fw-safety">五、统一安全监督 ChassisSafety ★</h2>
+<table>
+<tr><th>函数</th><th>作用</th></tr>
+<tr><td class="fn">ChassisSafety_GetActiveMotion</td><td>TUNE 轮次 &gt; POSE &gt; 调试底盘 &gt; 单电机 &gt; NONE</td></tr>
+<tr><td class="fn">ChassisSafety_CanReady / OpsReady</td><td>CAN1 LISTENING 且无错 / OPS 有限、有帧、帧龄≤300ms</td></tr>
+<tr><td class="fn">ChassisSafety_Stop</td><td><span class="badge safe">安全</span> 清全部运动 + ResetPlanner + G6220 失能 + PID_Reset；TUNE 走 StopRound(reason)，其余 Abort+四轮零速 + # …STOP SAFETY</td></tr>
+<tr><td class="fn">ChassisSafety_Process</td><td>检查顺序：CAN(含 TX 锁存) → OPS → HOST → POSE 超时，任一失败立即停车 return</td></tr>
+</table>
+<table>
+<tr><th>原因</th><th>条件</th><th>POSE</th><th>TUNE 轮次</th><th>MOVE/TURN</th><th>MOTOR RUN</th></tr>
+<tr><td class="warn">CAN FAULT</td><td>总线状态/错误寄存器/四轮发送失败锁存</td><td>✔停</td><td>✔停</td><td>✔停</td><td>✔停</td></tr>
+<tr><td class="warn">OPS LOST</td><td>无帧 / 帧龄&gt;300ms / 非有限</td><td>✔停</td><td>✔停</td><td>✔停</td><td>豁免（悬空）</td></tr>
+<tr><td class="warn">HOST LOST</td><td>&gt;1.5s 无命令（<b>仅 RPI 链路</b>；COM/TUNE/等待态豁免）</td><td>✔停</td><td>豁免</td><td>✔停(PLOT)</td><td>✔停(PLOT)</td></tr>
+<tr><td class="warn">TIMEOUT / 越界 / 非有限</td><td>TUNE 5s·POSE 15/35s / 误差&gt;10500mm / 目标行程&gt;10m</td><td>✔停</td><td>✔停</td><td>自动停</td><td>自动停</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-cmd">六、命令处理要点（V4）</h2>
+<table>
+<tr><th>命令</th><th>作用</th><th>安全要点</th></tr>
+<tr><td class="fn">HOST LINK COM|RPI</td><td>声明主机所有权（第二章）</td><td><span class="badge safe">安全</span> 声明即停车清状态；失败不喂狗</td></tr>
+<tr><td class="fn">HOST STATUS</td><td>链路/所有权/心跳查询（等待态可用）</td><td>—</td></tr>
+<tr><td class="fn">PING / PROTO VERSION / HELP</td><td>探测与帮助（等待态放行）</td><td>PROTO VERSION=4</td></tr>
+<tr><td class="fn">STOP</td><td>停车（等待态特殊分支带 HOST=WAITING 后缀）</td><td><span class="badge safe">安全</span> 不改模式</td></tr>
+<tr><td class="fn">POSE SET / POSE STOP / POSE STATUS</td><td>发车 / 取消（立即零速+确认）/ 查询</td><td>校验失败停车+ERROR</td></tr>
+<tr><td class="fn">MOVE / TURN / MOTOR RUN·EN·DIS·STOP·GET</td><td>调试运动与单电机（仅 TUNE/PLOT）</td><td>MOTOR RUN 豁免 OPS，≤10s 自动停</td></tr>
+<tr><td class="fn">PID SET / PID LIMIT</td><td>跨模式参数与输出上限（速度档用）</td><td>非运动命令；越界拒绝</td></tr>
+<tr><td class="fn">TUNE AXIS / TUNE LIMIT / SET P:…</td><td>调参轴/上限/启动轮次</td><td>轮次仅 TUNE</td></tr>
+<tr><td class="fn">TELEM OFF/WHEEL/POSE/BOTH、OPS/CAN/G6220/STATUS</td><td>遥测与自检查询</td><td>—</td></tr>
+<tr><td class="fn"><b>HOST BINARY START</b>（V4，ASCII）</td><td>请求切换二进制位姿协议会话</td><td><span class="badge safe">安全</span> 门禁通过回 <code># HOST BINARY READY VERSION=2 CAPS=0x0000003F</code>；仅 armed，不提前开遥测；见第十二章</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-tel">七、遥测 / 反馈 / 中断底层</h2>
+<table>
+<tr><th>函数</th><th>作用</th></tr>
+<tr><td class="fn">Ops_PrintStatus</td><td>OPS 四态诊断（NO_DATA/BYTES_NO_FRAME/STALE/OK）+ 计数 + 中心坐标</td></tr>
+<tr><td class="fn">Host_PrintHelp</td><td># HELP（含 HOST LINK 说明与各限值）</td></tr>
+<tr><td class="fn">HostLink_ProcessWait</td><td>等待态 60s 一次性超时提示，不改变状态</td></tr>
+<tr><td class="fn">Telemetry_Process</td><td>按会话选择 ASCII @W/@P 或 wire v2 WHEEL/POSE/LINK_STATS；二进制遥测只进入 latest 槽，可替换不阻塞</td></tr>
+<tr><td class="fn">HostLink_ProcessUartFault</td><td><span class="badge safe">安全</span> 消费 USART1 ISR 故障锁存：立即停车、AbortTransmit、拆会话、清 RX/TX 并回 HOST WAIT</td></tr>
+<tr><td class="fn">RpiBinary_TxProcess / HAL_UART_TxCpltCallback</td><td>启动单次 USART1 DMA；active buffer 在完成回调前保持稳定，完成后下一主循环发送下一优先级帧</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-mec">八、mecanum_chassis.c</h2>
+<table>
+<tr><th>函数</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">Mecanum_Kinematics</td><td>逆解 Vx/Vy/Vz→四轮（1左后/2左前/3右前/4右后）</td><td>—</td></tr>
+<tr><td class="fn">MsToRpm</td><td>m/s→RPM（Ø75 轮）</td><td>—</td></tr>
+<tr><td class="fn">SetAllMotorsSpeed</td><td>单轮 0.80m/s 硬限幅等比缩放后 CAN 下发</td><td><span class="badge safe">安全</span> 发送失败锁存 can_tx_fault</td></tr>
+<tr><td class="fn">StopAllMotors</td><td>四轮零速（停车最终原语）</td><td><span class="badge safe">安全</span></td></tr>
+<tr><td class="fn">Consume/Clear/ReportCanTxFault</td><td>发送故障锁存消费/清除/上报</td><td>安全监督每循环消费</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-pid">九、pid.c</h2>
+<table>
+<tr><th>函数</th><th>作用</th><th>备注</th></tr>
+<tr><td class="fn">PID_Init / SetTarget</td><td>初始化 / 设目标</td><td>—</td></tr>
+<tr><td class="fn">PID_Reset</td><td><span class="badge safe">安全</span> 只清 error/last_error/integral，不改 Kp/Ki/Kd 与限幅</td><td>所有停车/发车路径调用</td></tr>
+<tr><td class="fn">PID_CalcError / PID_Calc</td><td>位置式 PID：积分限幅+抗饱和+输出限幅</td><td>20ms 周期</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-tuner">十、llm_tuner.c —— 调参状态机 ★（仅 TUNE 运行）</h2>
+<table>
+<tr><th>当前状态</th><th>触发</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">WAIT</span></td><td>SET P:… 等 4 种格式（仅 TUNE）</td><td>StartRound：校验/停车/记起点/方向交替 → # ROUND START</td><td><span class="st run">RUN</span></td></tr>
+<tr><td><span class="st run">RUN</span></td><td>每 20ms</td><td>归一化误差→PID→制动限幅→斜坡→交叉轴保持→四轮输出 + 17 列 CSV(50ms)</td><td>继续</td></tr>
+<tr><td><span class="st run">RUN</span></td><td>TARGET 稳定10周期 / 5s / OPS丢 / CAN故障 / 反向 / 横漂 / 越程 / 航向超限</td><td>StopRound(原因) → # ROUND STOP（Pi 侧解析为 SafetyFault 或正常终态）</td><td><span class="st">WAIT</span></td></tr>
+</table>
+<p class="sub">其余：LLM_TunerInit/SetAxis/GetPid/IsRunning/Abort/ResetSession。</p>
+
+<!-- ================================================================ -->
+<h2 id="fw-drv">十一、驱动层</h2>
+<table>
+<tr><th>文件 · 函数</th><th>作用</th><th>备注</th></tr>
+<tr><td class="fn">zdtCan.c · ConfigFilter / Send_ExtId / RxFIFO0_Handler / GetStats</td><td>CAN1 过滤启动 / 扩展帧发送(10ms 邮箱超时) / 中断排空 / 统计</td><td><span class="badge safe">安全</span> 失败计数供锁存</td></tr>
+<tr><td class="fn">zdtEmm.c · SetSpeedByID / EnableSingleMotor / Read* / RxHandler / PollEvent</td><td>速度帧 0xF6（RPM±3000 限幅）/ 使能 0xF3 / 读 0x35·0x3A / 中断解析入 8 深环形队列 / 主循环消费</td><td>@W 数据源；满丢旧</td></tr>
+<tr><td class="fn">ops9.c · UART_RxCpltCallback / Reset_Zero</td><td>USART2 组帧 → robot_x/y/yaw + 时间戳 / 零点标定</td><td><span class="badge safe">安全</span> OPS 新鲜度依据</td></tr>
+<tr><td class="fn">dm_g6220.c · Init / StartCan / SendCommand / RxFIFO0_Handler / GetFeedback</td><td>CAN2 1Mbit 使能管理与反馈解析</td><td>电机内部闭环；等待/停车/非 WORK 失能</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="fw-binary">十二、下位机 二进制位姿协议与会话 ★（HOST V4 / wire v2）</h2>
+<p class="sub">动机：ASCII <code>POSE SET</code> 的完成匹配依赖坐标文本（响应迟到/丢失时有歧义）且无完整性校验。
+二进制协议给每个事务一个非零 <b>goal_id</b>，全部终态事件回带该 id——从协议层面消除歧义；帧含 SOF+长度+CRC。
+数值常量权威源：<code>protocol/rpi_binary_protocol.json</code>；生成器同步 C/Python/Markdown，<code>--check</code> 防漂移。
+行为规范：docs/binary-pose-protocol.md。ASCII 完整保留给 COM/TUNE/自检；二进制仅在显式握手后接管 USART1。</p>
+
+<h3>12.1 帧格式（wire v2）</h3>
+<table>
+<tr><th>字段</th><th>长度</th><th>说明</th></tr>
+<tr><td>SOF</td><td>2</td><td><code>A5 5A</code></td></tr>
+<tr><td>version</td><td>1</td><td><code>02</code></td></tr>
+<tr><td>message type</td><td>1</td><td>命令 0x10 / 响应 0x11 / 事件 0x22 / 遥测 0x23</td></tr>
+<tr><td>sequence</td><td>1</td><td>模 256 回绕；Pi pending 中仍存活的序号不得复用</td></tr>
+<tr><td>payload length</td><td>2</td><td>小端，≤64</td></tr>
+<tr><td>payload</td><td>N</td><td>按消息类型</td></tr>
+<tr><td>CRC-16/CCITT-FALSE</td><td>2</td><td>小端；poly 0x1021 / init 0xFFFF / 无反射无终异或；覆盖 version→payload</td></tr>
+</table>
+
+<h3>12.2 rpi_protocol.c/h + generated.h —— 传输层</h3>
+<table>
+<tr><th>函数</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">RpiProtocol_Crc16</td><td>CCITT-FALSE 校验（标准 "123456789" → 0x29B1）</td><td>主机侧 C 单测 tests/c/test_rpi_protocol.c 覆盖</td></tr>
+<tr><td class="fn">RpiProtocol_Encode</td><td>组帧（payload 超长拒绝）</td><td>—</td></tr>
+<tr><td class="fn">ParserInit / ParserReset / FeedByte</td><td><b>ISR 增量状态机</b>：SOF→头→载荷→CRC，逐字节喂入；噪声后自动重同步</td><td><span class="badge safe">安全</span> valid_frames/crc_errors/format_errors 统计</td></tr>
+<tr><td class="fn">QueuePush / QueuePop / QueueReset</td><td>4 深有界帧 FIFO；<b>STOP_ALL 走独立 urgent 锁存：FIFO 满仍可入、永远先于普通帧处理</b></td><td><span class="badge safe">安全</span> 急停绝不因积压丢失；普通帧满丢弃计 dropped</td></tr>
+<tr><td class="fn">TxQueuePush / TxQueuePop / TxQueueReset</td><td>USART1 DMA 的三类有界队列：urgent 故障锁存、8 深 control FIFO、1 个 latest telemetry 槽；出队顺序严格 fault→control→telemetry</td><td><span class="badge safe">安全</span> 遥测只覆盖旧值，不反压安全/响应</td></tr>
+<tr><td class="fn">rpi_protocol_generated.h</td><td>由 JSON schema 生成 HOST/wire 版本、CAPS、opcode/status/event/state/fault/telemetry 常量</td><td>禁止手改；运行 <code>python tools/generate_rpi_protocol.py</code></td></tr>
+</table>
+
+<h3>12.3 USART1 双协议自动识别（ISR 内分流）</h3>
+<table>
+<tr><th>条件</th><th>动作</th></tr>
+<tr><td>会话激活中 / 探测中 / 行首字节==0xA5</td><td>喂二进制解析器；置 candidate；合法帧入 RX 队列后不再喂 ASCII</td></tr>
+<tr><td>探测失败（回到 SOF_1 且无新合法帧）</td><td>candidate 清零，退回 ASCII 组帧</td></tr>
+<tr><td>其余</td><td>原 ASCII 双缓冲拼接（第一章）</td></tr>
+</table>
+<p class="sub">意义：同一 UART 上 PC 串口助手（ASCII）与 RPI（二进制）可共存，不会互相锁死；ISR 只组帧入队，处理仍在主循环。</p>
+
+<h3>12.4 二进制会话生命周期（RpiBinary armed / active）</h3>
+<table>
+<tr><th>当前状态</th><th>触发</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">未武装</span></td><td>上电 / HOST LINK 声明 / 会话拆除</td><td>armed=active=0、goal/遥测清、RX/TX 队列与 parser 复位</td><td><span class="st">未武装</span></td></tr>
+<tr><td><span class="st">未武装</span></td><td><code>SESSION_PROBE</code>（Pi 每次打开串口先发）</td><td>即使未武装也响应 active/armed/host/pose/goal/CAPS/wire；供新进程发现遗留会话</td><td>不变</td></tr>
+<tr><td><span class="st">未武装</span></td><td><code>HOST BINARY START</code>（仅 RPI 链路）</td><td class="warn">门禁：空闲 + OPS 新鲜 + CAN 健康 + 四轮已使能 → armed=1，回 <code># HOST BINARY READY VERSION=2 CAPS=0x0000003F</code>；<b>此时遥测仍关闭</b></td><td><span class="st run">armed</span></td></tr>
+<tr><td><span class="st run">armed</span></td><td>第一条二进制帧在主循环处理（armed 且 RPI）</td><td>active=1、开启二进制 WHEEL/POSE 遥测、刷新心跳；切换前不会发 ASCII @W/@P</td><td><span class="st okk">active</span></td></tr>
+<tr><td><span class="st okk">active</span></td><td>每主循环 RpiBinary_Process / TxProcess</td><td>urgent STOP_ALL 先行 → 普通 RX 处理 → 响应/事件/遥测入分级 TX → DMA 发送（_write 抑制 printf）</td><td>继续</td></tr>
+<tr><td><span class="st okk">active</span></td><td class="warn">1.5s 无任何命令（含二进制 PING 也喂狗）</td><td class="warn">Robot_StopAllMotion + 会话完全拆除 + <b>active_host_link=NONE 回 HOST WAIT（ASCII 自检态）</b>，绝不恢复旧目标</td><td><span class="st term">NONE/未武装</span></td></tr>
+<tr><td>armed/active</td><td class="warn">USART1 ORE/FE/其他 HAL 错误</td><td class="warn">ISR 仅置 host_uart_fault_pending；下一主循环立即停车、AbortTransmit、清目标/队列/会话并回 HOST WAIT</td><td><span class="st term">NONE/FAULT</span></td></tr>
+</table>
+
+<h3>12.5 命令 / 响应（首字节 opcode）</h3>
+<table>
+<tr><th>opcode</th><th>命令</th><th>载荷</th><th>校验</th></tr>
+<tr><td>01</td><td>PING</td><td>空</td><td>刷新主机看门狗</td></tr>
+<tr><td>02</td><td>STOP_ALL</td><td>空</td><td><span class="badge safe">安全</span> urgent 锁存；未武装也接受（其余命令未武装回 BUSY）</td></tr>
+<tr><td>03</td><td>SESSION_PROBE</td><td>空 → 13字节会话/能力状态</td><td>未武装也接受；只读，不恢复目标</td></tr>
+<tr><td>80</td><td>SET_POSE_GOAL（兼容）</td><td><code>&lt;IiiiI</code> goal_id, x mm, y mm, yaw <b>mrad</b>, timeout <b>ms</b></td><td>保留兼容；正式 Pi 运行不使用</td></tr>
+<tr><td>81</td><td>CANCEL_POSE_GOAL</td><td><code>&lt;I</code> goal_id</td><td>—</td></tr>
+<tr><td>82</td><td>QUERY_POSE_GOAL</td><td>空 → 响应数据 <code>&lt;IBiiiHBB</code>（id/state/x/y/yaw/fault/mode/host）</td><td>Pi 还以 pending sequence + request_goal_id 判定归属</td></tr>
+<tr><td>83</td><td>SET_SPEED_LIMITS（兼容）</td><td><code>&lt;ii</code> 线速度 µm/s、角速度 µrad/s</td><td>正式运行仅暂存到 Pi，避免“限速已改但目标被拒”的半事务</td></tr>
+<tr><td>84</td><td><b>SET_POSE_GOAL_WITH_LIMITS</b></td><td><code>&lt;IiiiIii</code> 目标五字段 + 线/角速度上限</td><td><span class="badge safe">安全</span> 固件先校验整包再同时接受；任一字段拒绝均不改限速、不发车、不发 POSE_STARTED</td></tr>
+</table>
+<p class="sub">响应载荷 = 请求 sequence + opcode + status（00 OK / 01 UNKNOWN_COMMAND / 02 INVALID_LENGTH /
+03 INVALID_ARGUMENT / 04 BUSY / 05 INTERNAL_ERROR）。</p>
+
+<h3>12.6 事件（全部回带 goal_id）</h3>
+<table>
+<tr><th>code</th><th>事件</th><th>载荷</th></tr>
+<tr><td>10</td><td>POSE_STARTED</td><td><code>&lt;I</code> goal_id</td></tr>
+<tr><td>11</td><td>POSE_REACHED</td><td><code>&lt;Iiiiii</code> goal_id, x, y, yaw, 位置误差, 航向误差</td></tr>
+<tr><td>12</td><td>POSE_CANCELLED</td><td><code>&lt;I</code> goal_id</td></tr>
+<tr><td>13</td><td>MOTION_FAULT</td><td><code>&lt;IH</code> goal_id, reason（OPS/HOST/CAN/越界/TIMEOUT/UART/INTERNAL）</td></tr>
+</table>
+<p class="sub">Pi 侧规则（规范强制）：异目标事件必须忽略；QUERY 响应必须同时属于当前 pending 请求和当前活动 goal；运动期间持续 PING；重连绝不重放旧目标。</p>
+
+<h3>12.7 二进制遥测与 DMA TX</h3>
+<table>
+<tr><th>项</th><th>格式 / 调度</th><th>安全 / 备注</th></tr>
+<tr><td>WHEEL / POSE</td><td>type 01/02 + <code>&lt;IH8i</code>，各39字节；20Hz、BOTH时25ms交错；RPM×10，姿态mm/mrad，规划速度µunits</td><td>进入 active 才启用</td></tr>
+<tr><td>LINK_STATS</td><td>type 03 + <code>&lt;6I</code>，每秒：tick/RX dropped/TX critical dropped/telemetry replaced/CRC/UART error</td><td>供 Pi 诊断，不进控制事件队列</td></tr>
+<tr><td>TX 调度</td><td>fault urgent 锁存 → response/event 8深 FIFO → latest telemetry 单槽；<code>HAL_UART_Transmit_DMA</code> 单 writer</td><td><span class="badge safe">安全</span> DMA active buffer 到完成回调前不覆盖；遥测可丢旧</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-bridge">十三、serial_bridge.py —— 串口桥线程 ★（双编解码唯一写者）</h2>
+<h3>13.1 链路状态机 LinkState</h3>
+<table>
+<tr><th>当前状态</th><th>触发</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">DISCONNECTED</span></td><td>线程启动</td><td>—</td><td><span class="st run">CONNECTING</span></td></tr>
+<tr><td><span class="st run">CONNECTING</span></td><td>工厂打开成功</td><td>先发 SESSION_PROBE；若发现遗留 armed/active 会话，先 STOP_ALL、停发心跳并等待≥1.6s 固件回 ASCII；完成后才发布 SerialConnected</td><td><span class="st okk">CONNECTED</span></td></tr>
+<tr><td><span class="st okk">CONNECTED</span></td><td>每轮循环</td><td>① RX 短超时→按模式解码→控制/遥测分队列 ② 清理 pending deadline ③ PING deadline 先于 TX ④ TX 限量 drain(8)</td><td>自循环</td></tr>
+<tr><td><span class="st okk">CONNECTED</span></td><td class="warn">读/写异常</td><td class="warn">关串口 → <b>锁存急停+清 TX/pending/暂存限速+复位二进制会话</b> → SerialDisconnected（绝不重发旧命令）</td><td><span class="st">BACKOFF</span></td></tr>
+<tr><td><span class="st">BACKOFF</span></td><td>退避（<b>二进制会话曾激活时 ≥1.6s</b>：先让固件 1.5s 会话超时触发，保证重连时固件已回 ASCII 自检态）</td><td>重试打开（main 自动枚举工厂每次重新扫描设备）</td><td><span class="st run">CONNECTING</span></td></tr>
+</table>
+<h3>13.2 函数（ASCII 模式）</h3>
+<table>
+<tr><th>函数</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">send / emergency_stop / release_emergency_stop</td><td>唯一入队入口（锁存期拒运动命令）/ 原子锁存+清队+仅留 STOP / 解除门禁</td><td><span class="badge safe">安全</span></td></tr>
+<tr><td class="fn">get_event / get_telemetry</td><td>控制事件无损队列 / 遥测有界队列(256 丢旧)</td><td>遥测不反压安全事件</td></tr>
+<tr><td class="fn">is_motion_command（protocol）</td><td>运动命令前缀表（STOP/POSE STOP/PID 配置豁免；HOST LINK 非运动）</td><td><span class="badge safe">安全</span> 新运动命令必须同步</td></tr>
+</table>
+<h3>13.3 二进制模式扩展（当前 wire v2）</h3>
+<table>
+<tr><th>函数 / 行为</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">enable_binary_mode(linear,yaw)</td><td>READY 的 version/CAPS 验证后原子切换编解码，复位 decoder/pending，并暂存启动自检确认的限速</td><td>仅由启动状态机最后一步调用</td></tr>
+<tr><td class="fn">send_pose_goal(goal_id,x,y,yaw,timeout,priority)</td><td>把暂存限速与目标组成 opcode 84 原子帧（定点换算、越界 ValueError）；未就绪/锁存急停/限速未知均拒绝</td><td><span class="badge safe">安全</span> 固件拒限速时不会启动目标</td></tr>
+<tr><td class="fn">cancel_pose_goal / set_speed_limits / query_pose_goal</td><td>CANCEL 帧 / <b>仅暂存</b>下一目标限速 / QUERY 帧（携带 Pi 侧 request_goal_id，默认独立 PRIORITY_QUERY=5）</td><td>QUERY 介于 STOP(0) 与普通运动(20)之间</td></tr>
+<tr><td class="fn">send("STOP") / emergency_stop()（二进制模式）</td><td>自动转为二进制 STOP_ALL（urgent）；其余 ASCII 命令在二进制模式一律拒绝</td><td><span class="badge safe">安全</span> 两模式不混写</td></tr>
+<tr><td class="fn">pending / sequence / timeout</td><td>最多64个、默认0.75s deadline；sequence 回绕跳过存活请求；响应必须同时匹配 sequence+opcode；超时发 BinaryCommandTimedOut</td><td>pending 满拒普通命令，但 STOP 仍以不跟踪方式发出</td></tr>
+<tr><td class="fn">RX 解码</td><td>事件→既有导航 Event；QUERY→BinaryPoseStatus(request_goal_id + firmware goal/status)；非OK→BinaryCommandRejected；WHEEL/POSE/LINK_STATS→独立最新值遥测队列</td><td>坏帧重同步；迟到/错 opcode 响应计数，不误配</td></tr>
+<tr><td class="fn">binary_stats</td><td>pending、命令超时、未匹配响应、decoder CRC/丢字节、Pi遥测丢旧计数</td><td>只读诊断</td></tr>
+<tr><td class="fn">断线复位</td><td>binary_mode=False、decoder/pending/暂存限速清空；退避 ≥1.6s</td><td><span class="badge safe">安全</span> 显式测试断连后 pending=0</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-bincodedec">十四、binary_protocol.py + 协议生成 —— 二进制编解码 ★</h2>
+<p class="sub">与 protocol.py 刻意分离的纯编解码层（无串口依赖）：wire v2，多字节小端，yaw 用 mrad（deg×17.45329252）、
+速度用 µunits 定点。常量不再由 C/Python 各自手写，而由 JSON schema 一次生成。</p>
+<table>
+<tr><th>函数 / 类</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">protocol/rpi_binary_protocol.json</td><td>HOST=4、wire=2、CAPS=0x3F 及全部枚举的唯一数值权威源</td><td><span class="badge safe">安全</span> schema 测试核对运行时常量</td></tr>
+<tr><td class="fn">tools/generate_rpi_protocol.py</td><td>生成 Core/Inc/rpi_protocol_generated.h、pi-brain/app/binary_protocol_generated.py、docs/binary-protocol-reference.generated.md；<code>--check</code> 只校验不改文件</td><td>生成物纳入版本控制</td></tr>
+<tr><td class="fn">crc16_ccitt / Frame.encode / decode_frame</td><td>CRC-16/CCITT-FALSE；组帧（seq≤255、payload≤64）/ 解帧（wire version/类型/长度/CRC 全验）</td><td>标准向量 0x29B1 自测</td></tr>
+<tr><td class="fn">FrameDecoder.feed(data)</td><td><b>增量解码器</b>：SOF 搜索 + 噪声丢弃计数 + CRC 错误计数，坏帧后逐字节重同步，永不卡死</td><td><span class="badge safe">安全</span> 与固件解析器对称</td></tr>
+<tr><td class="fn">PoseGoal / pose_goal_with_limits_data</td><td><code>&lt;IiiiI</code> 目标校验 + <code>&lt;ii</code> 限速拼为 opcode 84 数据；goal_id非零、timeout 1~60000ms</td><td><span class="badge safe">安全</span> 整包先校验，越界不发帧</td></tr>
+<tr><td class="fn">speed_limits_data(linear,yaw)</td><td><code>&lt;ii</code> µunits；0.02~0.30 / 0.02~0.80 越界拒绝（与固件硬边界一致）</td><td>正式运行作为下一原子目标的一部分</td></tr>
+<tr><td class="fn">Response / PoseStatus / decode_pose_event</td><td>响应三元组 / QUERY 21字节 <code>&lt;IBiiiHBB</code> / 四种事件严格长度与 goal_id 非零校验</td><td>畸形→ValueError→RawMessage</td></tr>
+<tr><td class="fn">decode_telemetry</td><td>严格解码39字节 WHEEL/POSE 和25字节 LINK_STATS 为类型化 sample</td><td>控制事件与遥测分流</td></tr>
+<tr><td class="fn">Capability / Command / ResponseStatus / EventCode / PoseState / MotionFault / TelemetryType</td><td>从 generated.py 导入，与固件生成头一一对应</td><td>新增命令/能力先改 schema</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-startup">十五、state_machine.py —— 启动自检状态机 ★（握手→自检→二进制会话）</h2>
+<table>
+<tr><th>当前状态</th><th>触发 / 响应</th><th>校验 → 动作</th><th>次态</th></tr>
+<tr><td><span class="st">BOOT</span></td><td>start()（首次/重连/FAULT 恢复）</td><td>emergency_stop()；已连接→发 <code>HOST LINK RPI</code>(PRIORITY_CONFIG)，清 ops_pose</td><td><span class="st">WAIT_HOST_LINK</span> / <span class="st">WAIT_CONNECTION</span></td></tr>
+<tr><td><span class="st">WAIT_HOST_LINK</span></td><td><code># HOST LINK RPI OK</code></td><td>host 必须 == RPI（否则 fail）→ 再发 STOP(PRIORITY_STOP)，从确定静止态开始自检</td><td><span class="st">WAIT_STOP</span></td></tr>
+<tr><td><span class="st">WAIT_STOP</span></td><td># STOP MODE=…</td><td>发 MODE WORK</td><td><span class="st">WAIT_MODE_WORK</span></td></tr>
+<tr><td><span class="st">WAIT_MODE_WORK</span></td><td># MODE …</td><td>mode=WORK 且 PLOT=0 → 发 STATUS</td><td><span class="st">WAIT_STATUS</span></td></tr>
+<tr><td><span class="st">WAIT_STATUS</span></td><td># STATUS …</td><td>WORK 空闲、协议≥<b>4</b> → 发 OPS STATUS</td><td><span class="st">WAIT_OPS</span></td></tr>
+<tr><td><span class="st">WAIT_OPS</span></td><td># OPS LINK=…</td><td>LINK=OK 且 frames&gt;0 → <b>捕获 ops_pose=(x,y,yaw)</b>（地图锚定用）→ 发 CAN STATUS</td><td><span class="st">WAIT_CAN</span></td></tr>
+<tr><td><span class="st">WAIT_CAN</span></td><td># CAN …</td><td>state=2 且 error=0 → 发 PID SET X</td><td><span class="st">WAIT_PID_X</span></td></tr>
+<tr><td><span class="st">WAIT_PID_X→Y→YAW</span></td><td># PID LOADED</td><td>回读核对(1e-7) → 下一轴 / PID LIMIT X</td><td>… → <span class="st">WAIT_LIMIT_X</span></td></tr>
+<tr><td><span class="st">WAIT_LIMIT_X→Y→YAW</span></td><td># PID LIMIT</td><td>核对 → PID STATUS ALL</td><td><span class="st">WAIT_PID_VERIFY</span></td></tr>
+<tr><td><span class="st">WAIT_PID_VERIFY</span></td><td># PID ALL</td><td>三轴终验 → 发 <code>HOST BINARY START</code>(PRIORITY_CONFIG)；<b>确认前仍保持急停门禁</b></td><td><span class="st">WAIT_BINARY_READY</span></td></tr>
+<tr><td><span class="st">WAIT_BINARY_READY</span></td><td><code># HOST BINARY READY VERSION=2 CAPS=0x0000003F</code></td><td>严格核对 wire version 和六项 REQUIRED_CAPABILITIES；缺失即 FAULT；通过后 enable_binary_mode(已验证限速) → release_emergency_stop</td><td><span class="st okk">READY</span></td></tr>
+<tr><td>任意等待态</td><td class="warn">超时 1.5s / SafetyFault / CanError / UnknownError / 断线</td><td class="warn">记录原因 + emergency_stop() + <b>清 ops_pose</b></td><td><span class="st term">FAULT</span></td></tr>
+<tr><td><span class="st term">FAULT</span> / <span class="st">WAIT_CONNECTION</span></td><td>SerialConnected</td><td>重新 start()（重新握手，绝不恢复旧运动）</td><td><span class="st">WAIT_HOST_LINK</span></td></tr>
+</table>
+<p class="sub">函数：start / tick / handle_event / _request_host_link / _on_host_link / _fail；属性 is_ready、ops_pose（供 map_frame 锚定）。</p>
+
+<!-- ================================================================ -->
+<h2 id="pi-nav">十六、navigator.py —— 单航点状态机 ★（goal_id 事务身份）</h2>
+<table>
+<tr><th>当前状态</th><th>触发 / 条件</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">IDLE</span>/终态</td><td>goto_pose()：门禁开+未锁急停+无活动航点</td><td><b>二进制模式</b>：send_pose_goal(goal_id,…)；ASCII 模式（COM/测试替身）：POSE SET 文本</td><td><span class="st run">WAIT_POSE_START</span></td></tr>
+<tr><td><span class="st run">WAIT_POSE_START</span></td><td># POSE START</td><td>设运动 deadline</td><td><span class="st run">MOVING</span></td></tr>
+<tr><td><span class="st run">WAIT_POSE_START</span></td><td class="warn">首次启动 deadline</td><td>二进制先发一次 QUERY(goal_id) 核对：MOVING→恢复；REACHED→成功；IDLE/CANCELLED→UNEXPECTED_STOP；查询仍无结果再 emergency_stop</td><td><span class="st run">MOVING</span> / <span class="st okk">REACHED</span> / <span class="st term">FAILED</span></td></tr>
+<tr><td><span class="st run">WAIT_POSE_START</span></td><td class="warn">未确认先收到异步到位</td><td class="warn">协议状态不同步，emergency_stop()</td><td><span class="st term">FAILED(UNEXPECTED_REACHED)</span></td></tr>
+<tr><td><span class="st run">MOVING</span></td><td># POSE TARGET</td><td>记录误差</td><td><span class="st okk">REACHED</span></td></tr>
+<tr><td><span class="st run">MOVING</span></td><td class="warn">总 deadline</td><td>先 QUERY：REACHED→补偿丢失的到位事件；仍 MOVING 或二次超时→emergency_stop；IDLE/CANCELLED→UNEXPECTED_STOP</td><td><span class="st okk">REACHED</span> / <span class="st term">FAILED</span></td></tr>
+<tr><td>运动态</td><td>cancel(id)</td><td><b>二进制模式</b>：cancel_pose_goal(id)；ASCII：POSE STOP</td><td><span class="st">CANCELLING</span></td></tr>
+<tr><td><span class="st">CANCELLING</span></td><td>停止确认 / 先到位 / 确认超时</td><td>— / 视为成功 / 首次超时升级 STOP+QUERY，再超时 emergency_stop()</td><td><span class="st okk">CANCELLED</span> / <span class="st okk">REACHED</span> / <span class="st term">FAILED(CANCEL_UNCONFIRMED)</span></td></tr>
+<tr><td>任意</td><td class="warn">SafetyFault / CanError / UnknownError / 非QUERY的 BinaryCommandRejected·TimedOut / 断线</td><td class="warn">emergency_stop()；QUERY 自身失败由原状态的有界 deadline 收口</td><td><span class="st term">FAILED</span></td></tr>
+</table>
+<p class="sub">终态保持可观察，下一次 goto_pose 自动清理；绝不自动重发；串口上任意时刻最多一个未完结目标。
+<b>事务归属加固</b>：异目标事件一律忽略；QUERY 响应除固件报告的 goal_id 外，还携带发送时记录的
+<code>request_goal_id</code>，仅当它等于当前目标且 query_context 非空才消费。旧目标跨切换迟到的 IDLE/FAULT
+不会终结新目标或误锁急停。只读属性 active_goal_id / active_target。</p>
+
+<!-- ================================================================ -->
+<h2 id="pi-route">十七、route_runner.py —— 多航点路线状态机 ★</h2>
+<table>
+<tr><th>当前状态</th><th>触发 / 条件</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">IDLE</span>/终态</td><td>start_route(goals)：非空且导航器空闲</td><td>先切速度档 → 提交第 1 航点</td><td><span class="st run">RUNNING</span>（首航点被拒→ABORTED）</td></tr>
+<tr><td><span class="st run">RUNNING</span></td><td>当前航点 REACHED（非最后）</td><td>切档 → 提交下一个（严格串行）</td><td><span class="st run">RUNNING</span></td></tr>
+<tr><td><span class="st run">RUNNING</span></td><td>最后航点 REACHED</td><td>—</td><td><span class="st okk">COMPLETED</span></td></tr>
+<tr><td><span class="st run">RUNNING</span></td><td class="warn">任一 FAILED / 取消后 CANCELLED / cancel() / 速度档非法</td><td class="warn">剩余全弃，绝不重试；不发车不半套</td><td><span class="st term">ABORTED</span></td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-mission">十八、mission.py —— 比赛任务状态机 ★</h2>
+<p class="sub">IDLE→WAIT_START→MOVE_TO_PICK→ALIGN_PICK→PICK→MOVE_TO_DROP→ALIGN_DROP→DROP→RETURN→FINISHED
+＋PAUSED/RECOVERY/ABORTED/EMERGENCY_STOP。只调 navigator.goto_pose()/cancel() 与 MechanismPort（非阻塞）。</p>
+<table>
+<tr><th>当前状态</th><th>触发 / 条件</th><th>动作</th><th>次态</th></tr>
+<tr><td><span class="st">IDLE</span></td><td>start() / begin_run()</td><td>— / 切档+发 pick_approach</td><td><span class="st">WAIT_START</span> → <span class="st run">MOVE_TO_PICK</span></td></tr>
+<tr><td>移动腿</td><td>REACHED</td><td>按链推进（…→PICK；…→DROP；RETURN→FINISHED）</td><td>下一状态</td></tr>
+<tr><td><span class="st">PICK</span>/<span class="st">DROP</span></td><td>mechanism.pick()/drop() 返回</td><td>成功→下一腿；失败→ABORTED(x FAILED)</td><td>下一腿 / <span class="st term">ABORTED</span></td></tr>
+<tr><td>移动腿</td><td class="warn">SafetyFault / CAN_ERROR / DISCONNECTED</td><td class="warn">只记录终态，绝不自动恢复</td><td><span class="st term">EMERGENCY_STOP</span></td></tr>
+<tr><td>移动腿</td><td>pause()→取消确认 / 其他失败 / abort() / goto 被拒</td><td>记录被中断腿 / —</td><td><span class="st">PAUSED</span> / <span class="st term">ABORTED</span></td></tr>
+<tr><td><span class="st">PAUSED</span></td><td>resume()（仅显式人工）</td><td>RECOVERY→tick 重驱被中断腿→回原腿</td><td><span class="st">RECOVERY</span>→原腿</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-speed">十九、speed_profile.py —— 双速度档</h2>
+<table>
+<tr><th>项</th><th>内容</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">cruise 0.25/0.25 · precise 0.12/0.12</td><td>巡航档（宽车道长距离）/ 定位停车档（400mm 窄巷、对位、启停区）</td><td>依据：3 分钟赛时 vs ±50mm 车道余量</td></tr>
+<tr><td class="fn">SpeedProfileController.apply(name)</td><td><b>二进制模式：只在桥内暂存档位，下一 send_pose_goal 合成 opcode 84 原子事务</b>；ASCII 模式仍发三条 PID LIMIT；同档缓存跳过</td><td><span class="badge safe">安全</span> 固件整包拒绝时不发车且不改旧限速；越界抛异常；非法档→路线/任务 ABORTED</td></tr>
+<tr><td class="fn">mark_unknown()</td><td>重连/重自检后作废缓存（runtime.set_control_ready(False) 自动调用）</td><td>下次发车强制重发</td></tr>
+<tr><td class="fn">PoseGoal.profile</td><td>每航点速度档，默认 precise（宁慢不越线）</td><td>—</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-proto">二十、protocol.py —— ASCII 协议层（V4）</h2>
+<table>
+<tr><th>函数 / 组</th><th>作用</th></tr>
+<tr><td class="fn">encode_ping/stop/status/pose_set/command · <b>encode_host_link(host)</b></td><td>命令编码；HOST LINK 仅接受 COM|RPI（归一化大写，越界 ValueError）</td></tr>
+<tr><td class="fn">PRIORITY_STOP=0 / QUERY=5 / PING=10 / MOTION=20 / CONFIG=30</td><td>TX 优先级（值小先发；PING 走 deadline 不排队；QUERY 不再与 STOP 同级）</td></tr>
+<tr><td class="fn">is_motion_command(text)</td><td><span class="badge safe">安全</span> 运动前缀表（HOST LINK/STOP/POSE STOP/PID 配置豁免）；新增运动命令必须同步</td></tr>
+<tr><td class="fn">parse_line(line)</td><td>解析优先级：@W/@P → PONG → <b># HOST LINK x OK → HostLinkAcknowledged / # HOST STATUS → HostStatus</b> → POSE STOP → STOP/MODE/PID → POSE START/TARGET → ROUND → STATUS → OPS → CAN → ERROR</td></tr>
+<tr><td class="fn"><b>HostLinkAcknowledged(host)</b> / <b>HostStatus(...)</b> / <b>BinaryReady(version,capabilities)</b></td><td>握手确认 / 所有权与健康查询 / 固件二进制会话版本与能力声明</td></tr>
+<tr><td class="fn">事件类（PR #2 增强）</td><td><b>PoseStarted / PoseReached / PoseStopped / SafetyFault 新增 goal_id 字段</b>（二进制事件回填；ASCII 路径为 None）——供 Navigator 做严格事务匹配</td></tr>
+<tr><td class="fn">事件类（其余）</td><td>Pong/Status/StopAcknowledged/ModeChanged/PidLoaded/PidLimitSet/PidStatusAll/RoundStarted/RoundStopped/OpsStatus/CanStatus/CanError/UnknownError/CsvTelemetry/WheelTelemetry/PoseTelemetry</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-misc">二十一、上位机 其余模块</h2>
+<table>
+<tr><th>文件 · 函数</th><th>作用</th><th>备注</th></tr>
+<tr><td class="fn">event_router.py · subscribe / publish</td><td>主循环唯一事件源顺序广播；单消费者异常不影响其他</td><td>各模块绝不自己 get_event</td></tr>
+<tr><td class="fn">jsonl_logger.py</td><td>JSONL 结构化日志：纯旁路 + 有界丢旧 + 独立写盘线程 + LOG_SUMMARY</td><td><span class="badge safe">安全</span> 不反压事件泵/心跳/STOP</td></tr>
+<tr><td class="fn">models.py · Pose / PoseGoal / NavState / GotoReason / GotoResult</td><td>导航数据模型（PoseGoal.profile 默认 precise）</td><td>—</td></tr>
+<tr><td class="fn">main.py · build_serial_factory / <b>build_auto_serial_factory</b> / build_demo_factory / run_loop / main</td><td>入口。自动枚举工厂<b>每次重连重新扫描</b>（支持 Pi 先于 STM32 上电）。run_loop 可选注入 logger / vision_cache / runtime；状态切换时依次调 vision_guard 与 runtime 的 set_control_ready。退出 finally：<b>先 emergency_stop()（排队 STOP）→ runtime.close() → bridge.stop() → logger.close()</b></td><td><span class="badge safe">安全</span> 退出前 STOP 有机会实际写出</td></tr>
+<tr><td class="fn">demo.py · FakeFirmware</td><td>固件仿真：HOST V4/wire v2、SESSION_PROBE、二进制 goal/query/event、原子目标+限速；可注入 opcode 84 INVALID_ARGUMENT，验证拒绝后无 POSE_STARTED</td><td>host_proto 默认 4；测试替身不代替 HAL 上板验证</td></tr>
+<tr><td class="fn">telemetry_plotter.py</td><td>W8/P8 曲线。COM 握手流：SerialConnected→estop+HOST LINK COM → Ack→estop+MODE → ModeChanged→TELEM BOTH+release；<b>heartbeat_enabled=False</b>（COM 免心跳）；握手未完成前控制台输入被拒；断线清 host 状态</td><td>退出先 estop 再关桥</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-vision">二十二、app/vision —— 视觉感知包（纯感知层）★</h2>
+<p class="sub">来源见 app/vision/UPSTREAM.md。红线：包内禁止 serial/协议/Navigator/任务机引用（tests/test_vision_architecture.py
+黑名单：serial_bridge / app.protocol / import serial / from app / POSE SET…）。唯一出口 VisionObservation；
+除障碍物（单应+OPS 位姿投影）外全部 x/y/yaw=None，像素坐标不冒充 OPS 毫米坐标。</p>
+<table>
+<tr><th>文件 · 函数</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">service.py · VisionService</td><td>唯一视觉工作线程 + 有界队列(32 丢旧) + 按类型保留最新</td><td><span class="badge safe">安全</span> 见 23.4 生命周期</td></tr>
+<tr><td class="fn">camera.py · validate_camera_config / PiCamera / DualCameraManager</td><td>配置校验（platform/双摄编号不同）；Picamera2 延迟导入、RGB888、单调时间戳；按角色启动（<b>部分失败回滚</b>）；健康=帧龄≤1s</td><td>启动/采集失败→CameraError</td></tr>
+<tr><td class="fn">pipeline.py · VisionPipeline</td><td>start 推导角色(front/gripper)，gripper 白平衡标定在视觉线程内；poll：front 一帧共享 QR→巡线→道路→障碍（障碍需 pose_provider 提供 OPS 位姿），gripper 物料检测</td><td>无目标返回空 tuple（正常）</td></tr>
+<tr><td class="fn">color_detector.py · ColorDetector</td><td>HSV+轮廓质量(填充/凸度/长宽比/边距)+历史投票多帧确认；status 状态机 + 白平衡 LUT</td><td>confidence=证据分数非概率</td></tr>
+<tr><td class="fn">qr_scanner.py · QrScanner</td><td>OpenCV 解码；连续 confirmations(默认2) 帧一致才 confirmed；0/多码即重置</td><td>宁严勿松</td></tr>
+<tr><td class="fn">material_detector.py · MaterialDetector</td><td>按目标编号过滤→最近已确认候选→夹爪中心偏移/aligned 判定→safe_to_pick</td><td>对准是抓取域概念，不进运动门禁</td></tr>
+<tr><td class="fn">road_detector.py / obstacle_detector.py</td><td>灰可行+黄白禁入 / 黑色圆柱单应投影+ObstacleTracker(3帧/120mm/0.5s保留)</td><td><span class="badge safe">安全</span> calibration_required=true 构造即拒绝</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-vision-stm">二十三、视觉内部小状态机 ★</h2>
+<h3>23.1 ColorDetector.status</h3>
+<table>
+<tr><th>状态</th><th>条件</th><th>safe_to_pick</th></tr>
+<tr><td><span class="st">SEARCHING</span></td><td>确认色数 &lt; 期望</td><td>false</td></tr>
+<tr><td><span class="st okk">READY</span></td><td>确认数==期望 且 当前帧==确认集合</td><td><b>true</b></td></tr>
+<tr><td><span class="st">HOLD</span></td><td>确认数==期望 但当前帧波动</td><td>false</td></tr>
+<tr><td><span class="st term">AMBIGUOUS</span></td><td>确认数 &gt; 期望</td><td>false</td></tr>
+</table>
+<h3>23.2 QrScanner 确认计数 / 23.3 ObstacleTracker 轨迹</h3>
+<table>
+<tr><th>机制</th><th>规则</th></tr>
+<tr><td>QR 确认</td><td>同文本连续≥2 帧 → confirmed；换文本计数=1；0/多码 reset()</td></tr>
+<tr><td>障碍轨迹</td><td>新建(conf=1) → 匹配(≤120mm)计数+1（<b>保留原始时间戳</b>）→ ≥3 输出 confirmed → 0.5s 未更新删除；半径=35+25mm 保守放大</td></tr>
+<tr><td>障碍投影</td><td>单应矩阵(图像→基座系) + MapPose(OPS 位姿) 旋转到地图系；未标定构造即拒绝</td></tr>
+</table>
+<h3>23.4 VisionService 生命周期</h3>
+<table>
+<tr><th>迁移</th><th>触发</th><th>动作</th></tr>
+<tr><td>→ <span class="st run">RUNNING</span></td><td>start()</td><td>先清旧结果再启线程（重启无旧目标）</td></tr>
+<tr><td><span class="st run">RUNNING</span></td><td>每 poll_interval(20ms)</td><td>成功采集即刷新健康时间（无目标≠故障）→ 入队丢旧</td></tr>
+<tr><td>→ <span class="st term">FAILED</span></td><td class="warn">poll/close 异常</td><td class="warn">记录 error + 清空全部观察 + close producer</td></tr>
+<tr><td>→ <span class="st">STOPPED</span></td><td>stop()/close()</td><td>join 成功后 clear()（停止即结果边界）</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-vision-int">二十四、vision_integration.py —— 观察→任务唯一桥 ★</h2>
+<table>
+<tr><th>类 / 函数</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">VisionRequirement(target_type, min_confidence, max_age_s, source, <b>target_id</b>)</td><td>门禁需求五元组（包含编号匹配）</td><td>—</td></tr>
+<tr><td class="fn">VisionObservationGate.require(req)</td><td>类型/来源/<b>编号</b>/置信度/新鲜度全过才返回（is_fresh 内含 valid）</td><td>未确认/过期观察天然被拦</td></tr>
+<tr><td class="fn">VisionGoalSelector.select(decision)</td><td>决策名→<b>预标定本地 PoseGoal</b>；构造时校验 goal 存在</td><td><span class="badge safe">安全</span> 绝不从像素造航点；拒绝返回 None 无 fallback</td></tr>
+<tr><td class="fn">TaskCodeObservationReader.read_task_code()</td><td>已确认二维码→任务码文本</td><td>置信度 1.0 + 0.5s + front</td></tr>
+<tr><td class="fn">VisionStateGuard</td><td>控制边界→清缓存：SerialDisconnected/SafetyFault/CanError/UnknownError/ModeChanged + set_control_ready(False)</td><td><span class="badge safe">安全</span> 只读事件只调 clear()</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-vision-cfg">二十五、config/vision 配置与 vision_debug 工具</h2>
+<table>
+<tr><th>文件</th><th>要点</th><th>安全默认</th></tr>
+<tr><td class="fn">cameras.json</td><td>双摄 Pi5：front 30fps(QR×2确认)、gripper 15fps(夹爪中心/对准容差)；require_global_ready_note 注明不代表自动抓取</td><td>—</td></tr>
+<tr><td class="fn">color.json / line.json</td><td>三色 HSV+投票参数 / 巡线阈值</td><td>line 默认关闭</td></tr>
+<tr><td class="fn">road.json / obstacle.json</td><td>道路三区 HSV 阈值 / 障碍阈值+单位阵占位单应+跟踪参数</td><td><span class="badge safe">安全</span> calibration_required=true 拒绝启用</td></tr>
+<tr><td class="fn">tools/vision_debug.py</td><td>只读视觉调试：JSON 打印观察与健康；不连 STM32</td><td>health.error 退出码 2</td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="pi-mapframe">二十六、map_frame.py —— 固定地图启动锚定 ★</h2>
+<p class="sub">把"固定场地图纸上的车体中心航点"转换为 POSE SET 需要的 OPS 原始航点。原理：以"标称起点 → 本轮自检读到的实际 OPS 起点"
+做一次刚体变换（旋转 yaw_delta + 平移），场地放置误差成为本轮整体偏差，由视觉精对准兜底——<b>无需现场逐点标定</b>。</p>
+<table>
+<tr><th>成员 / 函数</th><th>作用</th><th>备注</th></tr>
+<tr><td class="fn">MapGoal(name,x,y,yaw,timeout,profile)</td><td>地图纸中的车体中心航点（含速度档）</td><td>—</td></tr>
+<tr><td class="fn">StartAnchoredMapFrame(nominal_start_center, actual_start_ops, ops_offset)</td><td>锚定帧：构造时全字段 isfinite 校验</td><td>ops_offset 默认 (0,25) 传感器偏置</td></tr>
+<tr><td class="fn">to_ops_goal(map_goal)</td><td>① actual_center = actual_ops − rotate(offset, actual_yaw)（起点中心）
+② delta = map_goal − nominal；rotate(delta, actual_yaw−nominal_yaw)
+③ target_yaw = wrap(actual_yaw + goal_yaw − nominal_yaw)
+④ target_ops = target_center + rotate(offset, target_yaw)（终点传感器偏置按目标航向补偿）</td><td><span class="badge safe">安全</span> 非有限输入抛 ValueError；4 个单测覆盖恒等/旋转/终点偏置/零位移</td></tr>
+</table>
+<div class="note">限制（docstring 已声明）：放置误差会成为本轮地图的整体误差——粗导航后必须由视觉/机构精对准兜底，
+不适用于对绝对精度要求高于放置精度的场景。</div>
+
+<!-- ================================================================ -->
+<h2 id="pi-motiondbg">二十七、vision_motion_debug.py —— SSH 视觉-底盘人工联调 ★</h2>
+<p class="sub">局域网 SSH 进 Pi 运行：实时打印视觉观察 JSON（默认 0.5s 限频），人工确认后输入 <code>go</code> 发车。
+复用主事件泵（run_loop runtime= 注入）：自检、心跳、门禁、急停全部继承主程序。</p>
+<h3>27.1 命令集（stdin 线程→队列，主循环非阻塞消费）</h3>
+<table>
+<tr><th>命令</th><th>行为</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">go</td><td>发车到配置的地图航点（见 25.2 门禁）</td><td>默认 <b>OBSERVE_ONLY</b>：未加 --armed 时一律拒绝</td></tr>
+<tr><td class="fn">cancel</td><td>route.cancel() 取消当前航点</td><td>—</td></tr>
+<tr><td class="fn">estop</td><td>bridge.emergency_stop() + ready=False + vision.clear()</td><td><span class="badge safe">安全</span> 锁存后重启程序重新自检</td></tr>
+<tr><td class="fn">status / help / quit</td><td>状态 / 命令表 / 退出（EOF 也自动退出）</td><td>退出走 run_loop finally：先 STOP 后关口</td></tr>
+</table>
+<h3>27.2 go 门禁（六重前置，全部满足才发车）</h3>
+<table>
+<tr><th>#</th><th>条件</th><th>失败输出</th></tr>
+<tr><td>1</td><td>--armed 且 runtime READY 且地图锚定帧已建立</td><td>[GO REJECTED] requires --armed and READY</td></tr>
+<tr><td>2</td><td>vision.health().healthy（视觉线程活着、帧龄≤1s、无错误）</td><td>[GO REJECTED] vision is not healthy</td></tr>
+<tr><td>3</td><td>路线空闲（route != RUNNING）</td><td>[GO REJECTED] route already running</td></tr>
+<tr><td>4-5</td><td>观察门禁：目标类型+编号+来源+置信度(默认0.8)+新鲜度(0.5s) 全过</td><td>[GO REJECTED] no fresh matching observation</td></tr>
+<tr><td>6</td><td>READY 但无 OPS 起点位姿 → 直接急停+FAULT（set_control_ready 内）</td><td>[FAULT] READY without an OPS start pose</td></tr>
+</table>
+<p class="sub">说明：视觉只做"相机活着且看到预期目标"的<b>健康前置</b>，运动目标永远来自配置的预标定地图航点
+（frame.to_ops_goal 换算），不经像素生成——物料 aligned/safe_to_pick 属抓取域概念，不进本运动门禁。
+默认配置 map_goal == 标称起点（零位移），首次 SSH 联调天然安全。
+发车链路：SpeedProfileController 切档 → RouteRunner(单航点) → Navigator → SerialBridge → STM32；
+离开 READY 时 profiles.mark_unknown() 保证重自检后重新切档。配置校验（vision_motion_debug.json）：
+material 编号与 target_id 一致性、超时/置信度范围、offset 有限性，错误退出码 2。</p>
+
+<!-- ================================================================ -->
+<h2>附录：各状态机的共同安全不变量</h2>
+<div class="danger">
+<b>① 任何异常 → 锁存急停，绝不自动恢复旧目标</b>（重连/重新声明主机后必须重新自检）。<br>
+<b>② 超时一律按"固件可能已在运动"处理</b>：回复丢失 ≠ 未发车，START/取消确认超时都 emergency_stop()。<br>
+<b>③ 单航点串行</b>：串口上任意时刻最多一个未完结 POSE SET（Navigator→RouteRunner→Mission 逐层保证）。<br>
+<b>④ 双重停车保险</b>：下位机 ChassisSafety 每循环独立监督，上位机桥+导航器超时锁存——任一侧失效另一侧仍能停车。<br>
+<b>⑤ 限速与目标原子提交</b>：RPI 二进制运行把速度档暂存到 Pi，并与下一目标合为 opcode 84；固件整包校验后同时接受，拒绝时不改限速、不发车。ASCII 人工调试仍保持 PID LIMIT 先于 POSE SET。<br>
+<b>⑥ 职责红线</b>：树莓派只提交目标位姿，绝不持续发四轮速度、绝不直接驱动电机；STM32 独占闭环与电机控制。<br>
+<b>⑦ 视觉只读感知</b>：视觉包无串口/协议/导航依赖（架构测试固化）；观察只映射预标定航点或被门禁拒绝；像素≠毫米；
+未标定功能默认拒绝；控制边界事件统一清空视觉缓存。<br>
+<b>⑧ 主机所有权唯一</b>：HOST WAIT 门禁未握手前只放行探测/停车命令；COM/RPI 重新声明即停车清状态；
+RPI 链路运动受 1.5s HOST LOST 保护，COM 依赖操作员看护 + 固件超时/故障兜底。<br>
+<b>⑨ goal_id + pending 双重事务身份</b>：事件按当前 goal_id 过滤；响应还必须匹配存活 sequence/opcode；QUERY 额外校验 request_goal_id 与 query_context，旧目标迟到状态不能影响新目标。<br>
+<b>⑩ 会话与发送故障收口</b>：每次串口打开先 SESSION_PROBE，遗留会话先 STOP 再等待超时；断线清全部 pending；STOP/fault 走 urgent，控制走有界 FIFO，遥测只保留最新；USART1 错误下一主循环立即停车拆会话；二进制 active 时 printf 被抑制。
+</div>
+
+<!-- ================================================================ -->
+<h2 id="project-status">项目状态（2026-09-01）</h2>
+<table>
+<tr><th>项目</th><th>当前状态</th><th>后续动作</th></tr>
+<tr><td>Git 基线</td><td>本轮开发起点为 <code>39ec12c57dacd9d32a6b5aef319f7f430eb1d9c6</code>；本手册与当前 main 源码同步，发布提交以仓库 <code>git rev-parse HEAD</code> 为准；llm-pid-tuner-main 子模块指针未更新</td><td>后续修改继续保持源码、测试、README 与本手册同步</td></tr>
+<tr><td>协议基线</td><td>HOST protocol 4；binary wire 2；CAPS <code>0x0000003F</code>；JSON schema 为数值权威，C/Python/Markdown 生成物一致</td><td>改协议必须先改 schema，再生成并运行 <code>--check</code></td></tr>
+<tr><td>自动化验证</td><td><span class="ok">Python unittest 184/184 通过</span>；生成器一致性检查通过；便携式 C 协议测试通过；main.c 主机 GCC 语法检查通过（仅 CMSIS 64位主机指针宽度预期警告）；<code>git diff --check</code> 通过</td><td>保持新增 QUERY 交错、断连 pending 清理、原子限速拒绝三项回归测试</td></tr>
+<tr><td>STM32 构建/尺寸</td><td class="warn">当前 Debug ELF/map（13:44）早于 main.c（13:51），且现有 Debug 生成清单未包含新增 rpi_protocol.c，不能作为本修订尺寸基线</td><td>在 STM32CubeIDE 刷新工程源文件并执行完整 clean build；确认 rpi_protocol.c 入编译后，用 arm-none-eabi-size 记录 text/data/bss/Flash/RAM</td></tr>
+<tr><td>实车验证</td><td class="warn">HAL 相关 UART ORE/FE 锁存、DMA 饱和优先级/缓冲稳定性、Pi 进程冷重启恢复仍属人工验证项</td><td>按 docs/binary-pose-protocol.md 的 Hardware validation 清单上板验证，保留物理急停</td></tr>
+</table>
+<p class="sub" style="margin-top:30px">本文件更新于 2026-09-01。当前内容由 39ec12c 基线演进并对应 184/184 测试结果；
+完成 STM32 全量构建后请补录有效固件尺寸基线，修改协议、状态机或安全路径后请同步更新本文件。</p>
+</div>
+</body>
+</html>

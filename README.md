@@ -98,16 +98,29 @@ G6220 只使用电机内部闭环的“位置-速度模式”，STM32 不实现�
 
 为兼容现有命令，`TUNE AXIS X|Y|YAW`会自动切换到 `TUNE`；`PLOT ON`等价于进入 `PLOT`并开启两组遥测，`PLOT OFF`关闭遥测并返回 `WORK`。`STOP`只停止运动，不改变当前模式。正式运行前建议显式发送 `MODE WORK`。
 
-当前主机文本协议版本为 `3`，可发送 `PROTO VERSION` 查询。V3 新增强制
-`HOST LINK COM|RPI` 所有权握手；握手后原有 V2 业务命令格式保持不变。
+当前主机文本协议版本为 `4`，可发送 `PROTO VERSION` 查询。V4在既有
+`HOST LINK COM|RPI` 所有权握手之上增加二进制版本和能力协商。
 `PID SET`和`PID LIMIT`是跨模式的非运动配置命令，便于WORK启动自检和TUNE装载参数；`TUNE LIMIT`以及会启动调参轮次的`SET P:... I:... D:...`仅允许在TUNE模式执行。`STATUS`保留 `MODE`、`HOST_PROTO`、`PLOT`和USART1发送统计字段，并增加当前 `HOST`。
 
 正式 Raspberry Pi 位姿事务还可使用带 CRC、请求序号和 `goal_id` 的
 [二进制协议](docs/binary-pose-protocol.md)。PC/TUNE 文本命令保持不变；RPI
-必须先完成现有 ASCII 启动自检，再通过 `HOST BINARY START`/`# HOST BINARY READY`
-显式切换。切换后 `SerialBridgeThread` 仍是串口唯一写者，统一发送二进制心跳、
-速度档、位姿、取消和 STOP；Mission、RouteRunner 与 Navigator 不直接接触串口。
+必须先完成现有 ASCII 启动自检，再通过 `HOST BINARY START`和带
+`VERSION/CAPS`的READY响应显式切换。切换后 `SerialBridgeThread` 仍是串口唯一
+写者；速度档与位姿作为一条原子事务发送，另有QUERY、二进制遥测和冷启动会话
+恢复。Mission、RouteRunner 与 Navigator 不直接接触串口。
 链路丢失会停车、清除旧目标并退回 ASCII 自检状态，绝不恢复旧运动。
+
+二进制协议的数值常量只有一个权威来源：
+`protocol/rpi_binary_protocol.json`。修改版本、能力位、命令、事件或故障码后，运行：
+
+```powershell
+python tools/generate_rpi_protocol.py
+python tools/generate_rpi_protocol.py --check
+```
+
+生成器同步维护 STM32 头文件、树莓派 Python 常量和 Markdown 数值表，避免两端
+手工维护产生协议漂移。当前基线为 HOST protocol 4、binary wire 2、能力位
+`0x0000003F`。
 
 ## POSE 梯形速度规划
 
@@ -179,7 +192,8 @@ python3 -m tools.vision_motion_debug --port /dev/serial/by-id/<STM32设备> --ar
 
 ## Python 两组 8 通道实时波形
 
-项目不再依赖 SerialPlot 的单组二进制格式。固件输出两类带版本、STM32 tick 和序号的 ASCII 行；未知或残缺帧不会被当作控制事件：
+项目不再依赖 SerialPlot 的单组二进制格式。COM/PLOT调试继续输出下面两类
+ASCII行；RPI二进制会话使用CRC遥测帧，但映射为相同的Python事件类型：
 
 ```text
 @W,1,tick,seq,target1,target2,target3,target4,actual1,actual2,actual3,actual4
@@ -210,11 +224,19 @@ python -m tools.telemetry_plotter --port COM3 --mode work
 使用 STM32CubeIDE 1.19.0 打开工程并构建 `Debug` 配置。主要入口为：
 
 - `Core/Src/main.c`
+- `Core/Src/rpi_protocol.c`
+- `Core/Inc/rpi_protocol.h`
+- `Core/Inc/rpi_protocol_generated.h`
 - `Core/Src/mecanum_chassis.c`
 - `Core/Src/pid.c`
 - `Core/Src/zdtEmm.c`
 - `Core/Src/zdtCan.c`
 - `serialPlotTest.ioc`
+
+新增源文件后，先在 STM32CubeIDE 中刷新工程并执行一次完整 clean build，确认
+构建日志和 `Debug/Core/Src/subdir.mk` 已包含 `rpi_protocol.c`。构建完成后用
+`arm-none-eabi-size Debug/serialPlotTest.elf` 记录固件 `text/data/bss` 以及
+Flash/RAM 基线；旧 ELF 或未包含协议源文件的构建结果不能作为尺寸基线。
 
 Python 工具位于 `llm-pid-tuner-main/`，建议使用其 `.venv` 环境运行测试：
 
@@ -223,6 +245,29 @@ Python 工具位于 `llm-pid-tuner-main/`，建议使用其 `.venv` 环境运行
   llm-pid-tuner-main.tests.test_hw_bridge `
   llm-pid-tuner-main.tests.test_hardware_tui
 ```
+
+树莓派主控、协议和视觉测试：
+
+```powershell
+cd pi-brain
+python -m unittest discover -s tests -v
+cd ..
+python tools/generate_rpi_protocol.py --check
+```
+
+便携式 C 协议测试可在具有 GCC 的主机上运行：
+
+```powershell
+gcc -std=c11 -Wall -Wextra -Werror -ICore/Inc `
+  tests/c/test_rpi_protocol.c Core/Src/rpi_protocol.c -o test_rpi_protocol
+.\test_rpi_protocol.exe
+```
+
+当前自动化验证基线为 Python `184/184` 通过、协议生成一致性检查通过、便携式
+C 协议测试通过。USART1 ORE/FE 错误锁存、DMA 饱和时的发送优先级与缓冲稳定性、
+树莓派进程冷重启恢复仍需在实车上验证，详见
+`docs/binary-pose-protocol.md`。完整函数和状态机索引见
+`functions_reference.html`。
 
 ## 当前验证参数
 

@@ -10,10 +10,9 @@
     几乎零余量 → 定位停车档低速收敛
 
 实现方式：
-  - 通过串口桥发送一条原子的二进制速度档命令（硬边界：
+  - 二进制会话中把速度档暂存到串口桥，并与下一条位姿目标组成原子命令（硬边界：
     线速度 0.02~0.30 m/s、角速度 0.02~0.80 rad/s，与 main.c 一致）
-  - 速度档命令与随后的位姿目标同用 PRIORITY_MOTION：唯一写者队列
-    同优先级按序写出，保证“先切档、后发车”
+  - STM32先校验整包目标和限速，再同时接受；任何字段被拒绝都不会发车
   - mark_unknown()：断线重连或重新自检后调用；自检流程会重载默认限速，
     此时本地"当前档"缓存作废，下一次发车前必须重发
 """
@@ -54,7 +53,7 @@ DEFAULT_PROFILES = {
 
 
 class SpeedProfileController:
-    """速度档控制器：发车前切换 PID LIMIT，缓存当前档避免重复发送。"""
+    """速度档控制器：发车前选择限速，缓存当前档避免重复选择。"""
 
     def __init__(self, bridge, profiles: Optional[dict] = None) -> None:
         self._bridge = bridge
@@ -81,7 +80,8 @@ class SpeedProfileController:
     def apply(self, name: str) -> bool:
         """切换到指定速度档；与缓存一致时跳过。返回是否实际发送命令。
 
-        越界或未知档名直接抛异常，绝不发送半套配置。
+        越界或未知档名直接抛异常，绝不提交半套配置。二进制模式下桥会把
+        本档与下一条目标原子发送；ASCII人工调试仍按X/Y/YAW三条命令发送。
         """
         profile = self.profile(name)
         self._validate(profile)

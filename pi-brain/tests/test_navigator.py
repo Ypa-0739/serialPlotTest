@@ -21,6 +21,9 @@ from app.demo import FakeFirmware
 from app.models import GotoReason, NavState
 from app.navigator import NavigationRejected, Navigator
 from app.serial_bridge import SerialBridgeThread
+from app.serial_bridge import BinaryPoseStatus
+from app.binary_protocol import PoseState
+from app.protocol import PoseStarted, PoseStopped
 
 
 def pump_nav(bridge, nav, *, until, timeout=3.0, step=0.01):
@@ -81,6 +84,100 @@ class NavigatorTests(unittest.TestCase):
         self.assertAlmostEqual(r.final_pose.x_mm, 1000)
         self.assertEqual(self.nav.state, NavState.REACHED)  # 终态保持可观察
         self.assertGreaterEqual(r.elapsed_s, 0.0)
+
+    def test_query_reconciles_missing_binary_start_event(self):
+        self.firmware.pose_start_ok = False
+        self.firmware.pose_reached_ok = False
+        self.assertTrue(pump_nav(self.bridge, self.nav, until=lambda: self.bridge.is_connected))
+        self.bridge.enable_binary_mode()
+        self.ready()
+        self.nav.goto_pose(100, 200, 0)
+        ok = pump_nav(
+            self.bridge,
+            self.nav,
+            until=lambda: self.nav.state == NavState.MOVING,
+            timeout=1.5,
+        )
+        self.assertTrue(ok, f"QUERY未恢复启动状态: {self.nav.state}")
+
+    def test_query_reconciles_missing_cancel_event(self):
+        self.assertTrue(pump_nav(self.bridge, self.nav, until=lambda: self.bridge.is_connected))
+        self.bridge.enable_binary_mode()
+        self.ready()
+        gid = self.nav.goto_pose(100, 200, 0)
+        self.nav.handle_event(PoseStarted(goal_id=gid))
+        self.assertTrue(self.nav.cancel(gid))
+        self.nav._req.query_context = "cancel"
+        self.nav.handle_event(
+            BinaryPoseStatus(
+                request_goal_id=gid, goal_id=gid, state=PoseState.CANCELLED
+            )
+        )
+        self.assertEqual(self.nav.state, NavState.CANCELLED)
+        self.assertEqual(self.nav.last_result.reason, GotoReason.CANCELLED)
+
+    def test_query_reconciles_missing_reached_event(self):
+        self.assertTrue(pump_nav(self.bridge, self.nav, until=lambda: self.bridge.is_connected))
+        self.bridge.enable_binary_mode()
+        self.ready()
+        gid = self.nav.goto_pose(100, 200, 0)
+        self.nav.handle_event(PoseStarted(goal_id=gid))
+        self.nav._req.query_context = "motion"
+        self.nav.handle_event(
+            BinaryPoseStatus(
+                request_goal_id=gid,
+                goal_id=gid,
+                state=PoseState.REACHED,
+                x_mm=101,
+                y_mm=199,
+                yaw_deg=0.5,
+            )
+        )
+        self.assertEqual(self.nav.state, NavState.REACHED)
+        self.assertTrue(self.nav.last_result.success)
+
+    def test_late_query_response_cannot_terminate_or_latch_new_goal(self):
+        self.assertTrue(pump_nav(self.bridge, self.nav, until=lambda: self.bridge.is_connected))
+        self.bridge.enable_binary_mode()
+        self.ready()
+
+        old_goal = self.nav.goto_pose(100, 200, 0)
+        self.nav._req.query_context = "start"
+        self.nav.handle_event(PoseStopped(goal_id=old_goal))
+        self.assertEqual(self.nav.state, NavState.FAILED)
+
+        new_goal = self.nav.goto_pose(300, 400, 0)
+        self.nav.handle_event(
+            BinaryPoseStatus(
+                request_goal_id=old_goal,
+                goal_id=0,
+                state=PoseState.FAULT,
+            )
+        )
+
+        self.assertEqual(self.nav.active_goal_id, new_goal)
+        self.assertEqual(self.nav.state, NavState.WAIT_POSE_START)
+        self.assertFalse(self.bridge.is_emergency_stopped)
+
+    def test_atomic_limit_rejection_fails_without_starting_firmware_goal(self):
+        self.firmware.reject_atomic_limits = True
+        self.assertTrue(pump_nav(self.bridge, self.nav, until=lambda: self.bridge.is_connected))
+        self.bridge.enable_binary_mode()
+        self.ready()
+
+        self.nav.goto_pose(100, 200, 0)
+        self.assertTrue(
+            pump_nav(
+                self.bridge,
+                self.nav,
+                until=lambda: self.nav.state == NavState.FAILED,
+                timeout=1.0,
+            )
+        )
+        self.assertEqual(self.nav.last_result.reason, GotoReason.UNKNOWN_ERROR)
+        self.assertIn("BINARY 0x84", self.firmware.received)
+        self.assertEqual(self.firmware._binary_goal_id, 0)
+        self.assertEqual(self.firmware._pose_pending, [])
 
     # ------------------------------------------------------------------
     # 超时

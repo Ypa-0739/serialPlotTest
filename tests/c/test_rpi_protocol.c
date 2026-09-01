@@ -60,5 +60,37 @@ int main(void)
     assert(queued.sequence == 42U);
     assert(RpiProtocol_QueuePop(&queue, &queued) == 1U);
     assert(queued.sequence == 0U);
+
+    {
+        RpiTxQueue tx_queue;
+        RpiEncodedFrame encoded;
+        uint8_t low_a[] = {0xA1U};
+        uint8_t low_b[] = {0xA2U};
+        uint8_t high[] = {0xB1U};
+        uint8_t urgent[] = {0xC1U};
+        RpiProtocol_TxQueueReset(&tx_queue);
+        assert(RpiProtocol_TxQueuePush(&tx_queue, low_a, sizeof(low_a), 0U));
+        assert(RpiProtocol_TxQueuePush(&tx_queue, low_b, sizeof(low_b), 0U));
+        assert(tx_queue.replaced_telemetry == 1U);
+        assert(RpiProtocol_TxQueuePush(&tx_queue, high, sizeof(high), 1U));
+        assert(RpiProtocol_TxQueuePush(&tx_queue, urgent, sizeof(urgent), 2U));
+        assert(RpiProtocol_TxQueuePop(&tx_queue, &encoded));
+        assert(encoded.bytes[0] == urgent[0]);
+        assert(RpiProtocol_TxQueuePop(&tx_queue, &encoded));
+        assert(encoded.bytes[0] == high[0]);
+        assert(RpiProtocol_TxQueuePop(&tx_queue, &encoded));
+        assert(encoded.bytes[0] == low_b[0]);
+        assert(!RpiProtocol_TxQueuePop(&tx_queue, &encoded));
+
+        RpiProtocol_TxQueueReset(&tx_queue);
+        for (index = 0U; index < RPI_PROTOCOL_TX_CAPACITY; ++index) {
+            assert(RpiProtocol_TxQueuePush(&tx_queue, high, sizeof(high), 1U));
+        }
+        assert(!RpiProtocol_TxQueuePush(&tx_queue, high, sizeof(high), 1U));
+        assert(tx_queue.dropped_critical == 1U);
+        assert(RpiProtocol_TxQueuePush(&tx_queue, urgent, sizeof(urgent), 2U));
+        assert(RpiProtocol_TxQueuePop(&tx_queue, &encoded));
+        assert(encoded.bytes[0] == urgent[0]);
+    }
     return 0;
 }

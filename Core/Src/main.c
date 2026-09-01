@@ -95,7 +95,6 @@
 #define TELEMETRY_MASK_POSE          0x02U
 #define TELEMETRY_MASK_BOTH          (TELEMETRY_MASK_WHEEL | TELEMETRY_MASK_POSE)
 #define MOTOR_FEEDBACK_POLL_MS       10U
-#define HOST_PROTOCOL_VERSION        3U
 #define HOST_UART_TX_TIMEOUT_MS      20U
 #define HOST_WAIT_TIMEOUT_MS         60000U
 #define G6220_CAN_ID                 0x01U
@@ -106,49 +105,6 @@
 #define G6220_COMMAND_DELAY_MS       50U
 #define RPI_BINARY_GOAL_TIMEOUT_MAX_MS 60000U
 #define RPI_BINARY_RESPONSE_PREFIX_SIZE 3U
-
-typedef enum {
-    RPI_STATUS_OK = 0x00,
-    RPI_STATUS_UNKNOWN_COMMAND = 0x01,
-    RPI_STATUS_INVALID_LENGTH = 0x02,
-    RPI_STATUS_INVALID_ARGUMENT = 0x03,
-    RPI_STATUS_BUSY = 0x04,
-    RPI_STATUS_INTERNAL_ERROR = 0x05
-} RpiResponseStatus_t;
-
-typedef enum {
-    RPI_CMD_PING = 0x01,
-    RPI_CMD_STOP_ALL = 0x02,
-    RPI_CMD_SET_POSE_GOAL = 0x80,
-    RPI_CMD_CANCEL_POSE_GOAL = 0x81,
-    RPI_CMD_QUERY_POSE_GOAL = 0x82,
-    RPI_CMD_SET_SPEED_LIMITS = 0x83
-} RpiCommand_t;
-
-typedef enum {
-    RPI_POSE_IDLE = 0x00,
-    RPI_POSE_MOVING = 0x02,
-    RPI_POSE_REACHED = 0x03,
-    RPI_POSE_CANCELLED = 0x04,
-    RPI_POSE_FAULT = 0x05
-} RpiPoseState_t;
-
-typedef enum {
-    RPI_EVENT_POSE_STARTED = 0x10,
-    RPI_EVENT_POSE_REACHED = 0x11,
-    RPI_EVENT_POSE_CANCELLED = 0x12,
-    RPI_EVENT_MOTION_FAULT = 0x13
-} RpiPoseEvent_t;
-
-typedef enum {
-    RPI_FAULT_UNSPECIFIED = 0x0000,
-    RPI_FAULT_OPS9_LOST = 0x0001,
-    RPI_FAULT_HOST_LOST = 0x0002,
-    RPI_FAULT_CAN = 0x0003,
-    RPI_FAULT_OUT_OF_BOUNDS = 0x0004,
-    RPI_FAULT_TIMEOUT = 0x0005,
-    RPI_FAULT_INTERNAL = 0x00FF
-} RpiMotionFault_t;
 
 /* USER CODE END PD */
 
@@ -182,6 +138,11 @@ volatile uint8_t rpi_binary_candidate = 0U;
 volatile uint8_t rpi_binary_active = 0U;
 volatile uint8_t rpi_binary_armed = 0U;
 RpiFrameQueue rpi_binary_rx_queue;
+RpiTxQueue rpi_binary_tx_queue;
+RpiEncodedFrame rpi_binary_tx_loaded;
+volatile uint8_t rpi_binary_tx_dma_active = 0U;
+volatile uint8_t rpi_binary_tx_loaded_ready = 0U;
+volatile uint8_t host_uart_fault_pending = 0U;
 uint8_t rpi_binary_tx_sequence = 0U;
 uint32_t rpi_binary_goal_id = 0U;
 uint32_t rpi_binary_goal_timeout_ms = POSE_WORK_TIMEOUT_MS;
@@ -265,6 +226,7 @@ uint8_t telemetry_next_group = TELEMETRY_MASK_WHEEL;
 uint16_t telemetry_wheel_sequence = 0U;
 uint16_t telemetry_pose_sequence = 0U;
 uint32_t telemetry_last_tick = 0U;
+uint32_t binary_stats_last_tick = 0U;
 uint32_t telemetry_tx_ok = 0U;
 uint32_t telemetry_tx_error = 0U;
 uint8_t motor_feedback_poll_id = 1U;
@@ -298,11 +260,14 @@ static void Pose_InitMotionProfile(void);
 static void Pose_ResetPlanner(void);
 static void Robot_StopAllMotion(void);
 static void RpiBinary_Process(void);
+static void RpiBinary_TxProcess(void);
 static void RpiBinary_ProcessSessionTimeout(uint32_t now);
 static void RpiBinary_OnFrame(const RpiFrame *frame, void *context);
 static void RpiBinary_SendFault(uint16_t reason);
 static uint8_t RpiBinary_DequeueFrame(RpiFrame *frame);
 static void RpiBinary_ResetRxQueue(void);
+static void RpiBinary_ResetTxQueue(void);
+static void HostLink_ProcessUartFault(uint32_t now);
 static void Robot_SetMode(RobotMode_t mode);
 static const char *HostLink_Name(HostLink_t link);
 static uint8_t HostLink_ProcessCommand(const char *command);
@@ -400,7 +365,8 @@ static uint8_t HostLink_ProcessCommand(const char *command)
         }
         rpi_binary_armed = 1U;
         last_host_command_tick = now;
-        printf("# HOST BINARY READY\r\n");
+        printf("# HOST BINARY READY VERSION=%u CAPS=0x%08lX\r\n",
+               RPI_PROTOCOL_VERSION, (unsigned long)RPI_CAPABILITIES);
         return 1U;
     }
 
@@ -433,6 +399,7 @@ static uint8_t HostLink_ProcessCommand(const char *command)
     rpi_binary_active = 0U;
     rpi_binary_candidate = 0U;
     RpiBinary_ResetRxQueue();
+    RpiBinary_ResetTxQueue();
     RpiProtocol_ParserReset(&rpi_binary_parser);
     last_host_command_tick = HAL_GetTick();
     if (!chassis_motors_enabled) HostLink_SetChassisEnabled(1U);
@@ -513,9 +480,9 @@ static uint8_t ChassisSafety_OpsReady(uint32_t now)
 
 static void ChassisSafety_Stop(ChassisMotionType_t motion, const char *reason)
 {
-    uint16_t binary_reason = RPI_FAULT_INTERNAL;
+    uint16_t binary_reason = RPI_FAULT_INTERNAL_ERROR;
 
-    if (strcmp(reason, "CAN FAULT") == 0) binary_reason = RPI_FAULT_CAN;
+    if (strcmp(reason, "CAN FAULT") == 0) binary_reason = RPI_FAULT_CAN_FAULT;
     else if (strcmp(reason, "OPS LOST") == 0) binary_reason = RPI_FAULT_OPS9_LOST;
     else if (strcmp(reason, "HOST LOST") == 0) binary_reason = RPI_FAULT_HOST_LOST;
     else if (strcmp(reason, "TIMEOUT") == 0) binary_reason = RPI_FAULT_TIMEOUT;
@@ -757,7 +724,6 @@ static void RpiBinary_OnFrame(const RpiFrame *frame, void *context)
     (void)RpiProtocol_QueuePush(&rpi_binary_rx_queue, frame, urgent);
     rpi_binary_candidate = 1U;
     if (rpi_binary_armed && active_host_link == HOST_LINK_RPI) {
-        rpi_binary_active = 1U;
         last_host_command_tick = HAL_GetTick();
     }
 }
@@ -779,6 +745,41 @@ static void RpiBinary_ResetRxQueue(void)
     __enable_irq();
 }
 
+static void RpiBinary_ResetTxQueue(void)
+{
+    __disable_irq();
+    RpiProtocol_TxQueueReset(&rpi_binary_tx_queue);
+    rpi_binary_tx_dma_active = 0U;
+    rpi_binary_tx_loaded_ready = 0U;
+    __enable_irq();
+}
+
+static void HostLink_ProcessUartFault(uint32_t now)
+{
+    if (!host_uart_fault_pending) return;
+    __disable_irq();
+    host_uart_fault_pending = 0U;
+    __enable_irq();
+
+    /* ISR只锁存故障；停车和状态清理在主循环完成，避免中断内阻塞。 */
+    Robot_StopAllMotion();
+    (void)HAL_UART_AbortTransmit(&huart1);
+    rpi_binary_active = 0U;
+    rpi_binary_armed = 0U;
+    rpi_binary_candidate = 0U;
+    rpi_binary_goal_id = 0U;
+    rpi_binary_pose_state = RPI_POSE_FAULT;
+    rpi_binary_fault_reason = RPI_FAULT_UART_FAULT;
+    active_host_link = HOST_LINK_NONE;
+    pc_command_ready = 0U;
+    pc_rx_idx = 0U;
+    host_wait_start_tick = now;
+    last_host_command_tick = now;
+    RpiBinary_ResetRxQueue();
+    RpiBinary_ResetTxQueue();
+    RpiProtocol_ParserReset(&rpi_binary_parser);
+}
+
 static void RpiBinary_ProcessSessionTimeout(uint32_t now)
 {
     if (!rpi_binary_active ||
@@ -787,20 +788,24 @@ static void RpiBinary_ProcessSessionTimeout(uint32_t now)
     }
     /* Link loss never resumes the old binary goal; return to ASCII self-check. */
     Robot_StopAllMotion();
+    (void)HAL_UART_AbortTransmit(&huart1);
     rpi_binary_active = 0U;
     rpi_binary_armed = 0U;
     rpi_binary_candidate = 0U;
     rpi_binary_goal_id = 0U;
     rpi_binary_pose_state = RPI_POSE_IDLE;
+    telemetry_mask = 0U;
     active_host_link = HOST_LINK_NONE;
     host_wait_start_tick = now;
     RpiBinary_ResetRxQueue();
+    RpiBinary_ResetTxQueue();
     RpiProtocol_ParserReset(&rpi_binary_parser);
 }
 
-static HAL_StatusTypeDef RpiBinary_Send(uint8_t message_type,
-                                        const uint8_t *payload,
-                                        uint16_t payload_length)
+static HAL_StatusTypeDef RpiBinary_QueueSend(uint8_t message_type,
+                                             const uint8_t *payload,
+                                             uint16_t payload_length,
+                                             uint8_t priority)
 {
     uint8_t frame[RPI_PROTOCOL_MAX_FRAME];
     uint16_t length = RpiProtocol_Encode(message_type,
@@ -808,7 +813,37 @@ static HAL_StatusTypeDef RpiBinary_Send(uint8_t message_type,
                                          payload, payload_length,
                                          frame, sizeof(frame));
     if (length == 0U) return HAL_ERROR;
-    return HAL_UART_Transmit(&huart1, frame, length, HOST_UART_TX_TIMEOUT_MS);
+    if (!RpiProtocol_TxQueuePush(&rpi_binary_tx_queue, frame, length, priority)) {
+        host_uart_tx_error++;
+        return HAL_BUSY;
+    }
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef RpiBinary_Send(uint8_t message_type,
+                                        const uint8_t *payload,
+                                        uint16_t payload_length)
+{
+    return RpiBinary_QueueSend(message_type, payload, payload_length, 1U);
+}
+
+static void RpiBinary_TxProcess(void)
+{
+    HAL_StatusTypeDef status;
+    if (rpi_binary_tx_dma_active) return;
+    if (!rpi_binary_tx_loaded_ready) {
+        if (!RpiProtocol_TxQueuePop(&rpi_binary_tx_queue, &rpi_binary_tx_loaded)) return;
+        rpi_binary_tx_loaded_ready = 1U;
+    }
+    /* RX interrupt长期处于BUSY_RX；HAL_UART_Transmit_DMA只检查独立gState。 */
+    status = HAL_UART_Transmit_DMA(&huart1, rpi_binary_tx_loaded.bytes,
+                                  rpi_binary_tx_loaded.length);
+    if (status == HAL_OK) {
+        rpi_binary_tx_dma_active = 1U;
+    } else if (status != HAL_BUSY) {
+        host_uart_tx_error++;
+        host_uart_fault_pending = 1U;
+    }
 }
 
 static void RpiBinary_SendResponse(uint8_t request_sequence, uint8_t command,
@@ -822,7 +857,8 @@ static void RpiBinary_SendResponse(uint8_t request_sequence, uint8_t command,
     payload[1] = command;
     payload[2] = (uint8_t)status;
     for (index = 0U; index < data_length; ++index) payload[3U + index] = data[index];
-    (void)RpiBinary_Send(RPI_MSG_RESPONSE, payload, (uint16_t)(3U + data_length));
+    (void)RpiBinary_QueueSend(RPI_MSG_RESPONSE, payload,
+                              (uint16_t)(3U + data_length), 1U);
 }
 
 static void RpiBinary_SendGoalEvent(uint8_t event_code, uint32_t goal_id)
@@ -862,14 +898,14 @@ static void RpiBinary_SendFault(uint16_t reason)
     payload[0] = RPI_EVENT_MOTION_FAULT;
     RpiBinary_WriteU32(&payload[1], rpi_binary_goal_id);
     RpiBinary_WriteU16(&payload[5], reason);
-    (void)RpiBinary_Send(RPI_MSG_EVENT, payload, sizeof(payload));
+    (void)RpiBinary_QueueSend(RPI_MSG_EVENT, payload, sizeof(payload), 2U);
 }
 
 static void RpiBinary_Process(void)
 {
     RpiFrame frame;
     uint8_t command = 0U;
-    uint8_t response_data[19];
+    uint8_t response_data[21];
     uint16_t response_length = 0U;
     RpiResponseStatus_t status = RPI_STATUS_OK;
     uint32_t goal_id;
@@ -883,13 +919,16 @@ static void RpiBinary_Process(void)
 
     command = frame.payload_length > 0U ? frame.payload[0] : 0U;
     if ((!rpi_binary_armed || active_host_link != HOST_LINK_RPI) &&
-        command != RPI_CMD_STOP_ALL) {
+        command != RPI_CMD_STOP_ALL && command != RPI_CMD_SESSION_PROBE) {
         RpiBinary_SendResponse(frame.sequence, command, RPI_STATUS_BUSY, NULL, 0U);
         rpi_binary_candidate = 0U;
         RpiProtocol_ParserReset(&rpi_binary_parser);
         return;
     }
-    if (rpi_binary_armed) rpi_binary_active = 1U;
+    if (rpi_binary_armed) {
+        rpi_binary_active = 1U;
+        telemetry_mask = TELEMETRY_MASK_BOTH;
+    }
     last_host_command_tick = HAL_GetTick();
 
     if (frame.message_type != RPI_MSG_COMMAND || frame.payload_length == 0U) {
@@ -900,6 +939,21 @@ static void RpiBinary_Process(void)
     switch (command) {
     case RPI_CMD_PING:
         if (frame.payload_length != 1U) status = RPI_STATUS_INVALID_LENGTH;
+        break;
+    case RPI_CMD_SESSION_PROBE:
+        if (frame.payload_length != 1U) {
+            status = RPI_STATUS_INVALID_LENGTH;
+            break;
+        }
+        response_data[0] = rpi_binary_active;
+        response_data[1] = rpi_binary_armed;
+        response_data[2] = (uint8_t)active_host_link;
+        response_data[3] = (uint8_t)rpi_binary_pose_state;
+        RpiBinary_WriteU32(&response_data[4], rpi_binary_goal_id);
+        RpiBinary_WriteU32(&response_data[8], RPI_CAPABILITIES);
+        response_data[12] = RPI_PROTOCOL_VERSION;
+        response_length = 13U;
+        if (!rpi_binary_armed) rpi_binary_candidate = 0U;
         break;
     case RPI_CMD_STOP_ALL:
         if (frame.payload_length != 1U) {
@@ -913,7 +967,9 @@ static void RpiBinary_Process(void)
         Robot_StopAllMotion();
         break;
     case RPI_CMD_SET_POSE_GOAL:
-        if (frame.payload_length != 21U) {
+    case RPI_CMD_SET_POSE_GOAL_WITH_LIMITS:
+        if (frame.payload_length !=
+            (command == RPI_CMD_SET_POSE_GOAL ? 21U : 29U)) {
             status = RPI_STATUS_INVALID_LENGTH;
             break;
         }
@@ -928,6 +984,17 @@ static void RpiBinary_Process(void)
             status = RPI_STATUS_INVALID_ARGUMENT;
             break;
         }
+        if (command == RPI_CMD_SET_POSE_GOAL_WITH_LIMITS) {
+            linear_limit = (float)RpiBinary_ReadI32(&frame.payload[21]) / 1000000.0f;
+            yaw_limit = (float)RpiBinary_ReadI32(&frame.payload[25]) / 1000000.0f;
+            if (linear_limit < POSE_SPEED_MIN_MPS ||
+                linear_limit > POSE_SPEED_HARD_MAX_MPS ||
+                yaw_limit < POSE_YAW_SPEED_MIN_RADPS ||
+                yaw_limit > POSE_YAW_SPEED_HARD_MAX_RADPS) {
+                status = RPI_STATUS_INVALID_ARGUMENT;
+                break;
+            }
+        }
         start_result = Pose_StartTarget(
             (float)RpiBinary_ReadI32(&frame.payload[5]),
             (float)RpiBinary_ReadI32(&frame.payload[9]),
@@ -936,6 +1003,11 @@ static void RpiBinary_Process(void)
         if (start_result == POSE_START_BUSY) status = RPI_STATUS_BUSY;
         else if (start_result != POSE_START_OK) status = RPI_STATUS_INVALID_ARGUMENT;
         if (status == RPI_STATUS_OK) {
+            if (command == RPI_CMD_SET_POSE_GOAL_WITH_LIMITS) {
+                pid_x.max_out = linear_limit;
+                pid_y.max_out = linear_limit;
+                pid_yaw.max_out = yaw_limit;
+            }
             rpi_binary_goal_id = goal_id;
             rpi_binary_goal_timeout_ms = timeout_ms;
             rpi_binary_pose_state = RPI_POSE_MOVING;
@@ -970,7 +1042,9 @@ static void RpiBinary_Process(void)
         RpiBinary_WriteI32(&response_data[9], (int32_t)lroundf(robot_y));
         RpiBinary_WriteI32(&response_data[13], (int32_t)lroundf(robot_yaw * 17.45329252f));
         RpiBinary_WriteU16(&response_data[17], rpi_binary_fault_reason);
-        response_length = sizeof(response_data);
+        response_data[19] = (uint8_t)current_robot_mode;
+        response_data[20] = (uint8_t)active_host_link;
+        response_length = 21U;
         break;
     case RPI_CMD_SET_SPEED_LIMITS:
         if (frame.payload_length != 9U || pose_control_active) {
@@ -998,7 +1072,9 @@ static void RpiBinary_Process(void)
 
     RpiBinary_SendResponse(frame.sequence, command, status,
                            response_data, response_length);
-    if (status == RPI_STATUS_OK && command == RPI_CMD_SET_POSE_GOAL) {
+    if (status == RPI_STATUS_OK &&
+        (command == RPI_CMD_SET_POSE_GOAL ||
+         command == RPI_CMD_SET_POSE_GOAL_WITH_LIMITS)) {
         RpiBinary_SendGoalEvent(RPI_EVENT_POSE_STARTED, rpi_binary_goal_id);
     } else if (status == RPI_STATUS_OK && command == RPI_CMD_CANCEL_POSE_GOAL) {
         RpiBinary_SendGoalEvent(RPI_EVENT_POSE_CANCELLED, rpi_binary_goal_id);
@@ -1120,7 +1196,40 @@ static void Telemetry_Process(uint32_t now)
         group = telemetry_mask;
     }
 
-    if (group == TELEMETRY_MASK_WHEEL) {
+    if (rpi_binary_active) {
+        uint8_t payload[39];
+        uint16_t sequence;
+        uint8_t index;
+        payload[0] = group == TELEMETRY_MASK_WHEEL ? RPI_TELEM_WHEEL : RPI_TELEM_POSE;
+        RpiBinary_WriteU32(&payload[1], now);
+        sequence = group == TELEMETRY_MASK_WHEEL ?
+                   telemetry_wheel_sequence++ : telemetry_pose_sequence++;
+        RpiBinary_WriteU16(&payload[5], sequence);
+        if (group == TELEMETRY_MASK_WHEEL) {
+            for (index = 0U; index < 4U; ++index) {
+                RpiBinary_WriteI32(&payload[7U + index * 4U],
+                                   (int32_t)lroundf(motors[index].target_speed * 10.0f));
+                RpiBinary_WriteI32(&payload[23U + index * 4U],
+                                   (int32_t)lroundf(motors[index].actual_speed * 10.0f));
+            }
+        } else {
+            float center_x;
+            float center_y;
+            Pose_OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
+            RpiBinary_WriteI32(&payload[7], (int32_t)lroundf(robot_x));
+            RpiBinary_WriteI32(&payload[11], (int32_t)lroundf(robot_y));
+            RpiBinary_WriteI32(&payload[15], (int32_t)lroundf(robot_yaw * 17.45329252f));
+            RpiBinary_WriteI32(&payload[19], (int32_t)lroundf(center_x));
+            RpiBinary_WriteI32(&payload[23], (int32_t)lroundf(center_y));
+            RpiBinary_WriteI32(&payload[27], (int32_t)lroundf(
+                (pose_control_active ? pose_output_vx : 0.0f) * 1000000.0f));
+            RpiBinary_WriteI32(&payload[31], (int32_t)lroundf(
+                (pose_control_active ? pose_output_vy : 0.0f) * 1000000.0f));
+            RpiBinary_WriteI32(&payload[35], (int32_t)lroundf(
+                (pose_control_active ? pose_output_vz : 0.0f) * 1000000.0f));
+        }
+        written = RpiBinary_QueueSend(RPI_MSG_TELEMETRY, payload, sizeof(payload), 0U) == HAL_OK ? 1 : -1;
+    } else if (group == TELEMETRY_MASK_WHEEL) {
         written = printf("@W,1,%lu,%u,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\r\n",
                          (unsigned long)now, telemetry_wheel_sequence++,
                          motors[0].target_speed, motors[1].target_speed,
@@ -1141,6 +1250,19 @@ static void Telemetry_Process(uint32_t now)
 
     if (written > 0) telemetry_tx_ok++;
     else telemetry_tx_error++;
+
+    if (rpi_binary_active && (uint32_t)(now - binary_stats_last_tick) >= 1000U) {
+        uint8_t stats[25];
+        binary_stats_last_tick = now;
+        stats[0] = RPI_TELEM_LINK_STATS;
+        RpiBinary_WriteU32(&stats[1], now);
+        RpiBinary_WriteU32(&stats[5], rpi_binary_rx_queue.dropped);
+        RpiBinary_WriteU32(&stats[9], rpi_binary_tx_queue.dropped_critical);
+        RpiBinary_WriteU32(&stats[13], rpi_binary_tx_queue.replaced_telemetry);
+        RpiBinary_WriteU32(&stats[17], rpi_binary_parser.crc_errors);
+        RpiBinary_WriteU32(&stats[21], host_uart_tx_error);
+        (void)RpiBinary_QueueSend(RPI_MSG_TELEMETRY, stats, sizeof(stats), 0U);
+    }
 }
 
 static void Ops_PrintStatus(void)
@@ -1750,7 +1872,7 @@ static void Pose_ProcessControl(uint32_t now)
         PID_Reset(&pid_x);
         PID_Reset(&pid_y);
         PID_Reset(&pid_yaw);
-        RpiBinary_SendFault(RPI_FAULT_INTERNAL);
+        RpiBinary_SendFault(RPI_FAULT_INTERNAL_ERROR);
         printf("# POSE STOP SAFETY\r\n");
         return;
     }
@@ -1844,7 +1966,7 @@ static void Pose_ProcessControl(uint32_t now)
         PID_Reset(&pid_x);
         PID_Reset(&pid_y);
         PID_Reset(&pid_yaw);
-        RpiBinary_SendFault(RPI_FAULT_INTERNAL);
+        RpiBinary_SendFault(RPI_FAULT_INTERNAL_ERROR);
         printf("# POSE STOP SAFETY\r\n");
         return;
     }
@@ -2163,6 +2285,7 @@ int main(void)
   // 开启 USART1 单字节中断接收（接收树莓派或 PC 发来的主机命令）
     RpiProtocol_ParserInit(&rpi_binary_parser, RpiBinary_OnFrame, NULL);
     RpiProtocol_QueueReset(&rpi_binary_rx_queue);
+    RpiProtocol_TxQueueReset(&rpi_binary_tx_queue);
     HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
   // 1. 初始化 CAN 和过滤器
   ZDT_CAN_ConfigFilter();
@@ -2241,7 +2364,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
       uint32_t now = HAL_GetTick();
+      HostLink_ProcessUartFault(now);
       RpiBinary_Process();
+      RpiBinary_TxProcess();
       Host_ProcessCommand();
       Motor_ProcessFeedback();
 
@@ -2433,6 +2558,8 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     }
     else if (huart->Instance == USART1)
     {
+        /* 仅锁存；主循环在下一轮立即停车并清理会话。 */
+        host_uart_fault_pending = 1U;
         pc_rx_idx = 0U;
         rpi_binary_candidate = 0U;
         rpi_binary_active = 0U;
@@ -2441,6 +2568,16 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         RpiProtocol_QueueReset(&rpi_binary_rx_queue);
         RpiProtocol_ParserReset(&rpi_binary_parser);
         HAL_UART_Receive_IT(&huart1, &pc_rx_byte, 1);
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        rpi_binary_tx_dma_active = 0U;
+        rpi_binary_tx_loaded_ready = 0U;
+        host_uart_tx_ok++;
     }
 }
 /* USER CODE END 4 */

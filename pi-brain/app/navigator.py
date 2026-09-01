@@ -51,6 +51,7 @@ from .protocol import (
     PoseStarted,
     PoseStopped,
     PRIORITY_MOTION,
+    PRIORITY_QUERY,
     PRIORITY_STOP,
     SafetyFault,
     StopAcknowledged,
@@ -59,9 +60,12 @@ from .protocol import (
 )
 from .serial_bridge import (
     BinaryCommandRejected,
+    BinaryCommandTimedOut,
+    BinaryPoseStatus,
     MotionCommandRejected,
     SerialDisconnected,
 )
+from .binary_protocol import Command as BinaryCommand, PoseState
 
 
 class NavigationRejected(RuntimeError):
@@ -78,6 +82,7 @@ class _Request:
     motion_deadline: Optional[float] = None  # 收到 PoseStarted 后设定
     cancel_deadline: Optional[float] = None
     cancel_escalated: bool = False  # 取消确认超时后是否已升级为 STOP
+    query_context: Optional[str] = None
 
 
 class Navigator:
@@ -231,7 +236,13 @@ class Navigator:
 
     def handle_event(self, event: Event) -> None:
         event_goal_id = getattr(event, "goal_id", None)
-        if (
+        if isinstance(event, BinaryPoseStatus):
+            # A QUERY response carries two goal identities: the request owner
+            # selected by the Pi and the status goal reported by firmware.
+            # Only the former can prove that a late response belongs here.
+            if self._req is None or event.request_goal_id != self._req.goal_id:
+                return
+        elif (
             self._req is not None
             and event_goal_id is not None
             and event_goal_id != self._req.goal_id
@@ -248,7 +259,9 @@ class Navigator:
         if isinstance(event, UnknownError):
             self._abort(GotoReason.UNKNOWN_ERROR, emergency=True)
             return
-        if isinstance(event, BinaryCommandRejected):
+        if isinstance(event, (BinaryCommandRejected, BinaryCommandTimedOut)):
+            if event.command == BinaryCommand.QUERY_POSE_GOAL:
+                return  # 查询失败由原状态的有界超时路径处理。
             self._abort(GotoReason.UNKNOWN_ERROR, emergency=True)
             return
         if isinstance(event, SerialDisconnected):
@@ -259,10 +272,15 @@ class Navigator:
         if self._req is None:
             return  # 无活动目标：忽略（含终态后的迟到响应）
 
+        if isinstance(event, BinaryPoseStatus):
+            self._reconcile_pose_status(event)
+            return
+
         if self.state == NavState.WAIT_POSE_START:
             if isinstance(event, PoseStarted):
                 # 固件确认闭环开始，计时运动总超时
                 self.state = NavState.MOVING
+                self._req.query_context = None
                 self._req.motion_deadline = (
                     self._clock() + self._req.motion_timeout_s
                 )
@@ -313,16 +331,36 @@ class Navigator:
 
         if self.state == NavState.WAIT_POSE_START:
             if now >= self._req.start_deadline:
-                # POSE START 可能只是回复丢失，STM32实际已开始运动；必须锁存急停。
-                self.bridge.emergency_stop()
-                self._finish(GotoReason.START_TIMEOUT)
+                if (
+                    getattr(self.bridge, "is_binary_mode", False)
+                    and self._req.query_context != "start"
+                ):
+                    # 先QUERY核对是否只是POSE_STARTED事件丢失；仍保持有界等待。
+                    self._req.query_context = "start"
+                    self.bridge.query_pose_goal(
+                        self._req.goal_id, priority=PRIORITY_QUERY
+                    )
+                    self._req.start_deadline = now + self._cancel_confirm_timeout
+                else:
+                    self.bridge.emergency_stop()
+                    self._finish(GotoReason.START_TIMEOUT)
             return
 
         if self.state == NavState.MOVING:
             if now >= self._req.motion_deadline:
-                # 运动总超时：锁存急停并失败（所有运动命令被拒）
-                self.bridge.emergency_stop()
-                self._finish(GotoReason.MOTION_TIMEOUT)
+                if (
+                    getattr(self.bridge, "is_binary_mode", False)
+                    and self._req.query_context != "motion"
+                ):
+                    # 到位事件可能丢失；先查询一次，仍MOVING才确认超时。
+                    self._req.query_context = "motion"
+                    self.bridge.query_pose_goal(
+                        self._req.goal_id, priority=PRIORITY_QUERY
+                    )
+                    self._req.motion_deadline = now + self._cancel_confirm_timeout
+                else:
+                    self.bridge.emergency_stop()
+                    self._finish(GotoReason.MOTION_TIMEOUT)
             return
 
         if self.state == NavState.CANCELLING:
@@ -331,6 +369,11 @@ class Navigator:
                     # 取消确认超时：升级为最高优先级 STOP
                     self._req.cancel_escalated = True
                     self.bridge.send("STOP", priority=PRIORITY_STOP)
+                    if getattr(self.bridge, "is_binary_mode", False):
+                        self._req.query_context = "cancel"
+                        self.bridge.query_pose_goal(
+                            self._req.goal_id, priority=PRIORITY_QUERY
+                        )
                     self._req.cancel_deadline = now + self._cancel_confirm_timeout
                 else:
                     # 升级 STOP 后仍无确认：锁存急停并失败
@@ -341,6 +384,56 @@ class Navigator:
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
+
+    def _reconcile_pose_status(self, event: BinaryPoseStatus) -> None:
+        """用QUERY结果弥补启动/取消事件丢失，不恢复任何旧目标。"""
+        if (
+            self._req is None
+            or event.request_goal_id != self._req.goal_id
+            or self._req.query_context is None
+        ):
+            return
+        matches = event.goal_id == self._req.goal_id
+        if event.state == PoseState.FAULT:
+            self.bridge.emergency_stop()
+            self._finish(GotoReason.SAFETY_FAULT)
+            return
+        if self.state == NavState.WAIT_POSE_START:
+            if matches and event.state == PoseState.MOVING:
+                self.state = NavState.MOVING
+                self._req.query_context = None
+                self._req.motion_deadline = self._clock() + self._req.motion_timeout_s
+            elif matches and event.state == PoseState.REACHED:
+                self._finish(
+                    GotoReason.REACHED,
+                    final=Pose(event.x_mm, event.y_mm, event.yaw_deg),
+                )
+            elif event.state in (PoseState.IDLE, PoseState.CANCELLED):
+                self._finish(GotoReason.UNEXPECTED_STOP)
+            return
+        if self.state == NavState.MOVING:
+            if matches and event.state == PoseState.REACHED:
+                self._finish(
+                    GotoReason.REACHED,
+                    final=Pose(event.x_mm, event.y_mm, event.yaw_deg),
+                )
+            elif matches and event.state == PoseState.MOVING:
+                if self._req.query_context == "motion":
+                    self.bridge.emergency_stop()
+                    self._finish(GotoReason.MOTION_TIMEOUT)
+            elif event.state in (PoseState.IDLE, PoseState.CANCELLED):
+                self._finish(GotoReason.UNEXPECTED_STOP)
+            return
+        if self.state == NavState.CANCELLING:
+            if matches and event.state == PoseState.MOVING:
+                return
+            if matches and event.state == PoseState.REACHED:
+                self._finish(
+                    GotoReason.REACHED,
+                    final=Pose(event.x_mm, event.y_mm, event.yaw_deg),
+                )
+            else:
+                self._finish(GotoReason.CANCELLED)
 
     def _abort(self, reason: GotoReason, *, emergency: bool) -> None:
         """全局故障路径：急停 + 结束活动目标（无活动目标时仅急停）。"""

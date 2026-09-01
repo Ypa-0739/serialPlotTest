@@ -33,6 +33,8 @@ from .protocol import (
     PoseReached,
     PoseStarted,
     PoseStopped,
+    StopAcknowledged,
+    PRIORITY_QUERY,
     PRIORITY_STOP,
     encode_ping,
     is_motion_command,
@@ -46,12 +48,19 @@ from .binary_protocol import (
     FrameDecoder,
     MessageType,
     MotionFault,
+    LinkStatsSample,
+    PoseSample,
     PoseGoal as BinaryPoseGoal,
+    PoseState,
+    PoseStatus,
     Response as BinaryResponse,
     ResponseStatus,
+    WheelSample,
     cancel_goal_data,
     command_frame,
+    decode_telemetry,
     decode_pose_event,
+    pose_goal_with_limits_data,
     speed_limits_data,
 )
 
@@ -95,10 +104,59 @@ class BinaryCommandRejected(Event):
 
 
 @dataclass(frozen=True)
+class BinaryCommandTimedOut(Event):
+    """已发送的二进制命令在截止时间前没有收到匹配响应。"""
+
+    command: int = 0
+    goal_id: int | None = None
+
+
+@dataclass(frozen=True)
+class BinaryPoseStatus(Event):
+    # QUERY command's Pi-side owner. This is deliberately separate from the
+    # firmware-reported goal_id, which may already be IDLE or another goal.
+    request_goal_id: int | None = None
+    goal_id: int = 0
+    state: PoseState = PoseState.IDLE
+    x_mm: float = 0.0
+    y_mm: float = 0.0
+    yaw_deg: float = 0.0
+    fault_reason: int = 0
+    robot_mode: int = 0
+    host_link: int = 0
+
+
+@dataclass(frozen=True)
+class BinaryLinkStats(Event):
+    tick_ms: int = 0
+    rx_dropped: int = 0
+    tx_dropped: int = 0
+    telemetry_replaced: int = 0
+    crc_errors: int = 0
+    uart_errors: int = 0
+
+
+@dataclass(frozen=True)
+class BinaryBridgeStats:
+    pending: int
+    command_timeouts: int
+    unmatched_responses: int
+    decoder_crc_errors: int
+    decoder_discarded_bytes: int
+    telemetry_dropped: int
+
+
+@dataclass(frozen=True)
 class _BinaryTx:
     command: BinaryCommand
     data: bytes = b""
     goal_id: int | None = None
+
+
+@dataclass(frozen=True)
+class _PendingCommand:
+    tx: _BinaryTx
+    deadline: float
 
 
 class SerialBridgeThread(threading.Thread):
@@ -114,6 +172,9 @@ class SerialBridgeThread(threading.Thread):
         write_timeout: float = 0.1,
         backoff_seconds: float = 1.0,
         binary_recovery_seconds: float = 1.6,
+        binary_probe_timeout: float = 0.05,
+        binary_command_timeout: float = 0.75,
+        max_binary_pending: int = 64,
         tx_drain_limit: int = 8,
         telemetry_queue_size: int = 256,
         name: str = "serial-bridge",
@@ -126,6 +187,11 @@ class SerialBridgeThread(threading.Thread):
         self._write_timeout = write_timeout
         self._backoff = backoff_seconds
         self._binary_recovery_seconds = binary_recovery_seconds
+        self._binary_probe_timeout = binary_probe_timeout
+        self._binary_command_timeout = binary_command_timeout
+        if not 1 <= max_binary_pending <= 255:
+            raise ValueError("max_binary_pending must be in 1..255")
+        self._max_binary_pending = max_binary_pending
         self._tx_drain_limit = tx_drain_limit
         self._tx: queue.PriorityQueue = queue.PriorityQueue()
         self._events: queue.Queue = queue.Queue()
@@ -140,7 +206,12 @@ class SerialBridgeThread(threading.Thread):
         self._binary_mode = False
         self._binary_decoder = FrameDecoder()
         self._binary_sequence = 0
-        self._binary_pending: dict[int, _BinaryTx] = {}
+        self._binary_pending: dict[int, _PendingCommand] = {}
+        self._staged_speed_limits: tuple[float, float] | None = None
+        self._preconnected_rx: list[bytes] = []
+        self._binary_timeout_count = 0
+        self._binary_unmatched_response_count = 0
+        self._telemetry_dropped = 0
 
     # ------------------------------------------------------------------
     # 对外接口（外部只能通过这些方法，不直接触碰串口）
@@ -165,11 +236,27 @@ class SerialBridgeThread(threading.Thread):
         with self._safety_lock:
             return self._binary_mode
 
-    def enable_binary_mode(self) -> None:
+    @property
+    def binary_stats(self) -> BinaryBridgeStats:
+        with self._safety_lock:
+            return BinaryBridgeStats(
+                pending=len(self._binary_pending),
+                command_timeouts=self._binary_timeout_count,
+                unmatched_responses=self._binary_unmatched_response_count,
+                decoder_crc_errors=self._binary_decoder.crc_errors,
+                decoder_discarded_bytes=self._binary_decoder.discarded_bytes,
+                telemetry_dropped=self._telemetry_dropped,
+            )
+
+    def enable_binary_mode(
+        self, linear_mps: float = 0.20, yaw_radps: float = 0.25
+    ) -> None:
         """在收到 ``# HOST BINARY READY`` 后原子切换串口编解码模式。"""
+        speed_limits_data(linear_mps, yaw_radps)  # 与固件边界同步校验。
         with self._safety_lock:
             self._binary_decoder = FrameDecoder()
             self._binary_pending.clear()
+            self._staged_speed_limits = (linear_mps, yaw_radps)
             self._binary_mode = True
 
     def send_pose_goal(
@@ -189,12 +276,19 @@ class SerialBridgeThread(threading.Thread):
             yaw_mrad=round(yaw_deg * 17.45329252),
             timeout_ms=round(timeout_s * 1000.0),
         )
-        tx = _BinaryTx(BinaryCommand.SET_POSE_GOAL, goal.command_payload()[1:], goal_id)
         with self._safety_lock:
             if not self._binary_mode:
                 raise MotionCommandRejected("binary session is not ready")
             if self._emergency_latched:
                 raise MotionCommandRejected("emergency stop is latched")
+            if self._staged_speed_limits is None:
+                raise MotionCommandRejected("binary speed limits are unknown")
+            linear_mps, yaw_radps = self._staged_speed_limits
+            tx = _BinaryTx(
+                BinaryCommand.SET_POSE_GOAL_WITH_LIMITS,
+                pose_goal_with_limits_data(goal, linear_mps, yaw_radps),
+                goal_id,
+            )
             self._tx.put((priority, next(self._seq), tx))
 
     def cancel_pose_goal(self, goal_id: int, *, priority: int) -> None:
@@ -207,14 +301,26 @@ class SerialBridgeThread(threading.Thread):
     def set_speed_limits(
         self, linear_mps: float, yaw_radps: float, *, priority: int
     ) -> None:
-        tx = _BinaryTx(
-            BinaryCommand.SET_SPEED_LIMITS,
-            speed_limits_data(linear_mps, yaw_radps),
-        )
+        speed_limits_data(linear_mps, yaw_radps)
         with self._safety_lock:
             if not self._binary_mode:
                 raise MotionCommandRejected("binary session is not ready")
-            self._tx.put((priority, next(self._seq), tx))
+            # 二进制运行期不单独写限速；下一条目标把两者原子提交给固件。
+            self._staged_speed_limits = (linear_mps, yaw_radps)
+
+    def query_pose_goal(
+        self, goal_id: int | None = None, *, priority: int = PRIORITY_QUERY
+    ) -> None:
+        with self._safety_lock:
+            if not self._binary_mode:
+                raise MotionCommandRejected("binary session is not ready")
+            self._tx.put(
+                (
+                    priority,
+                    next(self._seq),
+                    _BinaryTx(BinaryCommand.QUERY_POSE_GOAL, goal_id=goal_id),
+                )
+            )
 
     def send(self, command: Command | str, priority: Optional[int] = None) -> None:
         """投递命令到 TX 队列（唯一入口，绝不直接写串口）。"""
@@ -241,6 +347,7 @@ class SerialBridgeThread(threading.Thread):
         with self._safety_lock:
             self._emergency_latched = True
             self._clear_tx_locked()
+            self._binary_pending.clear()
             outbound = (
                 _BinaryTx(BinaryCommand.STOP_ALL) if self._binary_mode else "STOP"
             )
@@ -294,6 +401,16 @@ class SerialBridgeThread(threading.Thread):
                 self._sleep_backoff()
                 continue
             self._serial = ser
+            self._preconnected_rx.clear()
+            if not self._prepare_connection(ser):
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                self._serial = None
+                self._set_link(LinkState.BACKOFF)
+                self._sleep_backoff()
+                continue
             self._set_link(LinkState.CONNECTED)
             self._events.put(SerialConnected())
             self._next_ping = time.monotonic() + self._ping_interval
@@ -305,6 +422,7 @@ class SerialBridgeThread(threading.Thread):
                 self._binary_mode = False
                 self._binary_decoder = FrameDecoder()
                 self._binary_pending.clear()
+                self._staged_speed_limits = None
             try:
                 ser.close()
             except Exception:
@@ -328,7 +446,11 @@ class SerialBridgeThread(threading.Thread):
             try:
                 if not getattr(ser, "is_open", True):
                     return
-                line = ser.readline()
+                line = (
+                    self._preconnected_rx.pop(0)
+                    if self._preconnected_rx
+                    else ser.readline()
+                )
             except Exception:
                 return  # 读失败视为断线
             if line:
@@ -348,6 +470,7 @@ class SerialBridgeThread(threading.Thread):
 
             # 2. PING：先于 TX 队列，按单调时钟 deadline 调度
             now = time.monotonic()
+            self._expire_binary_pending(now)
             if self._heartbeat_enabled and now >= self._next_ping:
                 ping = (
                     self._encode_binary_tx(_BinaryTx(BinaryCommand.PING), track=False)
@@ -379,7 +502,18 @@ class SerialBridgeThread(threading.Thread):
                 ):
                     continue
                 if isinstance(outbound, _BinaryTx):
-                    payload = self._encode_binary_tx(outbound)
+                    try:
+                        payload = self._encode_binary_tx(outbound)
+                    except MotionCommandRejected as exc:
+                        self._events.put(
+                            BinaryCommandRejected(
+                                raw=f"binary:local-reject:{exc}",
+                                command=int(outbound.command),
+                                status=int(ResponseStatus.BUSY),
+                                goal_id=outbound.goal_id,
+                            )
+                        )
+                        continue
                 else:
                     payload = outbound.encode("ascii") + b"\n"
                 if not self._write(ser, payload):
@@ -388,11 +522,48 @@ class SerialBridgeThread(threading.Thread):
         return True
 
     def _encode_binary_tx(self, tx: _BinaryTx, *, track: bool = True) -> bytes:
-        sequence = self._binary_sequence
-        self._binary_sequence = (sequence + 1) & 0xFF
+        if track and len(self._binary_pending) >= self._max_binary_pending:
+            if tx.command == BinaryCommand.STOP_ALL:
+                track = False  # 保留停车能力；STOP仍会发出但不占pending。
+            else:
+                raise MotionCommandRejected("binary pending table is full")
+        sequence = self._allocate_binary_sequence()
         if track:
-            self._binary_pending[sequence] = tx
+            self._binary_pending[sequence] = _PendingCommand(
+                tx=tx,
+                deadline=time.monotonic() + self._binary_command_timeout,
+            )
         return command_frame(sequence, tx.command, tx.data)
+
+    def _allocate_binary_sequence(self) -> int:
+        for _ in range(256):
+            sequence = self._binary_sequence
+            self._binary_sequence = (sequence + 1) & 0xFF
+            if sequence not in self._binary_pending:
+                return sequence
+        raise MotionCommandRejected("all binary sequence numbers are pending")
+
+    def _expire_binary_pending(self, now: float) -> None:
+        with self._safety_lock:
+            expired = [
+                (sequence, pending)
+                for sequence, pending in self._binary_pending.items()
+                if now >= pending.deadline
+            ]
+            for sequence, _ in expired:
+                self._binary_pending.pop(sequence, None)
+        for sequence, pending in expired:
+            self._binary_timeout_count += 1
+            self._events.put(
+                BinaryCommandTimedOut(
+                    raw=(
+                        f"binary:timeout sequence={sequence} "
+                        f"command=0x{int(pending.tx.command):02x}"
+                    ),
+                    command=int(pending.tx.command),
+                    goal_id=pending.tx.goal_id,
+                )
+            )
 
     def _decode_binary_frame(self, frame) -> Optional[Event]:
         if frame.message_type == MessageType.RESPONSE:
@@ -400,8 +571,46 @@ class SerialBridgeThread(threading.Thread):
                 response = BinaryResponse.decode(frame.payload)
             except (ValueError, IndexError):
                 return RawMessage(raw="binary:malformed-response")
-            pending = self._binary_pending.pop(response.request_sequence, None)
+            with self._safety_lock:
+                pending = self._binary_pending.pop(response.request_sequence, None)
+            if pending is None:
+                if response.command == BinaryCommand.PING:
+                    return None
+                self._binary_unmatched_response_count += 1
+                return RawMessage(
+                    raw=(
+                        f"binary:unmatched-response sequence={response.request_sequence} "
+                        f"command=0x{response.command:02x}"
+                    )
+                )
+            tx = pending.tx
+            if response.command != int(tx.command):
+                return RawMessage(
+                    raw=(
+                        f"binary:mismatched-response sequence={response.request_sequence} "
+                        f"expected=0x{int(tx.command):02x} actual=0x{response.command:02x}"
+                    )
+                )
             if response.status == ResponseStatus.OK:
+                if tx.command == BinaryCommand.QUERY_POSE_GOAL:
+                    try:
+                        status = PoseStatus.decode(response.data)
+                    except (ValueError, IndexError):
+                        return RawMessage(raw="binary:malformed-query-response")
+                    return BinaryPoseStatus(
+                        raw=f"binary:pose-status:goal={status.goal_id}",
+                        request_goal_id=tx.goal_id,
+                        goal_id=status.goal_id,
+                        state=status.state,
+                        x_mm=float(status.x_mm),
+                        y_mm=float(status.y_mm),
+                        yaw_deg=status.yaw_mrad / 17.45329252,
+                        fault_reason=status.fault_reason,
+                        robot_mode=status.robot_mode,
+                        host_link=status.host_link,
+                    )
+                if tx.command == BinaryCommand.STOP_ALL:
+                    return StopAcknowledged(raw="binary:stop-ack")
                 return None
             return BinaryCommandRejected(
                 raw=(
@@ -410,8 +619,49 @@ class SerialBridgeThread(threading.Thread):
                 ),
                 command=response.command,
                 status=int(response.status),
-                goal_id=pending.goal_id if pending is not None else None,
+                goal_id=tx.goal_id,
             )
+        if frame.message_type == MessageType.TELEMETRY:
+            try:
+                sample = decode_telemetry(frame.payload)
+            except (ValueError, IndexError):
+                return RawMessage(raw="binary:malformed-telemetry")
+            if isinstance(sample, WheelSample):
+                event = WheelTelemetry(
+                    raw=f"binary:wheel:{sample.sequence}",
+                    version=2,
+                    tick_ms=sample.tick_ms,
+                    sequence=sample.sequence,
+                    target_rpm=tuple(value / 10.0 for value in sample.target_rpm_tenths),
+                    actual_rpm=tuple(value / 10.0 for value in sample.actual_rpm_tenths),
+                )
+            elif isinstance(sample, PoseSample):
+                event = PoseTelemetry(
+                    raw=f"binary:pose:{sample.sequence}",
+                    version=2,
+                    tick_ms=sample.tick_ms,
+                    sequence=sample.sequence,
+                    ops_x_mm=float(sample.ops_x_mm),
+                    ops_y_mm=float(sample.ops_y_mm),
+                    ops_yaw_deg=sample.ops_yaw_mrad / 17.45329252,
+                    center_x_mm=float(sample.center_x_mm),
+                    center_y_mm=float(sample.center_y_mm),
+                    plan_vx_mps=sample.plan_vx_um_s / 1_000_000.0,
+                    plan_vy_mps=sample.plan_vy_um_s / 1_000_000.0,
+                    plan_vz_radps=sample.plan_vz_urad_s / 1_000_000.0,
+                )
+            else:
+                event = BinaryLinkStats(
+                    raw="binary:link-stats",
+                    tick_ms=sample.tick_ms,
+                    rx_dropped=sample.rx_dropped,
+                    tx_dropped=sample.tx_dropped,
+                    telemetry_replaced=sample.telemetry_replaced,
+                    crc_errors=sample.crc_errors,
+                    uart_errors=sample.uart_errors,
+                )
+            self._put_latest_telemetry(event)
+            return None
         if frame.message_type != MessageType.EVENT:
             return RawMessage(raw=f"binary:unexpected-type:{int(frame.message_type)}")
         try:
@@ -463,6 +713,7 @@ class SerialBridgeThread(threading.Thread):
             return
         except queue.Full:
             pass
+        self._telemetry_dropped += 1
         try:
             self._telemetry.get_nowait()
         except queue.Empty:
@@ -485,6 +736,57 @@ class SerialBridgeThread(threading.Thread):
             return self._factory()
         except Exception:
             return None
+
+    def _prepare_connection(self, ser: SerialLike) -> bool:
+        """探测遗留二进制会话；若存在，先停车并等待固件退回ASCII。"""
+        decoder = FrameDecoder()
+        sequence = self._allocate_binary_sequence()
+        if not self._write(ser, command_frame(sequence, BinaryCommand.SESSION_PROBE)):
+            return False
+        deadline = time.monotonic() + self._binary_probe_timeout
+        stale_session = False
+        while self._running and time.monotonic() < deadline:
+            try:
+                raw = ser.readline()
+            except Exception:
+                return False
+            if not raw:
+                time.sleep(0.005)
+                continue
+            if not bytes(raw).startswith(b"\xA5\x5A"):
+                self._preconnected_rx.append(bytes(raw))
+                continue
+            for frame in decoder.feed(bytes(raw)):
+                if frame.message_type != MessageType.RESPONSE:
+                    continue
+                try:
+                    response = BinaryResponse.decode(frame.payload)
+                except (ValueError, IndexError):
+                    continue
+                if (
+                    response.request_sequence == sequence
+                    and response.command == BinaryCommand.SESSION_PROBE
+                    and response.status == ResponseStatus.OK
+                    and len(response.data) == 13
+                ):
+                    stale_session = bool(response.data[0] or response.data[1])
+                    deadline = 0.0
+                    break
+        if not stale_session:
+            return self._running
+
+        stop_sequence = self._allocate_binary_sequence()
+        if not self._write(ser, command_frame(stop_sequence, BinaryCommand.STOP_ALL)):
+            return False
+        # 不发送PING，让旧会话确定性超时；期间丢弃旧STOP响应和取消事件。
+        recovery_deadline = time.monotonic() + self._binary_recovery_seconds
+        while self._running and time.monotonic() < recovery_deadline:
+            try:
+                ser.readline()
+            except Exception:
+                return False
+            time.sleep(0.01)
+        return self._running
 
     def _set_link(self, state: LinkState) -> None:
         self._link_state = state

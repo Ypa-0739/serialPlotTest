@@ -10,64 +10,27 @@ acknowledges ``HOST BINARY START``. All multi-byte fields are little-endian.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 import struct
+
+from .binary_protocol_generated import (
+    Capability,
+    Command,
+    EventCode,
+    HOST_PROTOCOL_VERSION,
+    MAX_PAYLOAD,
+    MessageType,
+    MotionFault,
+    PoseState,
+    REQUIRED_CAPABILITIES,
+    ResponseStatus,
+    TelemetryType,
+    VERSION,
+)
 
 
 SOF = b"\xA5\x5A"
-VERSION = 1
-MAX_PAYLOAD = 64
 _HEADER = struct.Struct("<BBBH")
 _CRC = struct.Struct("<H")
-
-
-class MessageType(IntEnum):
-    COMMAND = 0x10
-    RESPONSE = 0x11
-    EVENT = 0x22
-
-
-class Command(IntEnum):
-    PING = 0x01
-    STOP_ALL = 0x02
-    SET_POSE_GOAL = 0x80
-    CANCEL_POSE_GOAL = 0x81
-    QUERY_POSE_GOAL = 0x82
-    SET_SPEED_LIMITS = 0x83
-
-
-class ResponseStatus(IntEnum):
-    OK = 0x00
-    UNKNOWN_COMMAND = 0x01
-    INVALID_LENGTH = 0x02
-    INVALID_ARGUMENT = 0x03
-    BUSY = 0x04
-    INTERNAL_ERROR = 0x05
-
-
-class EventCode(IntEnum):
-    POSE_STARTED = 0x10
-    POSE_REACHED = 0x11
-    POSE_CANCELLED = 0x12
-    MOTION_FAULT = 0x13
-
-
-class PoseState(IntEnum):
-    IDLE = 0x00
-    MOVING = 0x02
-    REACHED = 0x03
-    CANCELLED = 0x04
-    FAULT = 0x05
-
-
-class MotionFault(IntEnum):
-    UNSPECIFIED = 0x0000
-    OPS9_LOST = 0x0001
-    HOST_LOST = 0x0002
-    CAN_FAULT = 0x0003
-    OUT_OF_BOUNDS = 0x0004
-    TIMEOUT = 0x0005
-    INTERNAL_ERROR = 0x00FF
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -205,15 +168,17 @@ class PoseStatus:
     y_mm: int
     yaw_mrad: int
     fault_reason: int
+    robot_mode: int
+    host_link: int
 
-    _STRUCT = struct.Struct("<IBiiiH")
+    _STRUCT = struct.Struct("<IBiiiHBB")
 
     @classmethod
     def decode(cls, data: bytes) -> "PoseStatus":
         if len(data) != cls._STRUCT.size:
-            raise ValueError("pose status must be 19 bytes")
-        goal_id, state, x_mm, y_mm, yaw_mrad, fault = cls._STRUCT.unpack(data)
-        return cls(goal_id, PoseState(state), x_mm, y_mm, yaw_mrad, fault)
+            raise ValueError("pose status must be 21 bytes")
+        goal_id, state, x_mm, y_mm, yaw_mrad, fault, mode, host = cls._STRUCT.unpack(data)
+        return cls(goal_id, PoseState(state), x_mm, y_mm, yaw_mrad, fault, mode, host)
 
 
 @dataclass(frozen=True)
@@ -221,6 +186,38 @@ class PoseEvent:
     code: EventCode
     goal_id: int
     values: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class WheelSample:
+    tick_ms: int
+    sequence: int
+    target_rpm_tenths: tuple[int, int, int, int]
+    actual_rpm_tenths: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class PoseSample:
+    tick_ms: int
+    sequence: int
+    ops_x_mm: int
+    ops_y_mm: int
+    ops_yaw_mrad: int
+    center_x_mm: int
+    center_y_mm: int
+    plan_vx_um_s: int
+    plan_vy_um_s: int
+    plan_vz_urad_s: int
+
+
+@dataclass(frozen=True)
+class LinkStatsSample:
+    tick_ms: int
+    rx_dropped: int
+    tx_dropped: int
+    telemetry_replaced: int
+    crc_errors: int
+    uart_errors: int
 
 
 def decode_pose_event(payload: bytes) -> PoseEvent:
@@ -245,6 +242,27 @@ def decode_pose_event(payload: bytes) -> PoseEvent:
     raise ValueError(f"unsupported pose event {code!r}")
 
 
+def decode_telemetry(payload: bytes) -> WheelSample | PoseSample | LinkStatsSample:
+    if not payload:
+        raise ValueError("telemetry payload is empty")
+    sample_type = TelemetryType(payload[0])
+    if sample_type == TelemetryType.WHEEL:
+        if len(payload) != 39:
+            raise ValueError("wheel telemetry must be 39 bytes")
+        values = struct.unpack_from("<IH8i", payload, 1)
+        return WheelSample(values[0], values[1], tuple(values[2:6]), tuple(values[6:10]))
+    if sample_type == TelemetryType.POSE:
+        if len(payload) != 39:
+            raise ValueError("pose telemetry must be 39 bytes")
+        values = struct.unpack_from("<IH8i", payload, 1)
+        return PoseSample(*values)
+    if sample_type == TelemetryType.LINK_STATS:
+        if len(payload) != 25:
+            raise ValueError("link stats telemetry must be 25 bytes")
+        return LinkStatsSample(*struct.unpack_from("<6I", payload, 1))
+    raise ValueError(f"unsupported telemetry type {sample_type!r}")
+
+
 def command_frame(sequence: int, command: Command, data: bytes = b"") -> bytes:
     return Frame(MessageType.COMMAND, sequence, bytes((command,)) + data).encode()
 
@@ -264,3 +282,8 @@ def speed_limits_data(linear_mps: float, yaw_radps: float) -> bytes:
     return struct.pack(
         "<ii", round(linear_mps * 1_000_000), round(yaw_radps * 1_000_000)
     )
+
+
+def pose_goal_with_limits_data(goal: PoseGoal, linear_mps: float, yaw_radps: float) -> bytes:
+    """Encode one atomic goal transaction; firmware validates all fields first."""
+    return goal.command_payload()[1:] + speed_limits_data(linear_mps, yaw_radps)

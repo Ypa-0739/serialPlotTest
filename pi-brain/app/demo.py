@@ -17,6 +17,8 @@ import struct
 from typing import Optional
 
 from .binary_protocol import (
+    REQUIRED_CAPABILITIES,
+    VERSION,
     Command as BinaryCommand,
     EventCode,
     Frame,
@@ -50,7 +52,7 @@ class FakeFirmware:
         pid_y=(0.0033, 0.0, 0.0),
         pid_yaw=(0.02, 0.0, 0.0),
         mode: str = "WORK",
-        host_proto: int = 3,
+        host_proto: int = 4,
         host_owner: Optional[str] = "RPI",
         # ---- POSE 仿真参数 ----
         pose_start_delay_s: float = 0.0,  # POSE SET -> # POSE START 延迟
@@ -62,6 +64,7 @@ class FakeFirmware:
         pose_safety_after_s: Optional[float] = None,  # 运动开始后 OPS 丢失
         pose_stopped_delay_s: float = 0.0,  # POSE STOP 确认延迟
         ack_stop: bool = True,  # STOP 命令是否回 # STOP MODE=...
+        reject_atomic_limits: bool = False,
     ) -> None:
         self.ops_link = ops_link
         self.ops_frames = ops_frames
@@ -80,6 +83,7 @@ class FakeFirmware:
         self.pose_safety_after_s = pose_safety_after_s
         self.pose_stopped_delay_s = pose_stopped_delay_s
         self.ack_stop = ack_stop
+        self.reject_atomic_limits = reject_atomic_limits
         self._responses: list[str | bytes] = []  # 即时响应 FIFO
         self._pose_pending: list[tuple[float, str | bytes]] = []
         self.is_open = True
@@ -91,6 +95,8 @@ class FakeFirmware:
         self._binary_decoder = FrameDecoder()
         self._binary_tx_sequence = 0
         self._binary_goal_id = 0
+        self._binary_pose_state = 0
+        self._binary_session = False
 
     def fail(self) -> None:
         """模拟物理断线。"""
@@ -143,52 +149,80 @@ class FakeFirmware:
         command = frame.payload[0]
         self.received.append(f"BINARY 0x{command:02X}")
         status = ResponseStatus.OK
-        if command == BinaryCommand.SET_POSE_GOAL and len(frame.payload) == 21:
-            goal_id, x_mm, y_mm, yaw_mrad, _ = struct.unpack_from(
-                "<IiiiI", frame.payload, 1
-            )
-            self._binary_goal_id = goal_id
-            start_at = time.monotonic() + self.pose_start_delay_s
-            if self.pose_start_ok:
-                payload = bytes((EventCode.POSE_STARTED,)) + struct.pack("<I", goal_id)
-                self._pose_pending.append(
-                    (start_at, self._binary_frame(MessageType.EVENT, payload))
+        response_data = b""
+        if command in (
+            BinaryCommand.SET_POSE_GOAL,
+            BinaryCommand.SET_POSE_GOAL_WITH_LIMITS,
+        ) and len(frame.payload) == (
+            21 if command == BinaryCommand.SET_POSE_GOAL else 29
+        ):
+            if (
+                command == BinaryCommand.SET_POSE_GOAL_WITH_LIMITS
+                and self.reject_atomic_limits
+            ):
+                status = ResponseStatus.INVALID_ARGUMENT
+            else:
+                goal_id, x_mm, y_mm, yaw_mrad, _ = struct.unpack_from(
+                    "<IiiiI", frame.payload, 1
                 )
-            if self.pose_reached_ok:
-                payload = bytes((EventCode.POSE_REACHED,)) + struct.pack(
-                    "<Iiiiii",
-                    goal_id,
-                    x_mm,
-                    y_mm,
-                    yaw_mrad,
-                    round(self.pose_error_mm),
-                    round(self.pose_error_yaw * 17.45329252),
-                )
-                self._pose_pending.append(
-                    (
-                        start_at + self.pose_reached_delay_s,
-                        self._binary_frame(MessageType.EVENT, payload),
+                self._binary_goal_id = goal_id
+                self._binary_pose_state = 2
+                start_at = time.monotonic() + self.pose_start_delay_s
+                if self.pose_start_ok:
+                    payload = bytes((EventCode.POSE_STARTED,)) + struct.pack(
+                        "<I", goal_id
                     )
-                )
+                    self._pose_pending.append(
+                        (start_at, self._binary_frame(MessageType.EVENT, payload))
+                    )
+                if self.pose_reached_ok:
+                    payload = bytes((EventCode.POSE_REACHED,)) + struct.pack(
+                        "<Iiiiii",
+                        goal_id,
+                        x_mm,
+                        y_mm,
+                        yaw_mrad,
+                        round(self.pose_error_mm),
+                        round(self.pose_error_yaw * 17.45329252),
+                    )
+                    self._pose_pending.append(
+                        (
+                            start_at + self.pose_reached_delay_s,
+                            self._binary_frame(MessageType.EVENT, payload),
+                        )
+                    )
         elif command == BinaryCommand.CANCEL_POSE_GOAL and len(frame.payload) == 5:
             goal_id = struct.unpack_from("<I", frame.payload, 1)[0]
             self._pose_pending.clear()
+            self._binary_pose_state = 4
             payload = bytes((EventCode.POSE_CANCELLED,)) + struct.pack("<I", goal_id)
             self._responses.append(self._binary_frame(MessageType.EVENT, payload))
         elif command == BinaryCommand.STOP_ALL:
             self._pose_pending.clear()
+            self._binary_pose_state = 4 if self._binary_goal_id else 0
             if self._binary_goal_id:
                 payload = bytes((EventCode.POSE_CANCELLED,)) + struct.pack(
                     "<I", self._binary_goal_id
                 )
                 self._responses.append(self._binary_frame(MessageType.EVENT, payload))
+        elif command == BinaryCommand.QUERY_POSE_GOAL:
+            response_data = struct.pack(
+                "<IBiiiHBB", self._binary_goal_id, self._binary_pose_state,
+                0, 0, 0, 0, 0, 2,
+            )
+        elif command == BinaryCommand.SESSION_PROBE:
+            response_data = bytes((
+                int(self._binary_session), int(self._binary_session), 2,
+                self._binary_pose_state,
+            )) + struct.pack(
+                "<IIB", self._binary_goal_id, int(REQUIRED_CAPABILITIES), VERSION
+            )
         elif command not in (
             BinaryCommand.PING,
-            BinaryCommand.QUERY_POSE_GOAL,
             BinaryCommand.SET_SPEED_LIMITS,
         ):
             status = ResponseStatus.UNKNOWN_COMMAND
-        response = bytes((frame.sequence, command, status))
+        response = bytes((frame.sequence, command, status)) + response_data
         self._responses.insert(0, self._binary_frame(MessageType.RESPONSE, response))
 
     def close(self) -> None:
@@ -201,7 +235,11 @@ class FakeFirmware:
         if command == "PING":
             self._responses.append("# PONG")
         elif command == "HOST BINARY START":
-            self._responses.append("# HOST BINARY READY")
+            self._binary_session = True
+            self._responses.append(
+                f"# HOST BINARY READY VERSION={VERSION} "
+                f"CAPS=0x{int(REQUIRED_CAPABILITIES):08X}"
+            )
         elif command.startswith("HOST LINK "):
             self._host_link(command)
         elif command == "HOST STATUS":

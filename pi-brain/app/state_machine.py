@@ -30,6 +30,11 @@ from .protocol import (
     PRIORITY_STOP,
 )
 from .serial_bridge import SerialConnected, SerialDisconnected
+from .binary_protocol import (
+    HOST_PROTOCOL_VERSION,
+    REQUIRED_CAPABILITIES,
+    VERSION as BINARY_PROTOCOL_VERSION,
+)
 
 
 class BridgePort(Protocol):
@@ -42,7 +47,9 @@ class BridgePort(Protocol):
 
     def release_emergency_stop(self) -> None: ...
 
-    def enable_binary_mode(self) -> None: ...
+    def enable_binary_mode(
+        self, linear_mps: float = 0.20, yaw_radps: float = 0.25
+    ) -> None: ...
 
 
 class StartupState(str, Enum):
@@ -85,7 +92,7 @@ class StartupConfig:
     limit_y: float = 0.20
     limit_yaw: float = 0.25
     step_timeout: float = 1.5
-    minimum_protocol: int = 3
+    minimum_protocol: int = HOST_PROTOCOL_VERSION
 
 
 class StartupStateMachine:
@@ -277,7 +284,20 @@ class StartupStateMachine:
     def _on_binary_ready(self, event: Event) -> None:
         if not isinstance(event, BinaryReady):
             return
-        self.bridge.enable_binary_mode()
+        if event.version != BINARY_PROTOCOL_VERSION:
+            self._fail(
+                f"binary protocol {event.version} is unsupported; "
+                f"expected {BINARY_PROTOCOL_VERSION}"
+            )
+            return
+        missing = int(REQUIRED_CAPABILITIES) & ~event.capabilities
+        if missing:
+            self._fail(f"firmware missing required binary capabilities: 0x{missing:08X}")
+            return
+        self.bridge.enable_binary_mode(
+            min(self.config.limit_x, self.config.limit_y),
+            self.config.limit_yaw,
+        )
         self.bridge.release_emergency_stop()
         self._deadline = None
         self.state = StartupState.READY

@@ -272,7 +272,7 @@ class Mission:
         if state in self._LEG_GOALS:
             goal_name = self._LEG_GOALS[state]
             goal: PoseGoal = getattr(self.config, goal_name)
-            # 先切速度档再发车；档名非法/越界直接中止，绝不在错误限速下发车
+            # 先选择速度档；二进制桥与目标原子提交，拒绝时绝不发车。
             if self.profiles is not None and goal.profile:
                 try:
                     self.profiles.apply(goal.profile)
