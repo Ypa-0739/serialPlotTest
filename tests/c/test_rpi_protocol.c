@@ -58,8 +58,20 @@ int main(void)
     assert(RpiProtocol_QueuePush(&queue, &received, 1U) == 1U);
     assert(RpiProtocol_QueuePop(&queue, &queued) == 1U);
     assert(queued.sequence == 42U);
-    assert(RpiProtocol_QueuePop(&queue, &queued) == 1U);
-    assert(queued.sequence == 0U);
+    assert(!RpiProtocol_QueuePop(&queue, &queued));
+    assert(queue.dropped == RPI_PROTOCOL_QUEUE_CAPACITY + 1U);
+
+    /* STOP 待处理期间也不能积累新运动；处理后只接受显式新命令。 */
+    assert(RpiProtocol_QueuePush(&queue, &received, 1U));
+    received.payload[0] = RPI_CMD_SET_POSE_GOAL;
+    received.sequence = 43U;
+    assert(!RpiProtocol_QueuePush(&queue, &received, 0U));
+    assert(RpiProtocol_QueuePop(&queue, &queued));
+    assert(queued.sequence == 42U);
+    assert(!RpiProtocol_QueuePop(&queue, &queued));
+    assert(RpiProtocol_QueuePush(&queue, &received, 0U));
+    assert(RpiProtocol_QueuePop(&queue, &queued));
+    assert(queued.sequence == 43U);
 
     {
         RpiTxQueue tx_queue;

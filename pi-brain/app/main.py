@@ -185,16 +185,19 @@ def run_loop(
     except KeyboardInterrupt:
         print("\n[EXIT] 正在停止...")
     finally:
-        # 任何入口退出都先锁存并排队 STOP；外部运行时关闭相机时，串口线程
-        # 仍保持运行，能够把 STOP 实际写出后再关闭端口。
-        bridge.emergency_stop()
+        # 在关闭相机和日志之前完成有界停车交接，不能以入队代替写出。
         try:
-            if runtime is not None:
-                runtime.close()
+            result = bridge.shutdown()
+            print(f"[EXIT] STOP written={result.stop_written} "
+                  f"acknowledged={result.stop_acknowledged} "
+                  f"thread_stopped={result.thread_stopped}")
         finally:
-            bridge.stop()
-            if logger is not None:
-                logger.close()
+            try:
+                if runtime is not None:
+                    runtime.close()
+            finally:
+                if logger is not None:
+                    logger.close()
 
 
 def main(argv: Optional[list[str]] = None) -> int:

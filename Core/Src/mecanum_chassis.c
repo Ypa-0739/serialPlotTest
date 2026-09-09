@@ -13,9 +13,34 @@
  */
 #include "mecanum_chassis.h"
 #include "zdtEmm.h"
+#include "zdtCan.h"
 #include <math.h>
 
 static volatile uint8_t can_tx_fault_latched = 0U;
+static MotorStopMonitor stop_monitor;
+static uint32_t stop_motion_generation, stop_retry_tick;
+static float applied_scale = 1.0f;
+
+float Mecanum_GetAppliedScale(void) { return applied_scale; }
+MotorStopMonitor Mecanum_GetStopStatus(void) { return stop_monitor; }
+uint8_t Mecanum_FeedbackReady(uint8_t mask)
+{
+    MotorFeedback samples[4];
+    ZDT_Emm_GetFeedback(samples);
+    return (MotorFeedback_FreshMask(samples, HAL_GetTick()) & mask) == mask;
+}
+void Mecanum_ProcessFeedback(uint32_t now)
+{
+    MotorFeedback samples[4];
+    if (stop_motion_generation != ZDT_Emm_MotionGeneration()) stop_monitor.state = MOTOR_STOP_IDLE;
+    ZDT_Emm_GetFeedback(samples);
+    now = HAL_GetTick();
+    MotorStop_Update(&stop_monitor, samples, ZDT_CAN_StopPending(), now);
+    if (stop_monitor.state == MOTOR_STOP_UNCONFIRMED && (uint32_t)(now - stop_retry_tick) >= 100U) {
+        stop_retry_tick = now;
+        Mecanum_ReportCanTxResult(ZDT_Emm_StopAll());
+    }
+}
 
 void Mecanum_Kinematics(float Vx, float Vy, float Vz, float *V_bl, float *V_fl, float *V_fr, float *V_br) {
     float L = (ROBOT_H / 2.0f) + (ROBOT_W / 2.0f);
@@ -43,12 +68,23 @@ uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
     float scale;
     uint8_t result = 0U;
 
+    applied_scale = 1.0f;
+    if (!isfinite(V_bl) || !isfinite(V_fl) || !isfinite(V_fr) || !isfinite(V_br) ||
+        ((V_bl != 0.0f || V_fl != 0.0f || V_fr != 0.0f || V_br != 0.0f) &&
+         !Mecanum_FeedbackReady(0x0FU))) {
+        applied_scale = 0.0f;
+        can_tx_fault_latched = 1U;
+        (void)StopAllMotors();
+        return 4U;
+    }
+
     if (fabsf(V_fl) > max_abs) max_abs = fabsf(V_fl);
     if (fabsf(V_fr) > max_abs) max_abs = fabsf(V_fr);
     if (fabsf(V_br) > max_abs) max_abs = fabsf(V_br);
     if (max_abs > MECANUM_MAX_WHEEL_SPEED_MPS) {
         /* 四轮同时按比例缩放，保留期望的平移与旋转方向比例。 */
         scale = MECANUM_MAX_WHEEL_SPEED_MPS / max_abs;
+        applied_scale = scale;
         V_bl *= scale;
         V_fl *= scale;
         V_fr *= scale;
@@ -59,7 +95,12 @@ uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
     result |= ZDT_Emm_SetSpeedByID(2, MsToRpm(V_fl));  // ID 2: 左前
     result |= ZDT_Emm_SetSpeedByID(3, MsToRpm(V_fr));  // ID 3: 右前
     result |= ZDT_Emm_SetSpeedByID(4, MsToRpm(V_br));  // ID 4: 右后
-    if (result != 0U) can_tx_fault_latched = 1U;
+    if (result != 0U) {
+        can_tx_fault_latched = 1U;
+        applied_scale = 0.0f;
+        /* 任一轮入队失败时撤销其他轮已入队的速度，避免部分下发。 */
+        (void)StopAllMotors();
+    }
     return result;
 }
 
@@ -77,12 +118,19 @@ void ReadAllMotorsSpeed(void) {
  * @brief  紧急停止所有电机
  */
 uint8_t StopAllMotors(void) {
-    return SetAllMotorsSpeed(0.0f, 0.0f, 0.0f, 0.0f);
+    uint8_t result;
+    if (stop_motion_generation != ZDT_Emm_MotionGeneration()) stop_monitor.state = MOTOR_STOP_IDLE;
+    MotorStop_Request(&stop_monitor, HAL_GetTick());
+    stop_motion_generation = ZDT_Emm_MotionGeneration();
+    stop_retry_tick = HAL_GetTick();
+    result = ZDT_Emm_StopAll();
+    if (result) can_tx_fault_latched = 1U;
+    return result;
 }
 
 uint8_t Mecanum_ConsumeCanTxFault(void)
 {
-    uint8_t fault = can_tx_fault_latched;
+    uint8_t fault = can_tx_fault_latched | ZDT_CAN_ConsumeFault();
     can_tx_fault_latched = 0U;
     return fault;
 }
@@ -96,6 +144,5 @@ void Mecanum_ReportCanTxResult(uint8_t result)
 {
     if (result != 0U) can_tx_fault_latched = 1U;
 }
-
 
 

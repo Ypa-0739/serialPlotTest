@@ -4,12 +4,18 @@
  */
 #include "zdtEmm.h"
 #include "zdtCan.h"
+#include <math.h>
+#include <string.h>
 
 #define ZDT_MAX_RPM                 3000.0f
 #define ZDT_X_DEFAULT_ACCEL_RPM_S   500U
 #define ZDT_EVENT_QUEUE_SIZE        8U
 
 ZDT_Motor_t motors[4];
+static MotorFeedback feedback[4];
+static uint8_t sending_stop;
+static uint32_t motion_generation;
+uint32_t ZDT_Emm_MotionGeneration(void) { return motion_generation; }
 
 static volatile ZDT_Protocol_t active_protocol = ZDT_PROTOCOL_EMM;
 static volatile uint8_t event_head = 0U;
@@ -35,6 +41,7 @@ static float ClampRpm(float rpm)
 void ZDT_Emm_InitAll(void)
 {
     uint8_t i;
+    memset(feedback, 0, sizeof(feedback));
     for (i = 0U; i < 4U; i++) {
         motors[i].node_id = i + 1U;
         motors[i].target_speed = 0.0f;
@@ -64,6 +71,13 @@ uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm)
 
     if (id < 1U || id > 4U) return 3U;
 
+    if (!isfinite(speed_rpm)) return 3U;
+    if (speed_rpm != 0.0f) {
+        MotorFeedback snapshot[4];
+        ZDT_Emm_GetFeedback(snapshot);
+        if (!(MotorFeedback_FreshMask(snapshot, HAL_GetTick()) & (1U << (id - 1U)))) return 4U;
+        motion_generation++;
+    }
     speed_rpm = ClampRpm(speed_rpm);
     dir = (speed_rpm < 0.0f) ? 1U : 0U;
     abs_rpm = (speed_rpm < 0.0f) ? -speed_rpm : speed_rpm;
@@ -82,7 +96,8 @@ uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm)
         tx_data[7] = 0x6B;
         index = MotorIndexFromId(id);
         if (index != 0xFFU) motors[index].target_speed = speed_rpm;
-        return ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 8U);
+        return sending_stop ? ZDT_CAN_SendStop(((uint32_t)id << 8), tx_data, 8U) :
+                              ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 8U);
     }
 
     {
@@ -95,7 +110,8 @@ uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm)
     }
     index = MotorIndexFromId(id);
     if (index != 0xFFU) motors[index].target_speed = speed_rpm;
-    return ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 7U);
+    return sending_stop ? ZDT_CAN_SendStop(((uint32_t)id << 8), tx_data, 7U) :
+                          ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 7U);
 }
 
 uint8_t ZDT_Emm_ReadSpeedByID(uint8_t id)
@@ -162,7 +178,9 @@ void ZDT_Emm_RxHandler(uint32_t ExtId, uint8_t *Data, uint8_t Len)
     float speed = 0.0f;
     ZDT_MotorEvent_t event;
 
-    if (Data == NULL || Len < 2U || sender_id < 1U || sender_id > 4U) return;
+    if (Data == NULL || Len < 2U || Len > 8U || sender_id < 1U || sender_id > 4U ||
+        (ExtId & 0xFFU) != 0U || Data[Len - 1U] != 0x6BU) return;
+    if (Data[0] == 0x35U && (Len != 5U || Data[1] > 1U)) return;
     index = MotorIndexFromId(sender_id);
 
     event.motor_id = sender_id;
@@ -176,7 +194,10 @@ void ZDT_Emm_RxHandler(uint32_t ExtId, uint8_t *Data, uint8_t Len)
         if (active_protocol == ZDT_PROTOCOL_X) speed *= 0.1f;
         if (Data[1] == 0x01U) speed = -speed;
         event.speed_rpm = speed;
-        if (index != 0xFFU) motors[index].actual_speed = speed;
+        if (index != 0xFFU) {
+            motors[index].actual_speed = speed;
+            MotorFeedback_Record(&feedback[index], speed, HAL_GetTick());
+        }
     } else if (Data[0] == 0x3AU && Len >= 3U) {
         if (index != 0xFFU) motors[index].enabled = (Data[1] & 0x01U) ? 1U : 0U;
     }
@@ -200,4 +221,22 @@ uint8_t ZDT_Emm_PollEvent(ZDT_MotorEvent_t *event)
     event_tail = (uint8_t)((event_tail + 1U) % ZDT_EVENT_QUEUE_SIZE);
     if (primask == 0U) __enable_irq();
     return 1U;
+}
+
+void ZDT_Emm_GetFeedback(MotorFeedback output[4])
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    memcpy(output, feedback, sizeof(feedback));
+    __set_PRIMASK(primask);
+}
+uint8_t ZDT_Emm_StopAll(void)
+{
+    uint8_t id, result = 0U;
+    ZDT_CAN_BeginStop();
+    sending_stop = 1U;
+    for (id = 1U; id <= 4U; ++id) result |= ZDT_Emm_SetSpeedByID(id, 0.0f);
+    sending_stop = 0U;
+    ZDT_CAN_Process(HAL_GetTick());
+    return result;
 }

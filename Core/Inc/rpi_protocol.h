@@ -89,6 +89,7 @@ void RpiProtocol_ParserInit(RpiProtocolParser *parser,
 void RpiProtocol_ParserReset(RpiProtocolParser *parser);
 void RpiProtocol_FeedByte(RpiProtocolParser *parser, uint8_t byte);
 void RpiProtocol_QueueReset(RpiFrameQueue *queue);
+/* urgent 用于 STOP：撤销普通队列，并在 STOP 出队前拒绝普通帧。 */
 uint8_t RpiProtocol_QueuePush(RpiFrameQueue *queue,
                               const RpiFrame *frame,
                               uint8_t urgent);

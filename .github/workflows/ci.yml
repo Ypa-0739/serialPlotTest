@@ -1,0 +1,43 @@
+name: Firmware and Pi regression
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install host test dependencies
+        run: python -m pip install pyserial 'numpy>=1.24,<3' 'opencv-python-headless>=4.8,<5'
+      - name: Verify generated protocol
+        run: python -B tools/generate_rpi_protocol.py --check
+      - name: Portable firmware tests
+        run: python -B tools/run_c_tests.py
+      - name: Pi regression
+        working-directory: pi-brain
+        run: python -B -m unittest discover -s tests -t .
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install ARM compiler and C library
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - name: Full source firmware build
+        run: python3 -B tools/build_firmware.py

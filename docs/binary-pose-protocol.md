@@ -86,6 +86,21 @@ reconciliation. The firmware-reported goal id alone is not used for ownership,
 because a delayed response may legitimately report IDLE after its old goal has
 already ended.
 
+## STOP receive barrier
+
+STOP_ALL has a dedicated RX slot. Receiving it discards the ordinary RX FIFO;
+ordinary frames arriving while STOP is pending are rejected and counted as
+dropped. After STOP is dequeued, new requests can be accepted. Clients must wait
+for its response before submitting new work. STOP does not change the wire
+version, mode or negotiation state; the Pi emergency latch separately prevents
+new motion until explicitly released.
+
+The Pi invalidates commands already removed from its TX queue when an emergency
+stop clears that queue, including binary goals and commands held across a later
+release. Application shutdown uses the serial thread to write STOP and waits
+for an acknowledgement with a bounded deadline before closing. Write completion
+and protocol acknowledgement are reported separately; neither is motor feedback.
+
 ## Events
 
 | Code | Event data |

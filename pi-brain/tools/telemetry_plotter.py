@@ -258,9 +258,10 @@ def main() -> int:
     finally:
         running.clear()
         # 退出绘图工具等同操作员离开：先锁存STOP，再关闭唯一串口写者。
-        bridge.emergency_stop()
-        time.sleep(0.15)
-        bridge.stop()
+        result = bridge.shutdown()
+        print(f"[EXIT] STOP written={result.stop_written} "
+              f"acknowledged={result.stop_acknowledged} "
+              f"thread_stopped={result.thread_stopped}")
         event_thread.join(timeout=0.5)
         recorder.close()
         _ = animation

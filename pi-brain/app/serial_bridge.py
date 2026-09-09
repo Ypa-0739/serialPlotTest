@@ -34,6 +34,7 @@ from .protocol import (
     PoseStarted,
     PoseStopped,
     StopAcknowledged,
+    RoundStopped,
     PRIORITY_QUERY,
     PRIORITY_STOP,
     encode_ping,
@@ -92,6 +93,15 @@ class SerialDisconnected(Event):
 
 class MotionCommandRejected(RuntimeError):
     """急停锁存期间拒绝了可能启动运动的命令。"""
+
+
+@dataclass(frozen=True)
+class ShutdownResult:
+    """串口写出、固件回复分别记录；均不代表电机零速反馈。"""
+
+    stop_written: bool
+    stop_acknowledged: bool
+    thread_stopped: bool
 
 
 @dataclass(frozen=True)
@@ -201,6 +211,11 @@ class SerialBridgeThread(threading.Thread):
         self._link_state = LinkState.DISCONNECTED
         self._next_ping = 0.0
         self._seq = itertools.count()
+        self._discard_before_seq = 0
+        self._stop_request_seq = None
+        self._stop_written = threading.Event()
+        self._stop_acknowledged = threading.Event()
+        self._closing = False
         self._safety_lock = threading.Lock()
         self._emergency_latched = False
         self._binary_mode = False
@@ -254,6 +269,8 @@ class SerialBridgeThread(threading.Thread):
         """在收到 ``# HOST BINARY READY`` 后原子切换串口编解码模式。"""
         speed_limits_data(linear_mps, yaw_radps)  # 与固件边界同步校验。
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             self._binary_decoder = FrameDecoder()
             self._binary_pending.clear()
             self._staged_speed_limits = (linear_mps, yaw_radps)
@@ -277,6 +294,8 @@ class SerialBridgeThread(threading.Thread):
             timeout_ms=round(timeout_s * 1000.0),
         )
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             if not self._binary_mode:
                 raise MotionCommandRejected("binary session is not ready")
             if self._emergency_latched:
@@ -294,6 +313,8 @@ class SerialBridgeThread(threading.Thread):
     def cancel_pose_goal(self, goal_id: int, *, priority: int) -> None:
         tx = _BinaryTx(BinaryCommand.CANCEL_POSE_GOAL, cancel_goal_data(goal_id), goal_id)
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             if not self._binary_mode:
                 raise MotionCommandRejected("binary session is not ready")
             self._tx.put((priority, next(self._seq), tx))
@@ -303,6 +324,8 @@ class SerialBridgeThread(threading.Thread):
     ) -> None:
         speed_limits_data(linear_mps, yaw_radps)
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             if not self._binary_mode:
                 raise MotionCommandRejected("binary session is not ready")
             # 二进制运行期不单独写限速；下一条目标把两者原子提交给固件。
@@ -312,6 +335,8 @@ class SerialBridgeThread(threading.Thread):
         self, goal_id: int | None = None, *, priority: int = PRIORITY_QUERY
     ) -> None:
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             if not self._binary_mode:
                 raise MotionCommandRejected("binary session is not ready")
             self._tx.put(
@@ -327,6 +352,8 @@ class SerialBridgeThread(threading.Thread):
         if isinstance(command, str):
             command = Command(text=command, priority=20 if priority is None else priority)
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             if self._binary_mode:
                 if command.text == "STOP":
                     self._tx.put(
@@ -348,10 +375,13 @@ class SerialBridgeThread(threading.Thread):
             self._emergency_latched = True
             self._clear_tx_locked()
             self._binary_pending.clear()
+            self._stop_written.clear()
+            self._stop_acknowledged.clear()
             outbound = (
                 _BinaryTx(BinaryCommand.STOP_ALL) if self._binary_mode else "STOP"
             )
-            self._tx.put((PRIORITY_STOP, next(self._seq), outbound))
+            self._stop_request_seq = next(self._seq)
+            self._tx.put((PRIORITY_STOP, self._stop_request_seq, outbound))
 
     def release_emergency_stop(self) -> None:
         """解除软件急停门禁；只应由完成自检后的SafetySupervisor调用。
@@ -359,6 +389,8 @@ class SerialBridgeThread(threading.Thread):
         本方法不会自动发送任何运动命令，也不会恢复急停前的队列。
         """
         with self._safety_lock:
+            if self._closing:
+                raise MotionCommandRejected("serial bridge is closing")
             self._emergency_latched = False
 
     def get_event(self, timeout: float = 0.0) -> Optional[Event]:
@@ -375,8 +407,30 @@ class SerialBridgeThread(threading.Thread):
         except queue.Empty:
             return None
 
+    def shutdown(self, timeout: float = 0.75) -> ShutdownResult:
+        """退出入口：由串口线程发送 STOP，限时等回复，然后关闭。
+
+        不消费业务事件队列；断线或缺少回复通过返回值报告。
+        """
+        if threading.current_thread() is self:
+            raise RuntimeError("shutdown must be called outside the serial thread")
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._safety_lock:
+            self._closing = True
+        self.emergency_stop()
+        try:
+            if self.is_alive() and self.is_connected:
+                self._stop_written.wait(max(0.0, deadline - time.monotonic()))
+                if self._stop_written.is_set():
+                    self._stop_acknowledged.wait(max(0.0, deadline - time.monotonic()))
+            written = self._stop_written.is_set()
+            acknowledged = self._stop_acknowledged.is_set()
+        finally:
+            self.stop()
+        return ShutdownResult(written, acknowledged, not self.is_alive())
+
     def stop(self) -> None:
-        """请求停止并等待线程退出。关闭串口以唤醒阻塞的 readline。"""
+        """底层线程关闭；应用退出使用 shutdown() 完成停车交接。"""
         self._running = False
         self._link_state = LinkState.STOPPING
         ser = self._serial
@@ -385,7 +439,8 @@ class SerialBridgeThread(threading.Thread):
                 ser.close()
             except Exception:
                 pass
-        self.join(timeout=2.0)
+        if self.ident is not None and threading.current_thread() is not self:
+            self.join(timeout=2.0)
 
     # ------------------------------------------------------------------
     # 线程主循环
@@ -427,7 +482,7 @@ class SerialBridgeThread(threading.Thread):
                 ser.close()
             except Exception:
                 pass
-            if not self._running:
+            if not self._running or self._closing:
                 return
             # 断线：清除旧命令并锁存运动门禁，重连后必须自检并显式解除。
             with self._safety_lock:
@@ -458,11 +513,13 @@ class SerialBridgeThread(threading.Thread):
                     for frame in self._binary_decoder.feed(bytes(line)):
                         event = self._decode_binary_frame(frame)
                         if event is not None:
+                            self._observe_stop_ack(event)
                             self._events.put(event)
                 else:
                     text = bytes(line).decode("utf-8", errors="replace").strip()
                     event = parse_line(text)
                     if event is not None:
+                        self._observe_stop_ack(event)
                         if isinstance(event, (WheelTelemetry, PoseTelemetry)):
                             self._put_latest_telemetry(event)
                         else:
@@ -490,11 +547,23 @@ class SerialBridgeThread(threading.Thread):
         sent = 0
         while self._running and sent < self._tx_drain_limit:
             try:
-                _, _, outbound = self._tx.get_nowait()
+                _, sequence, outbound = self._tx.get_nowait()
             except queue.Empty:
                 break
             # 与 emergency_stop() 共用锁，保证急停返回后不会再写出旧运动。
             with self._safety_lock:
+                # 已出队的旧对象同样失效，解除门禁不能复活旧命令。
+                if sequence < self._discard_before_seq:
+                    continue
+                if (
+                    isinstance(outbound, _BinaryTx)
+                    and self._emergency_latched
+                    and outbound.command in (
+                        BinaryCommand.SET_POSE_GOAL,
+                        BinaryCommand.SET_POSE_GOAL_WITH_LIMITS,
+                    )
+                ):
+                    continue
                 if (
                     isinstance(outbound, str)
                     and self._emergency_latched
@@ -518,6 +587,8 @@ class SerialBridgeThread(threading.Thread):
                     payload = outbound.encode("ascii") + b"\n"
                 if not self._write(ser, payload):
                     return False
+                if sequence == self._stop_request_seq:
+                    self._stop_written.set()
             sent += 1
         return True
 
@@ -703,8 +774,17 @@ class SerialBridgeThread(threading.Thread):
 
     def _clear_tx_locked(self) -> None:
         """清空TX队列。调用者必须持有_safety_lock。"""
+        self._discard_before_seq = next(self._seq)
         with self._tx.mutex:
             self._tx.queue.clear()
+
+    def _observe_stop_ack(self, event: Event) -> None:
+        # TUNE 正在运行时，固件用 ROUND STOP HOST 确认主机停车。
+        confirmed = isinstance(event, StopAcknowledged) or (
+            isinstance(event, RoundStopped) and event.reason == "HOST"
+        )
+        if confirmed and self._stop_written.is_set():
+            self._stop_acknowledged.set()
 
     def _put_latest_telemetry(self, event: Event) -> None:
         """遥测队列满时丢最旧样本；控制事件使用另一无损队列。"""
@@ -726,8 +806,7 @@ class SerialBridgeThread(threading.Thread):
     def _write(self, ser: SerialLike, payload: bytes) -> bool:
         """唯一实际写串口的路径；写失败视为断线。"""
         try:
-            ser.write(payload)
-            return True
+            return ser.write(payload) == len(payload)
         except Exception:
             return False
 

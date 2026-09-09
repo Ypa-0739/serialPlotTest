@@ -38,6 +38,10 @@ OPS9 安装在车体中心前方 25 mm。固件保留原始 OPS 坐标，同时�
 HOST LINK COM
 HOST LINK RPI
 HOST STATUS
+HOST RX STATUS
+CONTROL STATUS
+MOTOR FEEDBACK
+MOTOR STOP STATUS
 MODE WORK
 MODE TUNE
 MODE PLOT
@@ -122,6 +126,17 @@ python tools/generate_rpi_protocol.py --check
 手工维护产生协议漂移。当前基线为 HOST protocol 4、binary wire 2、能力位
 `0x0000003F`。
 
+## 主机接收与退出停车
+
+文本接收现在使用四项有界命令队列与独立 STOP 锁存，每行最多 63 字符。
+STOP 清除旧命令；STOP 尚未出队时普通命令会被丢弃，客户端须等待停车回复后
+再提交新业务。超长或含非法控制字符的行整行拒绝，不执行截断前缀。
+`HOST RX STATUS` 可查看撤销/丢弃项及无效行计数。二进制 STOP 同样清除旧 RX 队列。
+
+Pi 应用退出使用 `SerialBridgeThread.shutdown()`，由唯一串口线程发送 STOP，
+限时等待回复后再关闭；分别报告写出、固件确认和线程退出状态。无回复或写失败
+不能报告确认成功，固件确认也不等同于电机零速反馈。
+
 ## POSE 梯形速度规划
 
 `POSE SET` 的控制链为：车体中心位姿误差 → X/Y/YAW PID → 主动制动速度上限 →
@@ -156,7 +171,11 @@ python tools/generate_rpi_protocol.py --check
 OPS/HOST 丢失、CAN1 故障、非有限数值或行程越界同样直接清除规划状态并输出四轮零速，
 不会经过减速斜坡，也不会在故障恢复后继续旧目标。PID 状态清理不会修改 Kp/Ki/Kd。
 
-USART1 的 `printf` 发送采用 20 ms 有限超时，不使用 `HAL_MAX_DELAY`；串口异常只会累计发送错误，不会永久卡住主循环。主循环执行顺序为接收命令 → 统一安全监督 → POSE/TUNE 控制与运动超时 → 电机反馈轮询 → 遥测发送。TUNE 使用实际经过时间计算斜坡并把异常间隔限制在 100 ms 内，避免串口阻塞造成固定 20 ms 步进漂移。
+USART1 的 `printf` 使用有界行队列和 DMA：停车回复优先，普通回复 FIFO，W/P/调参遥测各保留最新值；DMA 缓冲在完成前保持不变。CAN1 每次最多提交 3 帧，四轮速度合并更新，STOP 清旧队列并优先提交零速。主机命令不再逐轮阻塞等待；UART DMA 忙超过 100 ms、CAN 普通帧排队超过 50 ms 均进入故障处理。
+
+POSE/TUNE 的 PID 和斜坡统一使用实际 dt；PID 保留旧版 20 ms 参数基准，增加 20 ms 微分低通和下游限幅抗积分饱和。OPS 读取使用包含位姿、帧号及更新时间的完整快照。`CONTROL STATUS` 可检查循环间隔和发送拥塞。
+
+四轮反馈超过 300 ms 未更新时禁止底盘非零速度。`MOTOR STOP STATUS` 将“零速已请求”与“收到新的四轮零速反馈”分开；600 ms 未确认则报告 UNCONFIRMED 并重试。启动完成后启用独立看门狗，名义约 2 秒未喂狗复位；**MCU 复位不保证外置驱动器停转，X42S 通信超时配置尚待核实并上板验证。** 设计及验收步骤见 [控制层验证说明](docs/control-layer-validation.md)。
 
 ## 树莓派视觉联调
 
@@ -200,7 +219,7 @@ ASCII行；RPI二进制会话使用CRC遥测帧，但映射为相同的Python事
 @P,1,tick,seq,ops_x,ops_y,ops_yaw,center_x,center_y,plan_vx,plan_vy,plan_vz
 ```
 
-- W8：四轮目标 RPM + 四轮反馈 RPM。开启后以非阻塞命令每 10 ms 轮询一台电机，每台约 25 Hz；W8 输出 20 Hz。
+- W8：四轮目标 RPM + 四轮反馈 RPM。后台始终每 10 ms 轮询一台电机，每台约 25 Hz，与遥测开关无关；W8 开启后输出 20 Hz。
 - P8：OPS X/Y/YAW、车体中心 X/Y、规划 Vx/Vy/Vz；输出 20 Hz。
 - `TELEM BOTH` 时 W8/P8 相差 25 ms 交错发送，避免同一控制周期连续发送两条长帧。
 - 桥接器把遥测放入独立的有界“保留最新值”队列；STOP、故障、到位和心跳事件走原有控制队列，遥测积压不能阻塞安全事件。
@@ -219,12 +238,36 @@ python -m tools.telemetry_plotter --port COM3 --mode work
 
 `TELEM OFF|WHEEL|POSE|BOTH`可在任意模式独立选择通道，`TELEM STATUS`查看序号及发送统计。旧的 `MODE PLOT`、`PLOT ON/OFF/STATUS`仍保留为文本协议兼容入口，但不再输出 SerialPlot 二进制帧。
 
+## 固件架构
+
+`main.c` 仅保留 CubeMX 外设初始化、时钟配置和应用入口，由 2681 行缩减到 194 行。业务状态收归 `robot_app.c` 私有，HAL 回调集中路由，接收协议与运动计算可独立在主机测试。
+
+| 模块 | 职责与边界 |
+| --- | --- |
+| `main.c` | 初始化硬件，调用 `RobotApp_Init()` / `RobotApp_Process()` |
+| `board_events.c` | HAL 中断及标准输出适配；不保存业务状态 |
+| `robot_app.c` | 会话、模式、目标和安全调度；持有私有 PID/目标状态 |
+| `host_rx_router.c` | ASCII/二进制接收分流、合法帧通知；不调用 HAL 或电机 |
+| `host_command_rx.c` / `rpi_protocol.c` | 文本组行、帧校验、有界队列及 STOP 抢占 |
+| `motion_math.c` | POSE/TUNE 共用坐标补偿、角度差、标量/二维斜坡；安装偏移只有一份 |
+| `pid.c` / `llm_tuner.c` | 闭环计算与调参轮次 |
+| `host_uart_tx.c` / `zdtCan.c` | 有界异步发送和拥塞监督 |
+| `ops9.c` / `zdtEmm.c` / `motor_monitor.c` | 传感器与电机反馈、停车确认 |
+| `control_runtime.c` | 周期间隔及 IWDG |
+
+协议业务分派和 POSE 状态机暂留应用模块，后续通过类型明确的命令/状态接口进一步分离。模块所有权、ISR 规则和扩展步骤见 [架构说明](docs/architecture.md)。
+
 ## 构建
 
 使用 STM32CubeIDE 1.19.0 打开工程并构建 `Debug` 配置。主要入口为：
 
 - `Core/Src/main.c`
+- `Core/Src/robot_app.c`
+- `Core/Src/board_events.c`
+- `Core/Src/host_rx_router.c`
+- `Core/Src/motion_math.c`
 - `Core/Src/rpi_protocol.c`
+- `Core/Src/host_command_rx.c`
 - `Core/Inc/rpi_protocol.h`
 - `Core/Inc/rpi_protocol_generated.h`
 - `Core/Src/mecanum_chassis.c`
@@ -234,9 +277,21 @@ python -m tools.telemetry_plotter --port COM3 --mode work
 - `serialPlotTest.ioc`
 
 新增源文件后，先在 STM32CubeIDE 中刷新工程并执行一次完整 clean build，确认
-构建日志和 `Debug/Core/Src/subdir.mk` 已包含 `rpi_protocol.c`。构建完成后用
+构建日志和 `Debug/Core/Src/subdir.mk` 已包含 `Core/Src/` 中全部源文件，尤其是
+新增应用、接收路由、共享计算与控制监督模块，并检查 `Debug/objects.list` 中对应对象。构建完成后用
 `arm-none-eabi-size Debug/serialPlotTest.elf` 记录固件 `text/data/bss` 以及
 Flash/RAM 基线；旧 ELF 或未包含协议源文件的构建结果不能作为尺寸基线。
+
+也可以在已安装 ARM GCC 与 newlib 的主机上直接构建，无须 CubeIDE 工作区或 `Debug/*.mk`：
+
+```powershell
+# arm-none-eabi-gcc 已在 PATH 中
+python -B tools/build_firmware.py
+# 或指定 CubeIDE 内置 GNU 工具链的 tools/bin 目录
+python -B tools/build_firmware.py --toolchain-bin "<GNU工具链目录>/bin"
+```
+
+默认输出为 `tmp/firmware/serialPlotTest.elf`、map 和 `build.log`，目标为 F407 Cortex-M4 硬浮点、Debug `-O0`，C 编译警告视为错误。此命令仅构建，不烧录。
 
 Python 工具位于 `llm-pid-tuner-main/`，建议使用其 `.venv` 环境运行测试：
 
@@ -255,19 +310,22 @@ cd ..
 python tools/generate_rpi_protocol.py --check
 ```
 
-便携式 C 协议测试可在具有 GCC 的主机上运行：
+便携式 C 测试可在具有 GCC 的主机上运行，包含二进制协议、文本接收、接收路由、共享运动计算和控制层五套测试：
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -Werror -ICore/Inc `
-  tests/c/test_rpi_protocol.c Core/Src/rpi_protocol.c -o test_rpi_protocol
-.\test_rpi_protocol.exe
+python -B tools/run_c_tests.py
 ```
 
-当前自动化验证基线为 Python `184/184` 通过、协议生成一致性检查通过、便携式
-C 协议测试通过。USART1 ORE/FE 错误锁存、DMA 饱和时的发送优先级与缓冲稳定性、
-树莓派进程冷重启恢复仍需在实车上验证，详见
-`docs/binary-pose-protocol.md`。完整函数和状态机索引见
-`functions_reference.html`。
+2026-09-09 验证基线为 Pi Python `192/192`、调参桥/界面 `17/17` 通过，
+协议生成一致性及五套便携 C 测试通过；控制层包含 9 组场景，HAL 使用测试替身。调参工具 17 项是本地子模块验证结果，该子模块的未提交修改不在本次主仓库发布范围。
+
+本轮通过可复现构建脚本编译链接 46 个单元、零警告，`text=100580`、`data=512`、`bss=29072` 字节；产物位于
+`tmp/firmware/`，未烧录。CubeIDE 需刷新并完整构建。
+真实 DMA/ISR、驱动器失联停车、IWDG 复位及 PID 效果仍须上板验证，详见
+[控制层验证说明](docs/control-layer-validation.md) 和 [二进制协议](docs/binary-pose-protocol.md)。
+`functions_reference.html` 为旧版函数索引，新控制模块以源码与交接文档为准。
+
+`.github/workflows/ci.yml` 在 push/PR 时分别运行主仓库 C/Pi 回归和 ARM 全源码构建，不依赖本地 IDE 文件或调参子模块。远端执行状态以仓库 Actions 页面为准。
 
 ## 当前验证参数
 
@@ -278,4 +336,4 @@ YAW:  P=0.02,   I=0, D=0
 高速上限: X/Y=0.20 m/s, YAW=0.25 rad/s
 ```
 
-低速实车验证中，X 横移约 195.81 mm，补偿后的前向漂移约 0.69 mm、偏航约 0.15°；YAW 转动约 29.03°，原始 OPS 位移约 13.87 mm，补偿后的车体中心位移约 2.62 mm。
+此前低速实车验证中，X 横移约 195.81 mm，补偿后的前向漂移约 0.69 mm、偏航约 0.15°；YAW 转动约 29.03°，原始 OPS 位移约 13.87 mm，补偿后的车体中心位移约 2.62 mm。这些是本轮控制层修改之前的数据，不能作为新版固件验收结果。

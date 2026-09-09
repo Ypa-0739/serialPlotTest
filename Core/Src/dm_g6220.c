@@ -221,12 +221,13 @@ void DM_G6220_RxFIFO0_Handler(DM_G6220_Motor_t *motor)
 {
     CAN_RxHeaderTypeDef rx_header;
     uint8_t data[DM_G6220_CAN_DLC];
+    uint8_t budget = 3U;
 
     if (motor == NULL || motor->hcan == NULL) {
         return;
     }
 
-    while (HAL_CAN_GetRxFifoFillLevel(motor->hcan, CAN_RX_FIFO0) > 0U) {
+    while (budget-- && HAL_CAN_GetRxFifoFillLevel(motor->hcan, CAN_RX_FIFO0) > 0U) {
         if (HAL_CAN_GetRxMessage(motor->hcan, CAN_RX_FIFO0,
                                  &rx_header, data) != HAL_OK) {
             return;

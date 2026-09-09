@@ -9,6 +9,7 @@
 #define INC_ZDTEMM_H_
 
 #include <stdint.h>
+#include "motor_monitor.h"
 
 typedef struct {
     uint8_t node_id;
@@ -40,6 +41,9 @@ extern ZDT_Motor_t motors[4];
 #define MOTOR_ID_BR  4  // Back-Right 右后
 
 void ZDT_Emm_InitAll(void);
+void ZDT_Emm_GetFeedback(MotorFeedback output[4]);
+uint8_t ZDT_Emm_StopAll(void);
+uint32_t ZDT_Emm_MotionGeneration(void);
 uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm);
 uint8_t ZDT_Emm_ReadSpeedByID(uint8_t id);
 uint8_t ZDT_Emm_ReadStatusByID(uint8_t id);

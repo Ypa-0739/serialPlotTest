@@ -5,7 +5,9 @@
  *      Author: steph
  */
 #include "ops9.h"
+#ifndef CONTROL_HOST_TEST
 #include "usart.h" // 需要用到 huart2
+#endif
 #include <math.h>
 
 /* OPS-9 每帧数据区包含 6 个小端 IEEE-754 float，下面是手册规定的索引。 */
@@ -31,6 +33,20 @@ volatile uint8_t ops9_last_raw_byte = 0U;
 uint8_t ops9_rx_byte;
 static uint8_t count = 0; // 状态机步骤计数
 static uint8_t i = 0;     // 数据数组索引
+
+OPS9_Snapshot OPS9_GetSnapshot(void)
+{
+    OPS9_Snapshot snapshot;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    snapshot.x_mm = robot_x;
+    snapshot.y_mm = robot_y;
+    snapshot.yaw_deg = robot_yaw;
+    snapshot.frame_count = ops9_frame_count;
+    snapshot.last_update_tick = ops9_last_update_tick;
+    __set_PRIMASK(primask);
+    return snapshot;
+}
 
 
 // 利用共用体直接将24个字节转换为6个浮点数
@@ -133,10 +149,13 @@ void OPS9_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         HAL_UART_Receive_IT(&huart2, &ops9_rx_byte, 1);
     }
 }
-void OPS9_Reset_Zero(void)
+uint8_t OPS9_Reset_Zero(void)
 {
     // OPS-9 manual: zero command is "ACT0" (digit zero).
-    HAL_UART_Transmit(&huart2, (uint8_t *)"ACT0", 4, 100);
+    static uint8_t zero_command[] = "ACT0";
+    if (HAL_UART_Transmit_IT(&huart2, zero_command, 4U) != HAL_OK) {
+        ops9_uart_error_count++;
+        return 0U;
+    }
+    return 1U;
 }
-
-

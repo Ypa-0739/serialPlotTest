@@ -5,6 +5,7 @@
  *      Author: steph
  */
 #include "pid.h"
+#include <math.h>
 
 /**
  * @brief  初始化 PID 控制器
@@ -28,6 +29,8 @@ void PID_Init(PID_Controller *pid, float Kp, float Ki, float Kd, float max_out, 
 
     pid->max_out = max_out;
     pid->max_integral = max_integral;
+    pid->derivative_tau_s = 0.020f;
+    PID_Reset(pid);
 }
 
 /**
@@ -47,6 +50,10 @@ void PID_Reset(PID_Controller *pid)
     pid->error = 0.0f;
     pid->last_error = 0.0f;
     pid->integral = 0.0f;
+    pid->derivative = 0.0f;
+    pid->integral_before_step = 0.0f;
+    pid->requested_output = 0.0f;
+    pid->has_last_error = 0U;
 }
 
 /**
@@ -55,19 +62,29 @@ void PID_Reset(PID_Controller *pid)
  * @param  current_val  传感器当前真实值 (如 OPS-9 的当前 X 坐标)
  * @return float        PID 计算输出的控制量 (如电机的目标速度)
  */
-float PID_CalcError(PID_Controller *pid, float error)
+float PID_CalcErrorDt(PID_Controller *pid, float error, float dt_s)
 {
     float candidate_integral = pid->integral;
     float p_out;
     float d_out;
     float total_out;
 
+    if (!isfinite(error) || !isfinite(dt_s) || dt_s <= 0.0f || dt_s > 0.100f) {
+        PID_Reset(pid);
+        return 0.0f;
+    }
+    pid->integral_before_step = pid->integral;
     pid->error = error;
     p_out = pid->Kp * pid->error;
-    d_out = pid->Kd * (pid->error - pid->last_error);
+    if (pid->has_last_error) {
+        float derivative = (error - pid->last_error) * PID_REFERENCE_DT_S / dt_s;
+        float alpha = dt_s / (pid->derivative_tau_s + dt_s);
+        pid->derivative += alpha * (derivative - pid->derivative);
+    }
+    d_out = pid->Kd * pid->derivative;
 
     if (pid->Ki != 0.0f) {
-        candidate_integral += pid->error;
+        candidate_integral += pid->error * dt_s / PID_REFERENCE_DT_S;
         if (candidate_integral > pid->max_integral) {
             candidate_integral = pid->max_integral;
         } else if (candidate_integral < -pid->max_integral) {
@@ -89,13 +106,33 @@ float PID_CalcError(PID_Controller *pid, float error)
         total_out = -pid->max_out;
     }
     pid->last_error = pid->error;
+    pid->has_last_error = 1U;
+    pid->requested_output = total_out;
     return total_out;
+}
+
+void PID_ApplyOutput(PID_Controller *pid, float applied_output)
+{
+    /* 下游矢量/制动/斜坡限幅仍向误差方向饱和时，撤销本步积分。 */
+    if (!isfinite(applied_output) ||
+        (pid->requested_output - applied_output) * pid->error > 0.000001f) {
+        pid->integral = pid->integral_before_step;
+    }
+}
+
+float PID_CalcDt(PID_Controller *pid, float current_val, float dt_s)
+{
+    return PID_CalcErrorDt(pid, pid->target - current_val, dt_s);
+}
+
+float PID_CalcError(PID_Controller *pid, float error)
+{
+    return PID_CalcErrorDt(pid, error, PID_REFERENCE_DT_S);
 }
 
 float PID_Calc(PID_Controller *pid, float current_val)
 {
     return PID_CalcError(pid, pid->target - current_val);
 }
-
 
 

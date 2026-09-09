@@ -8,7 +8,12 @@
 #ifndef INC_MECANUM_CHASSIS_H_
 #define INC_MECANUM_CHASSIS_H_
 
+#ifdef CONTROL_HOST_TEST
+#include "control_test_hal.h"
+#else
 #include "main.h"
+#endif
+#include "motor_monitor.h"
 
 /* 机器人底盘物理参数定义 */
 #define WHEEL_DIAMETER  0.075f      // 轮子直径 75mm (单位:m)
@@ -32,6 +37,10 @@ uint8_t StopAllMotors(void);
 uint8_t Mecanum_ConsumeCanTxFault(void);
 void Mecanum_ClearCanTxFault(void);
 void Mecanum_ReportCanTxResult(uint8_t result);
+void Mecanum_ProcessFeedback(uint32_t now);
+uint8_t Mecanum_FeedbackReady(uint8_t mask);
+MotorStopMonitor Mecanum_GetStopStatus(void);
+float Mecanum_GetAppliedScale(void);
 
 
 

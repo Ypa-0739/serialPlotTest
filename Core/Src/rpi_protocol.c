@@ -155,11 +155,16 @@ uint8_t RpiProtocol_QueuePush(RpiFrameQueue *queue,
 {
     if (queue == 0 || frame == 0) return 0U;
     if (urgent) {
+        /* STOP 是接收屏障：清除旧命令，处理前拒绝后续普通帧。 */
+        queue->dropped += queue->count;
+        queue->head = 0U;
+        queue->tail = 0U;
+        queue->count = 0U;
         queue->urgent_frame = *frame;
         queue->urgent_ready = 1U;
         return 1U;
     }
-    if (queue->count >= RPI_PROTOCOL_QUEUE_CAPACITY) {
+    if (queue->urgent_ready || queue->count >= RPI_PROTOCOL_QUEUE_CAPACITY) {
         queue->dropped++;
         return 0U;
     }

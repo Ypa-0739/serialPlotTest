@@ -1,8 +1,10 @@
 #include "llm_tuner.h"
+#include "motion_math.h"
 
 #include "mecanum_chassis.h"
 #include "ops9.h"
 #include "can.h"
+#include "control_runtime.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -16,8 +18,6 @@
 #define LLM_TUNE_CROSS_TRACK_MM      50.0f
 #define LLM_TUNE_YAW_TRANSLATION_MM  50.0f
 #define LLM_TUNE_TELEMETRY_PERIOD_MS 50U
-#define OPS_CENTER_OFFSET_X_MM       0.0f
-#define OPS_CENTER_OFFSET_Y_MM       25.0f
 
 typedef enum {
     LLM_TUNE_STATE_WAIT = 0,
@@ -40,41 +40,13 @@ static float tune_output;
 static uint32_t tune_round_count;
 static uint16_t tune_settle_cycles;
 
-static float ClampFloat(float value, float min_value, float max_value)
-{
-    if (value > max_value) return max_value;
-    if (value < min_value) return min_value;
-    return value;
-}
 
-static float Slew(float current, float target, float max_step)
-{
-    if (target > current + max_step) return current + max_step;
-    if (target < current - max_step) return current - max_step;
-    return target;
-}
 
-static float AngleErrorDeg(float current_deg, float reference_deg)
-{
-    float error = fmodf(current_deg - reference_deg + 180.0f, 360.0f);
-    if (error < 0.0f) error += 360.0f;
-    return error - 180.0f;
-}
 
-static void OpsToChassisCenter(float ops_x_mm, float ops_y_mm, float yaw_deg,
-                               float *center_x_mm, float *center_y_mm)
-{
-    float yaw_rad = yaw_deg * (3.1415926f / 180.0f);
-    float cos_yaw = cosf(yaw_rad);
-    float sin_yaw = sinf(yaw_rad);
 
-    *center_x_mm = ops_x_mm -
-                   (cos_yaw * OPS_CENTER_OFFSET_X_MM -
-                    sin_yaw * OPS_CENTER_OFFSET_Y_MM);
-    *center_y_mm = ops_y_mm -
-                   (sin_yaw * OPS_CENTER_OFFSET_X_MM +
-                    cos_yaw * OPS_CENTER_OFFSET_Y_MM);
-}
+
+
+
 
 static float BrakeLimitLinear(float error_mm)
 {
@@ -156,7 +128,8 @@ void LLM_TunerResetSession(void)
 
 void LLM_TunerStartRound(void)
 {
-    uint32_t last_ops_tick = ops9_last_update_tick;
+    const OPS9_Snapshot ops = OPS9_GetSnapshot();
+    uint32_t last_ops_tick = ops.last_update_tick;
     uint32_t now = HAL_GetTick();
     PID_Controller *pid = LLM_TunerGetPid();
     float center_x;
@@ -169,11 +142,16 @@ void LLM_TunerStartRound(void)
         printf("# ERROR TUNER NOT INITIALIZED\r\n");
         return;
     }
-    if (ops9_frame_count == 0U ||
+    if (ops.frame_count == 0U ||
         (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS) {
         StopAllMotors();
         LLM_TunerAbort();
         printf("# ERROR OPS NOT READY\r\n");
+        return;
+    }
+    if (!Mecanum_FeedbackReady(0x0FU)) {
+        StopAllMotors(); LLM_TunerAbort();
+        printf("# ERROR MOTOR FEEDBACK NOT READY\r\n");
         return;
     }
     if (tune_round_count >= LLM_TUNE_MAX_SESSION_ROUNDS) {
@@ -190,10 +168,10 @@ void LLM_TunerStartRound(void)
     PID_Reset(tuner_pid_x);
     PID_Reset(tuner_pid_y);
     PID_Reset(tuner_pid_yaw);
-    OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
+    Motion_OpsToCenter(ops.x_mm, ops.y_mm, ops.yaw_deg, &center_x, &center_y);
     start_x_pos = center_x;
     start_y_pos = center_y;
-    start_yaw_deg = robot_yaw;
+    start_yaw_deg = ops.yaw_deg;
     PID_SetTarget(pid, tuner_axis == LLM_TUNE_AXIS_YAW ?
                        LLM_TUNE_TARGET_YAW_DEG : LLM_TUNE_TARGET_MM);
     tune_output = 0.0f;
@@ -205,25 +183,27 @@ void LLM_TunerStartRound(void)
     printf("# ROUND START %lu AXIS=%s DIR %.0f X=%.2f Y=%.2f YAW=%.2f "
            "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
            (unsigned long)tune_round_count, LLM_TunerAxisName(tuner_axis),
-           tune_direction, robot_x, robot_y, robot_yaw, center_x, center_y);
+           tune_direction, ops.x_mm, ops.y_mm, ops.yaw_deg, center_x, center_y);
 }
 
 void LLM_TunerStopRound(const char *reason)
 {
+    const OPS9_Snapshot ops = OPS9_GetSnapshot();
     float center_x;
     float center_y;
 
     StopAllMotors();
     LLM_TunerAbort();
-    OpsToChassisCenter(robot_x, robot_y, robot_yaw, &center_x, &center_y);
+    Motion_OpsToCenter(ops.x_mm, ops.y_mm, ops.yaw_deg, &center_x, &center_y);
     printf("# ROUND STOP %s AXIS=%s X=%.2f Y=%.2f YAW=%.2f "
            "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
-           reason, LLM_TunerAxisName(tuner_axis), robot_x, robot_y, robot_yaw,
+           reason, LLM_TunerAxisName(tuner_axis), ops.x_mm, ops.y_mm, ops.yaw_deg,
            center_x, center_y);
 }
 
 void LLM_TunerProcess(uint32_t now)
 {
+    const OPS9_Snapshot ops = OPS9_GetSnapshot();
     float current_ops_x;
     float current_ops_y;
     float current_x;
@@ -258,19 +238,21 @@ void LLM_TunerProcess(uint32_t now)
         return;
     }
 
+    now = HAL_GetTick();
     elapsed_ms = (uint32_t)(now - last_control_time);
     if (elapsed_ms < LLM_TUNE_CONTROL_PERIOD_MS) return;
+    ControlRuntime_RecordControl(elapsed_ms);
     if (elapsed_ms > LLM_TUNE_DT_MAX_MS) elapsed_ms = LLM_TUNE_DT_MAX_MS;
     dt_s = (float)elapsed_ms / 1000.0f;
 
-    current_ops_x = robot_x;
-    current_ops_y = robot_y;
-    current_yaw = robot_yaw;
-    last_ops_tick = ops9_last_update_tick;
+    current_ops_x = ops.x_mm;
+    current_ops_y = ops.y_mm;
+    current_yaw = ops.yaw_deg;
+    last_ops_tick = ops.last_update_tick;
     now = HAL_GetTick();
     last_control_time = now;
     if (!isfinite(current_ops_x) || !isfinite(current_ops_y) ||
-        !isfinite(current_yaw) || ops9_frame_count == 0U ||
+        !isfinite(current_yaw) || ops.frame_count == 0U ||
         (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS) {
         LLM_TunerStopRound("OPS LOST");
         return;
@@ -293,14 +275,14 @@ void LLM_TunerProcess(uint32_t now)
         return;
     }
 
-    OpsToChassisCenter(current_ops_x, current_ops_y, current_yaw,
+    Motion_OpsToCenter(current_ops_x, current_ops_y, current_yaw,
                        &current_x, &current_y);
     dx = current_x - start_x_pos;
     dy = current_y - start_y_pos;
     heading_rad = start_yaw_deg * (3.1415926f / 180.0f);
     body_right_mm = cosf(heading_rad) * dx + sinf(heading_rad) * dy;
     body_forward_mm = -sinf(heading_rad) * dx + cosf(heading_rad) * dy;
-    yaw_delta_deg = AngleErrorDeg(current_yaw, start_yaw_deg);
+    yaw_delta_deg = Motion_AngleDeltaDeg(current_yaw, start_yaw_deg);
 
     if (tuner_axis == LLM_TUNE_AXIS_X) {
         normalized_input = tune_direction * body_right_mm;
@@ -356,11 +338,11 @@ void LLM_TunerProcess(uint32_t now)
     }
 
     pid = LLM_TunerGetPid();
-    desired_output = PID_Calc(pid, normalized_input);
+    desired_output = PID_CalcDt(pid, normalized_input, dt_s);
     brake_limit = tuner_axis == LLM_TUNE_AXIS_YAW ?
                   BrakeLimitYaw(normalized_error) : BrakeLimitLinear(normalized_error);
     if (brake_limit < pid->max_out) {
-        desired_output = ClampFloat(desired_output, -brake_limit, brake_limit);
+        desired_output = Motion_Clamp(desired_output, -brake_limit, brake_limit);
     }
     desired_output *= tune_direction;
     max_output_step = (tuner_axis == LLM_TUNE_AXIS_YAW ?
@@ -369,26 +351,26 @@ void LLM_TunerProcess(uint32_t now)
                        (fabsf(desired_output) < fabsf(tune_output) ?
                         LLM_TUNE_MAX_DECEL_MPS2 : LLM_TUNE_MAX_ACCEL_MPS2)) *
                        dt_s;
-    tune_output = Slew(tune_output, desired_output, max_output_step);
+    tune_output = Motion_Slew(tune_output, desired_output, max_output_step);
 
     if (tuner_axis == LLM_TUNE_AXIS_X) {
         command_vx = tune_output;
-        hold_cross_output = PID_CalcError(tuner_pid_y, -body_forward_mm);
-        hold_yaw_output = PID_CalcError(tuner_pid_yaw, -yaw_delta_deg);
-        command_vy = ClampFloat(hold_cross_output,
+        hold_cross_output = PID_CalcErrorDt(tuner_pid_y, -body_forward_mm, dt_s);
+        hold_yaw_output = PID_CalcErrorDt(tuner_pid_yaw, -yaw_delta_deg, dt_s);
+        command_vy = Motion_Clamp(hold_cross_output,
                                 -LLM_TUNE_HOLD_LINEAR_MPS,
                                 LLM_TUNE_HOLD_LINEAR_MPS);
-        command_vz = ClampFloat(hold_yaw_output,
+        command_vz = Motion_Clamp(hold_yaw_output,
                                 -LLM_TUNE_HOLD_YAW_RADPS,
                                 LLM_TUNE_HOLD_YAW_RADPS);
     } else if (tuner_axis == LLM_TUNE_AXIS_Y) {
         command_vy = tune_output;
-        hold_cross_output = PID_CalcError(tuner_pid_x, -body_right_mm);
-        hold_yaw_output = PID_CalcError(tuner_pid_yaw, -yaw_delta_deg);
-        command_vx = ClampFloat(hold_cross_output,
+        hold_cross_output = PID_CalcErrorDt(tuner_pid_x, -body_right_mm, dt_s);
+        hold_yaw_output = PID_CalcErrorDt(tuner_pid_yaw, -yaw_delta_deg, dt_s);
+        command_vx = Motion_Clamp(hold_cross_output,
                                 -LLM_TUNE_HOLD_LINEAR_MPS,
                                 LLM_TUNE_HOLD_LINEAR_MPS);
-        command_vz = ClampFloat(hold_yaw_output,
+        command_vz = Motion_Clamp(hold_yaw_output,
                                 -LLM_TUNE_HOLD_YAW_RADPS,
                                 LLM_TUNE_HOLD_YAW_RADPS);
     } else {
@@ -397,6 +379,10 @@ void LLM_TunerProcess(uint32_t now)
 
     Mecanum_Kinematics(command_vx, command_vy, command_vz, &v1, &v2, &v3, &v4);
     SetAllMotorsSpeed(v1, v2, v3, v4);
+    PID_ApplyOutput(pid, Mecanum_GetAppliedScale() * tune_direction * tune_output);
+    if (tuner_axis == LLM_TUNE_AXIS_X) PID_ApplyOutput(tuner_pid_y, Mecanum_GetAppliedScale() * command_vy);
+    if (tuner_axis == LLM_TUNE_AXIS_Y) PID_ApplyOutput(tuner_pid_x, Mecanum_GetAppliedScale() * command_vx);
+    if (tuner_axis != LLM_TUNE_AXIS_YAW) PID_ApplyOutput(tuner_pid_yaw, Mecanum_GetAppliedScale() * command_vz);
     if ((uint32_t)(now - last_telemetry_time) >= LLM_TUNE_TELEMETRY_PERIOD_MS) {
         last_telemetry_time = now;
         printf("%lu,%.2f,%.2f,%.4f,%.2f,%.7f,%.8f,%.7f,"

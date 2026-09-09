@@ -2,6 +2,7 @@
 """SerialBridgeThread 单测：唯一写者 / PING 心跳 / STOP 抢占 / 断线重连。"""
 
 import time
+import threading
 import unittest
 
 from app.binary_protocol import (
@@ -239,6 +240,32 @@ class PriorityTests(BridgeTestCase):
 
 
 class BinaryModeTests(BridgeTestCase):
+    def test_estop_between_dequeue_and_write_discards_binary_goal(self):
+        for release in (False, True):
+            with self.subTest(release=release):
+                ser = FakeSerial()
+                bridge = SerialBridgeThread(lambda: ser, heartbeat_enabled=False)
+                bridge.enable_binary_mode()
+                bridge._running = True
+                bridge.send_pose_goal(1, 100, 0, 0, 5, priority=20)
+                original_get = bridge._tx.get_nowait
+                injected = False
+
+                def dequeue_then_stop():
+                    nonlocal injected
+                    item = original_get()
+                    if not injected:
+                        injected = True
+                        bridge.emergency_stop()
+                        if release:
+                            bridge.release_emergency_stop()
+                    return item
+
+                bridge._tx.get_nowait = dequeue_then_stop
+                bridge._drain_tx(ser)
+                commands = [decode_frame(w).payload[0] for w in ser.writes]
+                self.assertEqual(commands, [BinaryCommand.STOP_ALL])
+
     def test_runtime_commands_use_single_writer_binary_frames(self):
         serials = []
         bridge = self.start_bridge(
@@ -347,6 +374,120 @@ class BinaryModeTests(BridgeTestCase):
             bridge._encode_binary_tx(_BinaryTx(BinaryCommand.QUERY_POSE_GOAL))
         )
         self.assertEqual(third.sequence, 1)
+
+
+class ShutdownTests(BridgeTestCase):
+    def test_shutdown_tune_accepts_host_stop_but_not_natural_round_end(self):
+        for reason in ("HOST", "TARGET"):
+            with self.subTest(reason=reason):
+                class TuneSerial(FakeSerial):
+                    def write(self, data):
+                        written = super().write(data)
+                        if data == b"STOP\n":
+                            self.lines.append(f"# ROUND STOP {reason} AXIS=X X=0 Y=0 YAW=0")
+                        return written
+
+                ser = TuneSerial()
+                bridge = self.start_bridge(lambda: ser, heartbeat_enabled=False)
+                self.assertTrue(self.wait_until(lambda: bridge.is_connected))
+                result = bridge.shutdown(0.1)
+                self.assertTrue(result.stop_written)
+                self.assertEqual(result.stop_acknowledged, reason == "HOST")
+                self.assertTrue(result.thread_stopped)
+
+    def test_shutdown_waits_for_ascii_and_binary_ack_without_stealing_events(self):
+        from app.demo import FakeFirmware
+        from app.protocol import StopAcknowledged
+
+        for binary in (False, True):
+            with self.subTest(binary=binary):
+                firmware = FakeFirmware()
+                bridge = self.start_bridge(lambda: firmware, heartbeat_enabled=False)
+                self.assertTrue(self.wait_until(lambda: bridge.is_connected))
+                if binary:
+                    bridge.enable_binary_mode()
+                result = bridge.shutdown(timeout=0.5)
+                self.assertTrue(result.stop_written)
+                self.assertTrue(result.stop_acknowledged)
+                self.assertTrue(result.thread_stopped)
+                events = []
+                while (event := bridge.get_event()) is not None:
+                    events.append(event)
+                self.assertTrue(any(isinstance(e, StopAcknowledged) for e in events))
+                with self.assertRaises(MotionCommandRejected):
+                    bridge.release_emergency_stop()
+                with self.assertRaises(MotionCommandRejected):
+                    bridge.send("MODE WORK")
+
+    def test_shutdown_waits_for_writer_blocked_in_read_before_closing(self):
+        class GatedSerial(FakeSerial):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.resume = threading.Event()
+
+            def readline(self):
+                self.entered.set()
+                self.resume.wait(1.0)
+                return super().readline()
+
+        class PreparedBridge(SerialBridgeThread):
+            def _prepare_connection(self, ser):
+                return True
+
+        ser = GatedSerial()
+        bridge = PreparedBridge(lambda: ser, heartbeat_enabled=False)
+        bridge.start()
+        self.assertTrue(ser.entered.wait(1.0))
+        results = []
+        closer = threading.Thread(target=lambda: results.append(bridge.shutdown(0.2)))
+        closer.start()
+        self.assertTrue(self.wait_until(lambda: bridge._closing))
+        self.assertTrue(ser.is_open)
+        ser.resume.set()
+        closer.join(1.0)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(ser.writes, [b"STOP\n"])
+        self.assertEqual(ser.write_threads, ["serial-bridge"])
+        self.assertTrue(results[0].stop_written)
+        self.assertFalse(results[0].stop_acknowledged)
+        self.assertTrue(results[0].thread_stopped)
+
+    def test_shutdown_missing_ack_is_bounded(self):
+        ser = FakeSerial()
+        bridge = self.start_bridge(lambda: ser, heartbeat_enabled=False)
+        self.assertTrue(self.wait_until(lambda: bridge.is_connected))
+        start = time.monotonic()
+        result = bridge.shutdown(0.05)
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertTrue(result.stop_written)
+        self.assertFalse(result.stop_acknowledged)
+        self.assertTrue(result.thread_stopped)
+
+    def test_shutdown_reports_write_failure_without_reconnect(self):
+        serials = []
+        bridge = self.start_bridge(_factory_tracked(serials), heartbeat_enabled=False)
+        self.assertTrue(self.wait_until(lambda: bridge.is_connected))
+        serials[0].fail_after = len(serials[0].writes)
+        result = bridge.shutdown(0.05)
+        self.assertFalse(result.stop_written)
+        self.assertFalse(result.stop_acknowledged)
+        self.assertTrue(result.thread_stopped)
+        self.assertEqual(len(serials), 1)
+
+    def test_shutdown_before_start_does_not_claim_stop_was_sent(self):
+        bridge = SerialBridgeThread(lambda: FakeSerial())
+        result = bridge.shutdown(0.05)
+        self.assertFalse(result.stop_written)
+        self.assertFalse(result.stop_acknowledged)
+        self.assertTrue(result.thread_stopped)
+
+    def test_partial_write_is_failure(self):
+        class PartialSerial(FakeSerial):
+            def write(self, payload):
+                return len(payload) - 1
+        bridge = SerialBridgeThread(lambda: PartialSerial())
+        self.assertFalse(bridge._write(PartialSerial(), b"STOP\n"))
 
 
 class DisconnectTests(BridgeTestCase):
