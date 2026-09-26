@@ -116,6 +116,7 @@ class StartupStateMachine:
         self.fault_reason = ""
         self.ops_pose: Pose | None = None
         self._deadline: float | None = None
+        self._can_parts: dict = {}
 
     @property
     def is_ready(self) -> bool:
@@ -224,6 +225,7 @@ class StartupStateMachine:
             self._fail(f"OPS not ready: {event.raw}")
             return
         self.ops_pose = Pose(event.x, event.y, event.yaw)
+        self._can_parts = {}
         self.bridge.send("CAN STATUS")
         self._enter(StartupState.WAIT_CAN)
 
@@ -231,8 +233,14 @@ class StartupStateMachine:
         if not isinstance(event, CanStatus):
             return
         # STM32F4 HAL: 2=HAL_CAN_STATE_LISTENING；0/1尚未启动，3/4为睡眠，5为错误。
-        if event.error != 0 or event.state != 2:
-            self._fail(f"CAN not listening: {event.raw}")
+        for name in ("state", "ready", "esr"):
+            value = getattr(event, name)
+            if value is not None:
+                self._can_parts[name] = value
+        if not all(name in self._can_parts for name in ("state", "ready", "esr")):
+            return
+        if self._can_parts["state"] != 2 or not self._can_parts["ready"] or self._can_parts["esr"] & 7:
+            self._fail(f"CAN not ready: {event.raw}")
             return
         self._send_pid("X", self.config.x)
         self._enter(StartupState.WAIT_PID_X)

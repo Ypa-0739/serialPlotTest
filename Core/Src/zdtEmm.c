@@ -38,6 +38,16 @@ static float ClampRpm(float rpm)
     return rpm;
 }
 
+/*
+ * 统一下发一帧命令。停车序列期间改走 stops 队列：它优先发送，且不会被随后
+ * 到达的新速度覆盖；其余情况走高优先命令队列(读查询)或每电机速度槽。
+ */
+static uint8_t EmmEmit(uint32_t ext_id, uint8_t *data, uint8_t length)
+{
+    return sending_stop ? ZDT_CAN_SendStop(ext_id, data, length)
+                        : ZDT_CAN_Send_ExtId(ext_id, data, length);
+}
+
 void ZDT_Emm_InitAll(void)
 {
     uint8_t i;
@@ -86,6 +96,7 @@ uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm)
     tx_data[1] = dir;
 
     if (active_protocol == ZDT_PROTOCOL_X) {
+        /* X 固件：功能码 方向 加速度(2) 速度(2) 同步标志 校验 */
         uint16_t accel = ZDT_X_DEFAULT_ACCEL_RPM_S;
         uint16_t speed_x10 = (uint16_t)(abs_rpm * 10.0f + 0.5f);
         tx_data[2] = (uint8_t)(accel >> 8);
@@ -96,22 +107,21 @@ uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm)
         tx_data[7] = 0x6B;
         index = MotorIndexFromId(id);
         if (index != 0xFFU) motors[index].target_speed = speed_rpm;
-        return sending_stop ? ZDT_CAN_SendStop(((uint32_t)id << 8), tx_data, 8U) :
-                              ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 8U);
+        return EmmEmit((uint32_t)id << 8, tx_data, 8U);
     }
 
+    /* Emm 固件：功能码 方向 速度(2) 加速度档位 同步标志 校验 */
     {
         uint16_t speed_int = (uint16_t)(abs_rpm + 0.5f);
         tx_data[2] = (uint8_t)(speed_int >> 8);
         tx_data[3] = (uint8_t)speed_int;
-        tx_data[4] = 0x00; /* no acceleration curve */
+        tx_data[4] = 0x00; /* 加速度档位 0：不使用曲线加减速，直接启动 */
         tx_data[5] = 0x00; /* execute immediately */
         tx_data[6] = 0x6B;
     }
     index = MotorIndexFromId(id);
     if (index != 0xFFU) motors[index].target_speed = speed_rpm;
-    return sending_stop ? ZDT_CAN_SendStop(((uint32_t)id << 8), tx_data, 7U) :
-                          ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 7U);
+    return EmmEmit((uint32_t)id << 8, tx_data, 7U);
 }
 
 uint8_t ZDT_Emm_ReadSpeedByID(uint8_t id)
@@ -128,7 +138,7 @@ uint8_t ZDT_Emm_ReadStatusByID(uint8_t id)
     return ZDT_CAN_Send_ExtId(((uint32_t)id << 8), tx_data, 2U);
 }
 
-uint8_t ZDT_Emm_EnableSingleMotor(uint8_t id, uint8_t enable)
+uint8_t ZDT_Emm_EnableByID(uint8_t id, uint8_t enable)
 {
     uint8_t tx_data[5];
     uint8_t result;
@@ -149,30 +159,9 @@ uint8_t ZDT_Emm_EnableSingleMotor(uint8_t id, uint8_t enable)
     return result;
 }
 
-uint8_t ZDT_Emm_EnableByID(uint8_t id)
-{
-    return ZDT_Emm_EnableSingleMotor(id, 1U);
-}
-
-uint8_t ZDT_Emm_SetSingleMotorSpeed(uint8_t id, float speed_rpm)
-{
-    return ZDT_Emm_SetSpeedByID(id, speed_rpm);
-}
-
-uint8_t ZDT_Emm_ReadSingleMotorSpeed(uint8_t id)
-{
-    return ZDT_Emm_ReadSpeedByID(id);
-}
-
-float ZDT_Emm_GetSingleMotorSpeed(uint8_t id)
-{
-    uint8_t index = MotorIndexFromId(id);
-    return (index == 0xFFU) ? 0.0f : motors[index].actual_speed;
-}
-
 void ZDT_Emm_RxHandler(uint32_t ExtId, uint8_t *Data, uint8_t Len)
 {
-    uint8_t sender_id = (uint8_t)((ExtId >> 8) & 0xFFU);
+    uint32_t sender_id = ExtId >> 8;
     uint8_t index;
     uint8_t next_head;
     float speed = 0.0f;
@@ -230,12 +219,19 @@ void ZDT_Emm_GetFeedback(MotorFeedback output[4])
     memcpy(output, feedback, sizeof(feedback));
     __set_PRIMASK(primask);
 }
-uint8_t ZDT_Emm_StopAll(void)
+
+uint8_t ZDT_Emm_StopMask(uint8_t motor_mask)
 {
     uint8_t id, result = 0U;
+    motor_mask &= 0x0FU;
+    if (motor_mask == 0U) return 3U;
     ZDT_CAN_BeginStop();
     sending_stop = 1U;
-    for (id = 1U; id <= 4U; ++id) result |= ZDT_Emm_SetSpeedByID(id, 0.0f);
+    for (id = 1U; id <= 4U; ++id) {
+        if (motor_mask & (uint8_t)(1U << (id - 1U))) {
+            result |= ZDT_Emm_SetSpeedByID(id, 0.0f);
+        }
+    }
     sending_stop = 0U;
     ZDT_CAN_Process(HAL_GetTick());
     return result;

@@ -297,6 +297,11 @@ class FakeFirmware:
                 f"# CAN STATE={self.can_state} ERROR=0x{self.can_error:08X} "
                 f"FREE=3 TX_OK=100 TX_ERR=0 RX=50 LAST=0"
             )
+            self._responses.extend([
+                "# CAN TX_QUEUED=100 TX_ABORT=0 TX_TIMEOUT=0",
+                f"# CAN READY={int(self.can_state == 2 and self.can_error == 0)} TX_FAULT={int(self.can_error != 0)}",
+                "# CAN ESR=0x00000000 TSR=0 TEC=0 REC=0 BOFF=0 EPVF=0 EWGF=0",
+            ])
         elif command.startswith("PID SET "):
             parts = command.split()  # PID SET <AXIS> <p> <i> <d>
             if len(parts) == 6 and parts[2] in self.pids:

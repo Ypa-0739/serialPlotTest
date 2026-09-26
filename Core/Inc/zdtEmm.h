@@ -40,25 +40,23 @@ extern ZDT_Motor_t motors[4];
 #define MOTOR_ID_FR  3  // Front-Right 右前
 #define MOTOR_ID_BR  4  // Back-Right 右后
 
+/*
+ * 对外接口统一收敛为 ZDT_Emm_*ByID 一套命名（id 取 1..4）。
+ * 原先并存的 *SingleMotor* 别名已删除，避免同一功能两套入口。
+ */
 void ZDT_Emm_InitAll(void);
 void ZDT_Emm_GetFeedback(MotorFeedback output[4]);
-uint8_t ZDT_Emm_StopAll(void);
+/* 停车：motor_mask 位掩码，bit0..3 对应 ID1..4。 */
+uint8_t ZDT_Emm_StopMask(uint8_t motor_mask);
+/* 每次下发非零速度都会递增，用于让上层识别运动代次是否变化。 */
 uint32_t ZDT_Emm_MotionGeneration(void);
 uint8_t ZDT_Emm_SetSpeedByID(uint8_t id, float speed_rpm);
 uint8_t ZDT_Emm_ReadSpeedByID(uint8_t id);
 uint8_t ZDT_Emm_ReadStatusByID(uint8_t id);
-uint8_t ZDT_Emm_EnableByID(uint8_t id);
+uint8_t ZDT_Emm_EnableByID(uint8_t id, uint8_t enable);
 void ZDT_Emm_RxHandler(uint32_t ExtId, uint8_t *Data, uint8_t Len);
 void ZDT_Emm_SetProtocol(ZDT_Protocol_t protocol);
 ZDT_Protocol_t ZDT_Emm_GetProtocol(void);
 uint8_t ZDT_Emm_PollEvent(ZDT_MotorEvent_t *event);
 
-void ZDT_Emm_ReadPositionByID(uint8_t id);//读取单个电机位置
-
-int32_t ZDT_Emm_GetSingleMotorPosition(uint8_t id);//获取单个电机位置
-//调试用
-uint8_t ZDT_Emm_SetSingleMotorSpeed(uint8_t id, float speed_rpm);
-uint8_t ZDT_Emm_ReadSingleMotorSpeed(uint8_t id);
-uint8_t ZDT_Emm_EnableSingleMotor(uint8_t id, uint8_t enable);
-float ZDT_Emm_GetSingleMotorSpeed(uint8_t id);                       // 获取单个电机实际速度
 #endif

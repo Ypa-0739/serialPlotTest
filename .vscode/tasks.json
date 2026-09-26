@@ -4,24 +4,23 @@
         {
             "label": "STM32: Build Debug",
             "type": "process",
-            "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "command": "python",
             "args": [
-                "-NoLogo",
-                "-NoProfile",
-                "-Command",
-                "chcp 65001 > $null; & 'E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.make.win32_2.2.0.202409170845\\tools\\bin\\make.exe' -j8 all"
+                "-B",
+                "${workspaceFolder}\\tools\\build_firmware.py",
+                "--toolchain-bin",
+                "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\\tools\\bin",
+                "--output",
+                "${workspaceFolder}\\Debug"
             ],
             "options": {
-                "cwd": "${workspaceFolder}\\Debug",
-                "env": {
-                    "PATH": "E:\\STMCubeIDE\\STM32CubeIDE_1.19.0\\STM32CubeIDE\\plugins\\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344\\tools\\bin;${env:PATH}"
-                }
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
                 "$gcc"
             ],
             "group": {
-                "kind": "test",
+                "kind": "build",
                 "isDefault": true
             },
             "presentation": {
@@ -85,7 +84,11 @@
                 "STM32: Build Debug",
                 "STM32: Flash Debug (ST-LINK)"
             ],
-            "problemMatcher": []
+            "problemMatcher": [],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
         }
     ]
 }

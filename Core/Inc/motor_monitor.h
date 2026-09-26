@@ -19,6 +19,10 @@ typedef struct {
 void MotorFeedback_Record(MotorFeedback *sample, float rpm, uint32_t now);
 uint8_t MotorFeedback_FreshMask(const MotorFeedback samples[4], uint32_t now);
 void MotorStop_Request(MotorStopMonitor *monitor, uint32_t now);
+void MotorStop_UpdateMasked(MotorStopMonitor *monitor,
+                            const MotorFeedback samples[4],
+                            uint8_t required_mask,
+                            uint8_t tx_pending, uint32_t now);
 void MotorStop_Update(MotorStopMonitor *monitor, const MotorFeedback samples[4],
                       uint8_t tx_pending, uint32_t now);
 const char *MotorStop_Name(MotorStopState state);

@@ -25,10 +25,17 @@ void MotorStop_Request(MotorStopMonitor *monitor, uint32_t now)
     monitor->requested_tick = now;
     monitor->baseline_valid = 0U;
 }
-void MotorStop_Update(MotorStopMonitor *monitor, const MotorFeedback samples[4],
-                      uint8_t tx_pending, uint32_t now)
+void MotorStop_UpdateMasked(MotorStopMonitor *monitor,
+                            const MotorFeedback samples[4],
+                            uint8_t required_mask,
+                            uint8_t tx_pending, uint32_t now)
 {
-    uint8_t i, stopped = MotorFeedback_FreshMask(samples, now) == 0x0FU;
+    uint8_t i;
+    uint8_t stopped;
+
+    required_mask &= 0x0FU;
+    stopped = required_mask != 0U &&
+              (MotorFeedback_FreshMask(samples, now) & required_mask) == required_mask;
     if (monitor->state == MOTOR_STOP_IDLE) return;
     if (!monitor->baseline_valid && !tx_pending) {
         for (i = 0U; i < 4U; ++i) monitor->baseline[i] = samples[i].sequence;
@@ -38,6 +45,7 @@ void MotorStop_Update(MotorStopMonitor *monitor, const MotorFeedback samples[4],
     if (!monitor->baseline_valid || tx_pending) stopped = 0U;
     for (i = 0U; i < 4U; ++i) {
         uint32_t count = samples[i].sequence - monitor->baseline[i];
+        if (!(required_mask & (uint8_t)(1U << i))) continue;
         if (count < 2U || count >= 0x80000000UL || samples[i].zero_streak < 2U)
             stopped = 0U;
     }
@@ -49,6 +57,12 @@ void MotorStop_Update(MotorStopMonitor *monitor, const MotorFeedback samples[4],
     } else if (monitor->state == MOTOR_STOP_CONFIRMED) {
         monitor->state = MOTOR_STOP_WAIT_FEEDBACK;
     }
+}
+
+void MotorStop_Update(MotorStopMonitor *monitor, const MotorFeedback samples[4],
+                      uint8_t tx_pending, uint32_t now)
+{
+    MotorStop_UpdateMasked(monitor, samples, 0x0FU, tx_pending, now);
 }
 const char *MotorStop_Name(MotorStopState state)
 {

@@ -4,10 +4,13 @@
 #include "mecanum_chassis.h"
 #include "ops9.h"
 #include "can.h"
+#include "zdtCan.h"
+#include "zdtEmm.h"
 #include "control_runtime.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #define LLM_TUNE_OVERTRAVEL_MM       50.0f
 #define LLM_TUNE_WRONG_DIR_MM        25.0f
@@ -18,9 +21,11 @@
 #define LLM_TUNE_CROSS_TRACK_MM      50.0f
 #define LLM_TUNE_YAW_TRANSLATION_MM  50.0f
 #define LLM_TUNE_TELEMETRY_PERIOD_MS 50U
+#define LLM_TUNE_ARM_TIMEOUT_MS      2000U
 
 typedef enum {
     LLM_TUNE_STATE_WAIT = 0,
+    LLM_TUNE_STATE_ARMING,
     LLM_TUNE_STATE_RUN
 } LLM_TuneState_t;
 
@@ -107,64 +112,15 @@ uint8_t LLM_TunerIsRunning(void)
     return tuner_state == LLM_TUNE_STATE_RUN ? 1U : 0U;
 }
 
-uint8_t LLM_TunerGetState(void)
-{
-    return (uint8_t)tuner_state;
-}
-
-void LLM_TunerAbort(void)
-{
-    tune_output = 0.0f;
-    tune_settle_cycles = 0U;
-    tuner_state = LLM_TUNE_STATE_WAIT;
-}
-
-void LLM_TunerResetSession(void)
-{
-    LLM_TunerAbort();
-    tune_round_count = 0U;
-    tune_direction = 1.0f;
-}
-
-void LLM_TunerStartRound(void)
+static void LLM_TunerBeginRun(uint32_t now)
 {
     const OPS9_Snapshot ops = OPS9_GetSnapshot();
-    uint32_t last_ops_tick = ops.last_update_tick;
-    uint32_t now = HAL_GetTick();
     PID_Controller *pid = LLM_TunerGetPid();
     float center_x;
     float center_y;
 
-    if (pid == NULL || tuner_pid_x == NULL ||
-        tuner_pid_y == NULL || tuner_pid_yaw == NULL) {
-        StopAllMotors();
-        LLM_TunerAbort();
-        printf("# ERROR TUNER NOT INITIALIZED\r\n");
-        return;
-    }
-    if (ops.frame_count == 0U ||
-        (uint32_t)(now - last_ops_tick) > LLM_TUNE_OPS_TIMEOUT_MS) {
-        StopAllMotors();
-        LLM_TunerAbort();
-        printf("# ERROR OPS NOT READY\r\n");
-        return;
-    }
-    if (!Mecanum_FeedbackReady(0x0FU)) {
-        StopAllMotors(); LLM_TunerAbort();
-        printf("# ERROR MOTOR FEEDBACK NOT READY\r\n");
-        return;
-    }
-    if (tune_round_count >= LLM_TUNE_MAX_SESSION_ROUNDS) {
-        StopAllMotors();
-        LLM_TunerAbort();
-        printf("# ERROR TUNE ROUND LIMIT MAX=%lu\r\n",
-               (unsigned long)LLM_TUNE_MAX_SESSION_ROUNDS);
-        return;
-    }
-
     if (tune_round_count > 0U) tune_direction = -tune_direction;
     tune_round_count++;
-    StopAllMotors();
     PID_Reset(tuner_pid_x);
     PID_Reset(tuner_pid_y);
     PID_Reset(tuner_pid_yaw);
@@ -186,19 +142,81 @@ void LLM_TunerStartRound(void)
            tune_direction, ops.x_mm, ops.y_mm, ops.yaw_deg, center_x, center_y);
 }
 
+uint8_t LLM_TunerGetState(void)
+{
+    return (uint8_t)tuner_state;
+}
+
+void LLM_TunerAbort(void)
+{
+    tune_output = 0.0f;
+    tune_settle_cycles = 0U;
+    tuner_state = LLM_TUNE_STATE_WAIT;
+}
+
+void LLM_TunerResetSession(void)
+{
+    LLM_TunerAbort();
+    tune_round_count = 0U;
+    tune_direction = 1.0f;
+}
+
+void LLM_TunerStartRound(void)
+{
+    uint32_t now = HAL_GetTick();
+    PID_Controller *pid = LLM_TunerGetPid();
+
+    if (pid == NULL || tuner_pid_x == NULL ||
+        tuner_pid_y == NULL || tuner_pid_yaw == NULL) {
+        StopAllMotors();
+        LLM_TunerAbort();
+        printf("# ERROR TUNER NOT INITIALIZED\r\n");
+        return;
+    }
+    if (tune_round_count >= LLM_TUNE_MAX_SESSION_ROUNDS) {
+        StopAllMotors();
+        LLM_TunerAbort();
+        printf("# ERROR TUNE ROUND LIMIT MAX=%lu\r\n",
+               (unsigned long)LLM_TUNE_MAX_SESSION_ROUNDS);
+        return;
+    }
+
+    /* Stopping cancels old speed/query mailboxes. Wait for zero-speed feedback
+     * and any CAN recovery before announcing a runnable round. */
+    StopAllMotors();
+    /* ARMING waits for stop confirmation and the common idle recovery gate. */
+    tune_start_time = now;
+    tuner_state = LLM_TUNE_STATE_ARMING;
+    printf("# ROUND ARMING AXIS=%s\r\n", LLM_TunerAxisName(tuner_axis));
+}
+
 void LLM_TunerStopRound(const char *reason)
 {
     const OPS9_Snapshot ops = OPS9_GetSnapshot();
+    ZDT_CAN_Stats_t can_stats;
+    uint32_t can_error = HAL_CAN_GetError(&hcan1);
     float center_x;
     float center_y;
 
+    ZDT_CAN_GetStats(&can_stats);
     StopAllMotors();
     LLM_TunerAbort();
     Motion_OpsToCenter(ops.x_mm, ops.y_mm, ops.yaw_deg, &center_x, &center_y);
-    printf("# ROUND STOP %s AXIS=%s X=%.2f Y=%.2f YAW=%.2f "
-           "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
-           reason, LLM_TunerAxisName(tuner_axis), ops.x_mm, ops.y_mm, ops.yaw_deg,
-           center_x, center_y);
+    if (strcmp(reason, "CAN FAULT") == 0) {
+        printf("# ROUND STOP CAN FAULT ERROR=0x%08lX ESR=0x%08lX "
+               "FATAL_CB=%lu TX_TIMEOUT=%lu AXIS=%s X=%.2f Y=%.2f YAW=%.2f "
+               "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
+               (unsigned long)can_error, (unsigned long)can_stats.esr,
+               (unsigned long)can_stats.fatal_error_callbacks,
+               (unsigned long)can_stats.tx_timeout,
+               LLM_TunerAxisName(tuner_axis), ops.x_mm, ops.y_mm, ops.yaw_deg,
+               center_x, center_y);
+    } else {
+        printf("# ROUND STOP %s AXIS=%s X=%.2f Y=%.2f YAW=%.2f "
+               "CENTER_X=%.2f CENTER_Y=%.2f\r\n",
+               reason, LLM_TunerAxisName(tuner_axis), ops.x_mm, ops.y_mm, ops.yaw_deg,
+               center_x, center_y);
+    }
 }
 
 void LLM_TunerProcess(uint32_t now)
@@ -234,6 +252,41 @@ void LLM_TunerProcess(uint32_t now)
     uint32_t elapsed_ms;
     float dt_s;
 
+    if (tuner_state == LLM_TUNE_STATE_ARMING) {
+        uint8_t ops_ready;
+        uint8_t feedback_ready;
+        uint8_t stop_confirmed;
+        uint8_t can_ready;
+        uint8_t required_mask;
+        now = HAL_GetTick();
+        ops_ready = isfinite(ops.x_mm) && isfinite(ops.y_mm) &&
+                    isfinite(ops.yaw_deg) && ops.frame_count > 0U &&
+                    (uint32_t)(now - ops.last_update_tick) <= LLM_TUNE_OPS_TIMEOUT_MS;
+        /*
+         * 必须跟随 MOTOR MASK：硬编码 0x0F 会让单电机台架测试永远卡在
+         * ARMING，2 秒后报出含糊的 MOTOR FEEDBACK NOT READY。MASK=0x0F 时
+         * 与原来的四轮要求完全等价。
+         */
+        required_mask = Mecanum_GetRequiredMotorMask();
+        feedback_ready = Mecanum_FeedbackReady(required_mask);
+        stop_confirmed = Mecanum_GetStopStatus().state == MOTOR_STOP_CONFIRMED;
+        can_ready = ZDT_CAN_IsReady();
+        if (ops_ready && feedback_ready && stop_confirmed && can_ready) {
+            LLM_TunerBeginRun(now);
+        } else if ((uint32_t)(now - tune_start_time) > LLM_TUNE_ARM_TIMEOUT_MS) {
+            if (!ops_ready) LLM_TunerStopRound("OPS NOT READY");
+            else if (!feedback_ready) {
+                MotorFeedback samples[4];
+                ZDT_Emm_GetFeedback(samples);
+                LLM_TunerStopRound("MOTOR FEEDBACK NOT READY");
+                printf("# ROUND FEEDBACK MASK=0x%02X FRESH=0x%02X\r\n",
+                       required_mask, MotorFeedback_FreshMask(samples, HAL_GetTick()));
+            }
+            else if (!stop_confirmed) LLM_TunerStopRound("STOP NOT CONFIRMED");
+            else LLM_TunerStopRound("CAN NOT READY");
+        }
+        return;
+    }
     if (!LLM_TunerIsRunning()) {
         return;
     }
@@ -257,15 +310,7 @@ void LLM_TunerProcess(uint32_t now)
         LLM_TunerStopRound("OPS LOST");
         return;
     }
-    /*
-     * TUNE 轮次不依赖主机 PING（调参时可不用上位机），但 CAN1 总线故障
-     * 必须与 POSE 控制一样立即停车，不能等到 5 秒轮次超时。
-     */
-    if (HAL_CAN_GetState(&hcan1) != HAL_CAN_STATE_LISTENING ||
-        HAL_CAN_GetError(&hcan1) != HAL_CAN_ERROR_NONE) {
-        LLM_TunerStopRound("CAN FAULT");
-        return;
-    }
+    /* CAN runtime safety is evaluated once by ChassisSafety_Process. */
     /*
      * TUNE 自动轮次固定最多运行 5 秒，并保留 OPS、方向、漂移和越界保护。
      * 为便于使用普通串口助手观察完整输出，调参轮次不依赖主机 PING。

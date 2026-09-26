@@ -283,7 +283,7 @@ static void HostLink_SetChassisEnabled(uint8_t enable)
 
     /* 四轮闭环驱动器按顺序切换使能状态；使能且零速时提供静止保持力矩。 */
     for (id = 1U; id <= 4U; id++) {
-        result = ZDT_Emm_EnableSingleMotor(id, enable);
+        result = ZDT_Emm_EnableByID(id, enable);
         Mecanum_ReportCanTxResult(result);
         if (result != 0U) all_ok = 0U;
 
@@ -312,8 +312,9 @@ static uint8_t HostLink_ProcessCommand(const char *command)
     }
     if (strcmp(command, "MOTOR STOP STATUS") == 0) {
         MotorStopMonitor stop = Mecanum_GetStopStatus();
-        printf("# MOTOR STOP STATE=%s FRESH=%u ELAPSED_MS=%lu\r\n",
-               MotorStop_Name(stop.state), Mecanum_FeedbackReady(0x0FU),
+        uint8_t mask = Mecanum_GetRequiredMotorMask();
+        printf("# MOTOR STOP STATE=%s MASK=0x%02X FRESH=%u ELAPSED_MS=%lu\r\n",
+               MotorStop_Name(stop.state), mask, Mecanum_FeedbackReady(mask),
                (unsigned long)(stop.state == MOTOR_STOP_IDLE ? 0U :
                                (stop.state == MOTOR_STOP_CONFIRMED ?
                                 stop.confirmed_tick - stop.requested_tick : HAL_GetTick() - stop.requested_tick)));
@@ -376,6 +377,7 @@ static uint8_t HostLink_ProcessCommand(const char *command)
     }
 
     /* 每次声明或切换主机都先停车、清旧状态，绝不恢复上一个主机的目标。 */
+    (void)Mecanum_SetRequiredMotorMask(0x0FU);
     Robot_StopAllMotion();
     ControlRuntime_ClearFault();
     LLM_TunerResetSession();
@@ -407,6 +409,10 @@ static void HostLink_ProcessWait(uint32_t now)
 static void Robot_SetMode(RobotMode_t mode)
 {
     if (current_robot_mode == mode) {
+        if (mode != ROBOT_MODE_TUNE && Mecanum_GetRequiredMotorMask() != 0x0FU) {
+            (void)Mecanum_SetRequiredMotorMask(0x0FU);
+            (void)StopAllMotors();
+        }
         if (mode == ROBOT_MODE_PLOT) telemetry_mask = TELEMETRY_MASK_BOTH;
         if (mode == ROBOT_MODE_WORK) {
             (void)G6220_SetEnabled(1U);
@@ -417,6 +423,9 @@ static void Robot_SetMode(RobotMode_t mode)
     }
 
     /* 模式切换是安全边界：先停掉旧模式的一切运动，再启用新模式输出。 */
+    if (mode != ROBOT_MODE_TUNE) {
+        (void)Mecanum_SetRequiredMotorMask(0x0FU);
+    }
     Robot_StopAllMotion();
     LLM_TunerResetSession();
     current_robot_mode = mode;
@@ -452,8 +461,7 @@ static const char *ChassisSafety_MotionName(ChassisMotionType_t motion)
 
 static uint8_t ChassisSafety_CanReady(void)
 {
-    return (HAL_CAN_GetState(&hcan1) == HAL_CAN_STATE_LISTENING &&
-            HAL_CAN_GetError(&hcan1) == HAL_CAN_ERROR_NONE) ? 1U : 0U;
+    return ZDT_CAN_IsReady();
 }
 
 static uint8_t ChassisSafety_OpsReady(uint32_t now)
@@ -465,6 +473,12 @@ static uint8_t ChassisSafety_OpsReady(uint32_t now)
             ops.frame_count > 0U &&
             (uint32_t)(now - last_ops_tick) <= LLM_TUNE_OPS_TIMEOUT_MS) ? 1U : 0U;
 }
+
+/* Hardware faults stop immediately. A software fault remains latched through
+ * the existing 100 ms grace; reading its notification cannot restart the timer. */
+#define CAN_FAULT_GRACE_MS 100U
+static uint32_t can_fault_since;
+static uint8_t can_fault_active;
 
 static void ChassisSafety_Stop(ChassisMotionType_t motion, const char *reason)
 {
@@ -478,6 +492,7 @@ static void ChassisSafety_Stop(ChassisMotionType_t motion, const char *reason)
     debug_motor_active = 0U;
     debug_chassis_active = 0U;
     pose_control_active = 0U;
+    can_fault_active = 0U;
     Pose_ResetPlanner();
     (void)G6220_SetEnabled(0U);
     PID_Reset(&pid_x);
@@ -505,18 +520,72 @@ static void ChassisSafety_Process(uint32_t now)
     ChassisMotionType_t motion = ChassisSafety_GetActiveMotion();
     uint8_t needs_ops;
     uint8_t needs_host;
+    uint8_t can_tx_fault;
+    uint8_t required_mask;
 
-    if (motion == CHASSIS_MOTION_NONE) return;
-    if (ControlRuntime_GetStats().fault) { ChassisSafety_Stop(motion, "CONTROL OVERRUN"); return; }
-    if (!Mecanum_FeedbackReady(motion == CHASSIS_MOTION_SINGLE_MOTOR ?
-                              (uint8_t)(1U << (debug_motor_id - 1U)) : 0x0FU)) {
-        ChassisSafety_Stop(motion, "MOTOR FEEDBACK LOST");
+    (void)Mecanum_ConsumeCanTxFault(); /* Notification only. */
+    can_tx_fault = ZDT_CAN_HasFault();
+
+    if (motion == CHASSIS_MOTION_NONE) {
+        /* 空闲期不累计停车证据，否则紧接着开始的运动会被历史故障立刻打断。 */
+        can_fault_active = 0U;
         return;
+    }
+    if (ControlRuntime_GetStats().fault) { ChassisSafety_Stop(motion, "CONTROL OVERRUN"); return; }
+    /*
+     * 单电机台架测试只看被测试电机；TUNE 轮次遵循 MOTOR MASK（PID 调参在
+     * MASK=0x0F 时等价于原来的四轮要求）；POSE 只在整车上运行。
+     */
+    if (motion == CHASSIS_MOTION_SINGLE_MOTOR) {
+        required_mask = (uint8_t)(1U << (debug_motor_id - 1U));
+    } else if (motion == CHASSIS_MOTION_TUNE_ROUND) {
+        required_mask = Mecanum_GetRequiredMotorMask();
+    } else {
+        required_mask = 0x0FU;
+    }
+    {
+        MotorFeedback samples[4];
+        uint32_t feedback_now;
+        uint8_t fresh_mask;
+        ZDT_Emm_GetFeedback(samples);
+        feedback_now = HAL_GetTick();
+        fresh_mask = MotorFeedback_FreshMask(samples, feedback_now);
+        if ((fresh_mask & required_mask) != required_mask) {
+            /* 故障瞬间记录哪一路超过 300 ms；停车判据与门槛保持不变。 */
+            printf("# CAN FEEDBACK LOST MASK=0x%02X FRESH=0x%02X "
+                   "AGE_MS=%lu,%lu,%lu,%lu SEQ=%lu,%lu,%lu,%lu\r\n",
+                   required_mask, fresh_mask,
+                   (unsigned long)(feedback_now - samples[0].tick),
+                   (unsigned long)(feedback_now - samples[1].tick),
+                   (unsigned long)(feedback_now - samples[2].tick),
+                   (unsigned long)(feedback_now - samples[3].tick),
+                   (unsigned long)samples[0].sequence,
+                   (unsigned long)samples[1].sequence,
+                   (unsigned long)samples[2].sequence,
+                   (unsigned long)samples[3].sequence);
+            ChassisSafety_Stop(motion, "MOTOR FEEDBACK LOST");
+            return;
+        }
     }
 
     /* CAN状态和四轮实际发送结果对所有运动类型都是共同的硬安全边界。 */
-    if (!ChassisSafety_CanReady() ||
-        Mecanum_ConsumeCanTxFault()) {
+    if (can_tx_fault) {
+        if (!can_fault_active) { can_fault_active = 1U; can_fault_since = now; }
+    } else {
+        can_fault_active = 0U;
+    }
+    if ((can_fault_active &&
+         (uint32_t)(now - can_fault_since) >= CAN_FAULT_GRACE_MS) ||
+        !ZDT_CAN_HardwareReady()) {
+        ZDT_CAN_Stats_t stats;
+        ZDT_CAN_GetStats(&stats);
+        printf("# CAN SAFETY TX_FAULT=%u READY=%u ERR=0x%08lX ESR=0x%08lX "
+               "TX_TIMEOUT=%lu AUTO_REC=%lu STREAK_MS=%lu\r\n",
+               can_tx_fault, ZDT_CAN_IsReady(),
+               (unsigned long)HAL_CAN_GetError(&hcan1), (unsigned long)stats.esr,
+               (unsigned long)stats.tx_timeout, (unsigned long)stats.auto_recoveries,
+               (unsigned long)(can_fault_active ?
+                               (uint32_t)(now - can_fault_since) : 0U));
         ChassisSafety_Stop(motion, "CAN FAULT");
         return;
     }
@@ -630,7 +699,7 @@ static PoseStartResult_t Pose_StartTarget(float pose_x, float pose_y,
     pose_target_y_mm = pose_y;
     pose_target_yaw_deg = pose_yaw;
     pose_translation_yaw_deg = ops.yaw_deg;
-    Mecanum_ClearCanTxFault();
+
     Pose_ResetPlanner();
     pose_last_control_time = now;
     pose_start_time = now;
@@ -1068,6 +1137,7 @@ static void Host_PrintHelp(void)
     printf("# HELP STATUS | PING | STOP | RESET | OPS STATUS | OPS MONITOR ON|OFF | OPS ZERO\r\n");
     printf("# HELP PROTO EMM|X | CAN STATUS | MOTOR EN|DIS <id>\r\n");
     printf("# HELP CONTROL STATUS | MOTOR FEEDBACK | MOTOR STOP STATUS | HOST RX STATUS\r\n");
+    printf("# HELP MOTOR MASK STATUS|0x01..0x0F (TUNE only; bit0..3 = ID1..4)\r\n");
     printf("# HELP MOTOR RUN <id> <signed_rpm> [ms] | MOTOR STOP <id>|ALL | MOTOR GET <id>\r\n");
     printf("# HELP MOVE FWD|BACK|LEFT|RIGHT [mps] [ms] | TURN CW|CCW [radps] [ms] | MOVE STOP\r\n");
     printf("# HELP POSE SET <x_mm> <y_mm> <yaw_deg> | POSE STOP | POSE STATUS\r\n");
@@ -1087,16 +1157,22 @@ static void Host_PrintHelp(void)
 static void Motor_ProcessFeedbackPolling(uint32_t now)
 {
     uint8_t result;
+    uint8_t mask;
+    uint8_t id;
 
     if ((uint32_t)(now - motor_feedback_poll_tick) < MOTOR_FEEDBACK_POLL_MS) {
         return;
     }
 
     motor_feedback_poll_tick = now;
-    result = ZDT_Emm_ReadSpeedByID(motor_feedback_poll_id);
-    Mecanum_ReportCanTxResult(result);
+    mask = Mecanum_GetRequiredMotorMask();
+    id = motor_feedback_poll_id;
     motor_feedback_poll_id++;
     if (motor_feedback_poll_id > 4U) motor_feedback_poll_id = 1U;
+    if (!(mask & (uint8_t)(1U << (id - 1U)))) return;
+    result = ZDT_Emm_ReadSpeedByID(id);
+    /* 查询轮询的入队失败只是瞬时拥塞，不能升级成会触发停车判定的运动故障。 */
+    Mecanum_ReportPollResult(result);
 }
 
 static void Telemetry_Process(uint32_t now)
@@ -1231,6 +1307,8 @@ static void Ops_PrintStatus(void)
 }
 
 static uint8_t motor_feedback_print_mask;
+/* MOTOR RUN 后打印一次 0xF6 的 ACK，用于确认电机是否真的接受了速度命令。 */
+static uint8_t motor_ack_print_mask;
 
 static void Motor_ProcessFeedback(void)
 {
@@ -1257,9 +1335,15 @@ static void Motor_ProcessFeedback(void)
             /*
              * 速度闭环每 20 ms 给四个电机发送一次 0xF6，正常 ACK 会形成约
              * 200 行/秒的无效串口流量。仅静默正常 0x02 ACK，条件/格式等异常仍输出。
+             * MOTOR RUN 之后允许每个电机打印一次 ACK，便于区分“电机没收到命令”
+             * 和“电机收到命令但没有转动”。
              */
-            if (event.function_code == 0xF6U && event.value == 0x02U) {
-                continue;
+            if (event.function_code == 0xF6U) {
+                if (motor_ack_print_mask & (uint8_t)(1U << (event.motor_id - 1U))) {
+                    motor_ack_print_mask &= (uint8_t)~(1U << (event.motor_id - 1U));
+                } else if (event.value == 0x02U) {
+                    continue;
+                }
             }
             if (event.value == 0x02U) result = "OK";
             else if (event.value == 0xE2U) result = "CONDITION";
@@ -1275,6 +1359,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
 {
     const OPS9_Snapshot ops = OPS9_GetSnapshot();
     unsigned int id;
+    unsigned int motor_mask;
     float rpm = 0.0f;
     unsigned long duration_ms = DEBUG_MOTOR_DEFAULT_MS;
     unsigned long move_duration_ms = DEBUG_MOVE_DEFAULT_MS;
@@ -1287,6 +1372,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
     float v1, v2, v3, v4;
     float pose_x, pose_y, pose_yaw;
     float center_x, center_y;
+    char extra;
     int fields;
     uint8_t result_a;
     uint8_t result_b;
@@ -1415,6 +1501,28 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
                (unsigned long)HAL_CAN_GetTxMailboxesFreeLevel(&hcan1),
                (unsigned long)stats.tx_ok, (unsigned long)stats.tx_error,
                (unsigned long)stats.rx_count, stats.last_tx_result);
+        printf("# CAN TX_QUEUED=%lu TX_ABORT=%lu TX_TIMEOUT=%lu ERR_CB=%lu ERR_FATAL=%lu ERR_LATCH=0x%08lX ACK_SEEN=%u BOFF_SEEN=%u\r\n",
+               (unsigned long)stats.tx_queued, (unsigned long)stats.tx_aborted,
+               (unsigned long)stats.tx_timeout, (unsigned long)stats.error_callbacks,
+               (unsigned long)stats.fatal_error_callbacks,
+               (unsigned long)stats.error_latched,
+               (unsigned int)!!(stats.error_latched & HAL_CAN_ERROR_ACK),
+               (unsigned int)!!(stats.error_latched & HAL_CAN_ERROR_BOF));
+        printf("# CAN READY=%u RECOVERIES=%lu AUTO_REC=%lu STALL_REC=%lu TX_FAULT=%u POLL_FAIL=%lu MASK=0x%02X GEN=%lu REC_PHASE=%u\r\n",
+               ZDT_CAN_IsReady(), (unsigned long)stats.recoveries,
+               (unsigned long)stats.auto_recoveries,
+               (unsigned long)stats.stall_recoveries,
+               stats.tx_fault,
+               (unsigned long)Mecanum_GetPollFailures(),
+               Mecanum_GetRequiredMotorMask(),
+               (unsigned long)stats.fault_generation, stats.recovery_phase);
+        printf("# CAN ESR=0x%08lX TSR=0x%08lX TEC=%lu REC=%lu BOFF=%u EPVF=%u EWGF=%u\r\n",
+               (unsigned long)stats.esr, (unsigned long)stats.tsr,
+               (unsigned long)((stats.esr >> 16) & 255U),
+               (unsigned long)((stats.esr >> 24) & 255U),
+               (unsigned int)!!(stats.esr & CAN_ESR_BOFF),
+               (unsigned int)!!(stats.esr & CAN_ESR_EPVF),
+               (unsigned int)!!(stats.esr & CAN_ESR_EWGF));
         return 1U;
     }
 
@@ -1512,6 +1620,35 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         return 1U;
     }
 
+    if (strcmp(command, "MOTOR MASK STATUS") == 0) {
+        uint8_t mask = Mecanum_GetRequiredMotorMask();
+        printf("# MOTOR MASK=0x%02X ID1=%u ID2=%u ID3=%u ID4=%u MODE=%s\r\n",
+               mask,
+               (mask & 0x01U) != 0U, (mask & 0x02U) != 0U,
+               (mask & 0x04U) != 0U, (mask & 0x08U) != 0U,
+               RobotMode_Name(current_robot_mode));
+        return 1U;
+    }
+
+    if (strncmp(command, "MOTOR MASK ", 11U) == 0) {
+        fields = sscanf(command, "MOTOR MASK %x %c", &motor_mask, &extra);
+        if (current_robot_mode != ROBOT_MODE_TUNE) {
+            printf("# ERROR MOTOR MASK REQUIRES MODE=TUNE CURRENT=%s\r\n",
+                   RobotMode_Name(current_robot_mode));
+        } else if (fields != 1 || motor_mask == 0U || motor_mask > 0x0FU) {
+            printf("# ERROR MOTOR MASK 0x01..0x0F\r\n");
+        } else {
+            Robot_StopAllMotion();
+            (void)Mecanum_SetRequiredMotorMask((uint8_t)motor_mask);
+            motor_feedback_poll_id = 1U;
+            motor_feedback_poll_tick = 0U;
+            (void)StopAllMotors();
+            printf("# MOTOR MASK=0x%02X POLL=SELECTED MOTION=STOPPED\r\n",
+                   Mecanum_GetRequiredMotorMask());
+        }
+        return 1U;
+    }
+
     if (sscanf(command, "POSE SET %f %f %f", &pose_x, &pose_y, &pose_yaw) == 3) {
         PoseStartResult_t start_result = Pose_StartTarget(
             pose_x, pose_y, pose_yaw, 0U);
@@ -1584,6 +1721,10 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
             printf("# ERROR MODE REQUIRED=TUNE|PLOT CURRENT=WORK\r\n");
             return 1U;
         }
+        if (Mecanum_GetRequiredMotorMask() != 0x0FU) {
+            printf("# ERROR CHASSIS MOVE REQUIRES MOTOR MASK=0x0F\r\n");
+            return 1U;
+        }
         if (!ChassisSafety_CanReady() || !ChassisSafety_OpsReady(HAL_GetTick())) {
             printf("# ERROR DEBUG CHASSIS SAFETY CAN=%u OPS=%u\r\n",
                    ChassisSafety_CanReady(), ChassisSafety_OpsReady(HAL_GetTick()));
@@ -1596,7 +1737,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         pose_control_active = 0U;
         Pose_ResetPlanner();
         LLM_TunerAbort();
-        Mecanum_ClearCanTxFault();
+
         Mecanum_Kinematics(0.0f, 0.0f, vz, &v1, &v2, &v3, &v4);
         SetAllMotorsSpeed(v1, v2, v3, v4);
         debug_chassis_active = 1U;
@@ -1634,6 +1775,10 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
             printf("# ERROR MODE REQUIRED=TUNE|PLOT CURRENT=WORK\r\n");
             return 1U;
         }
+        if (Mecanum_GetRequiredMotorMask() != 0x0FU) {
+            printf("# ERROR CHASSIS MOVE REQUIRES MOTOR MASK=0x0F\r\n");
+            return 1U;
+        }
         if (!ChassisSafety_CanReady() || !ChassisSafety_OpsReady(HAL_GetTick())) {
             printf("# ERROR DEBUG CHASSIS SAFETY CAN=%u OPS=%u\r\n",
                    ChassisSafety_CanReady(), ChassisSafety_OpsReady(HAL_GetTick()));
@@ -1645,7 +1790,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         pose_control_active = 0U;
         Pose_ResetPlanner();
         LLM_TunerAbort();
-        Mecanum_ClearCanTxFault();
+
         Mecanum_Kinematics(vx, vy, 0.0f, &v1, &v2, &v3, &v4);
         SetAllMotorsSpeed(v1, v2, v3, v4);
         debug_chassis_active = 1U;
@@ -1659,7 +1804,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
-            result_a = ZDT_Emm_EnableSingleMotor((uint8_t)id, 1U);
+            result_a = ZDT_Emm_EnableByID((uint8_t)id, 1U);
             printf("# MOTOR EN ID=%u TX=%u\r\n", id, result_a);
         }
         return 1U;
@@ -1669,8 +1814,8 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
-            ZDT_Emm_SetSingleMotorSpeed((uint8_t)id, 0.0f);
-            result_a = ZDT_Emm_EnableSingleMotor((uint8_t)id, 0U);
+            ZDT_Emm_SetSpeedByID((uint8_t)id, 0.0f);
+            result_a = ZDT_Emm_EnableByID((uint8_t)id, 0U);
             if (debug_motor_active && debug_motor_id == (uint8_t)id) debug_motor_active = 0U;
             printf("# MOTOR DIS ID=%u TX=%u\r\n", id, result_a);
         }
@@ -1681,7 +1826,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
         if (!Motor_IsValidId(id)) {
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
-            result_a = ZDT_Emm_SetSingleMotorSpeed((uint8_t)id, 0.0f);
+            result_a = ZDT_Emm_SetSpeedByID((uint8_t)id, 0.0f);
             if (debug_motor_active && debug_motor_id == (uint8_t)id) debug_motor_active = 0U;
             printf("# MOTOR STOP ID=%u TX=%u\r\n", id, result_a);
         }
@@ -1693,7 +1838,7 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
             printf("# ERROR MOTOR ID 1..4\r\n");
         } else {
             motor_feedback_print_mask |= (uint8_t)(1U << (id - 1U));
-            result_a = ZDT_Emm_ReadSingleMotorSpeed((uint8_t)id);
+            result_a = ZDT_Emm_ReadSpeedByID((uint8_t)id);
 
             result_b = ZDT_Emm_ReadStatusByID((uint8_t)id);
             printf("# MOTOR GET ID=%u TX_SPEED=%u TX_STATE=%u\r\n", id, result_a, result_b);
@@ -1709,14 +1854,25 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
             printf("# ERROR RPM RANGE +/-%.0f NONZERO\r\n", DEBUG_MOTOR_MAX_RPM);
         } else if (duration_ms < 100UL || duration_ms > DEBUG_MOTOR_MAX_MS) {
             printf("# ERROR DURATION 100..%lu MS\r\n", DEBUG_MOTOR_MAX_MS);
+        } else if (!(Mecanum_GetRequiredMotorMask() &
+                     (uint8_t)(1U << (id - 1U)))) {
+            printf("# ERROR MOTOR ID=%u NOT IN MASK=0x%02X\r\n",
+                   id, Mecanum_GetRequiredMotorMask());
         } else {
             /* 调试运动仅限 TUNE/PLOT；WORK 模式下唯一运动源是 POSE SET（受心跳与安全检查保护）。 */
             if (current_robot_mode == ROBOT_MODE_WORK) {
                 printf("# ERROR MODE REQUIRED=TUNE|PLOT CURRENT=WORK\r\n");
                 return 1U;
             }
+            /* Motion admission never clears the transport fault latch. */
             if (!ChassisSafety_CanReady()) {
-                printf("# ERROR MOTOR RUN CAN NOT READY\r\n");
+                ZDT_CAN_Stats_t stats;
+                ZDT_CAN_GetStats(&stats);
+                printf("# ERROR MOTOR RUN CAN NOT READY STATE=%u ERR=0x%08lX "
+                       "ESR=0x%08lX TX_TIMEOUT=%lu\r\n",
+                       (unsigned int)HAL_CAN_GetState(&hcan1),
+                       (unsigned long)HAL_CAN_GetError(&hcan1),
+                       (unsigned long)stats.esr, (unsigned long)stats.tx_timeout);
                 return 1U;
             }
             StopAllMotors();
@@ -1724,10 +1880,27 @@ static uint8_t Host_ProcessOperationalCommand(const char *command)
             pose_control_active = 0U;
             Pose_ResetPlanner();
             LLM_TunerAbort();
-            Mecanum_ClearCanTxFault();
-            result_a = ZDT_Emm_EnableSingleMotor((uint8_t)id, 1U);
+            /*
+             * StopAllMotors() 的邮箱撤销/清队列有可能再次锁存一次瞬时发送故障；
+             * 必须在真正下发速度之前再确认一次，否则刚发出去的速度会被
+             * ChassisSafety_Process 立刻当成 CAN FAULT 用零速覆盖掉。
+             */
 
-            result_b = ZDT_Emm_SetSingleMotorSpeed((uint8_t)id, rpm);
+            if (!ChassisSafety_CanReady()) {
+                ZDT_CAN_Stats_t stats;
+                ZDT_CAN_GetStats(&stats);
+                printf("# ERROR MOTOR RUN CAN NOT READY AFTER STOP STATE=%u "
+                       "ERR=0x%08lX ESR=0x%08lX TX_TIMEOUT=%lu\r\n",
+                       (unsigned int)HAL_CAN_GetState(&hcan1),
+                       (unsigned long)HAL_CAN_GetError(&hcan1),
+                       (unsigned long)stats.esr, (unsigned long)stats.tx_timeout);
+                return 1U;
+            }
+            /* 让下一次 0xF6 的 ACK 可见，便于确认电机是否真正接受了速度命令。 */
+            motor_ack_print_mask |= (uint8_t)(1U << (id - 1U));
+            result_a = ZDT_Emm_EnableByID((uint8_t)id, 1U);
+
+            result_b = ZDT_Emm_SetSpeedByID((uint8_t)id, rpm);
             if (result_a == 0U && result_b == 0U) {
                 debug_motor_active = 1U;
                 debug_motor_id = (uint8_t)id;
@@ -1773,8 +1946,6 @@ static void Pose_ProcessControl(uint32_t now)
     float v1, v2, v3, v4;
     uint32_t last_ops_tick;
     uint32_t elapsed_ms;
-    uint32_t can_error;
-    HAL_CAN_StateTypeDef can_state;
 
     if (!pose_control_active) {
         return;
@@ -1785,8 +1956,6 @@ static void Pose_ProcessControl(uint32_t now)
     current_ops_x = ops.x_mm;
     current_ops_y = ops.y_mm;
     current_yaw = ops.yaw_deg;
-    can_state = HAL_CAN_GetState(&hcan1);
-    can_error = HAL_CAN_GetError(&hcan1);
 
     if (!isfinite(current_ops_x) || !isfinite(current_ops_y) || !isfinite(current_yaw) ||
         ops.frame_count == 0U ||
@@ -1796,7 +1965,7 @@ static void Pose_ProcessControl(uint32_t now)
          (uint32_t)(now - last_host_command_tick) > LLM_TUNE_HOST_TIMEOUT_MS) ||
         (current_robot_mode == ROBOT_MODE_TUNE &&
          (uint32_t)(now - pose_start_time) > POSE_TUNE_TIMEOUT_MS) ||
-        can_state != HAL_CAN_STATE_LISTENING || can_error != HAL_CAN_ERROR_NONE) {
+        !ChassisSafety_CanReady()) {
         pose_control_active = 0U;
         Pose_ResetPlanner();
         StopAllMotors();
@@ -2109,6 +2278,11 @@ static void Host_ProcessCommand(void)
                    RobotMode_Name(current_robot_mode));
             return;
         }
+        if (Mecanum_GetRequiredMotorMask() != 0x0FU) {
+            /* 掩码在 TUNE 中同样生效：0x0F 是整车自动调参，其余为台架验证。 */
+            printf("# WARN PID TUNE MASK=0x%02X FULL_CHASSIS=0x0F\r\n",
+                   Mecanum_GetRequiredMotorMask());
+        }
         requested_axis = LLM_TunerGetAxis();
         pid = LLM_TunerGetPid();
         kp_max = requested_axis == LLM_TUNE_AXIS_YAW ? LLM_TUNE_YAW_KP_MAX : LLM_TUNE_KP_MAX;
@@ -2126,7 +2300,7 @@ static void Host_ProcessCommand(void)
             debug_chassis_active = 0U;
             pose_control_active = 0U;
             Pose_ResetPlanner();
-            Mecanum_ClearCanTxFault();
+
             LLM_TunerStartRound();
         } else {
             printf("# ERROR PID LIMIT P<=%.4f I<=%.5f D<=%.4f\r\n",
@@ -2212,6 +2386,7 @@ void RobotApp_Init(void)
 
   // 3. 初始化 4 个电机
   ZDT_Emm_InitAll();
+  (void)Mecanum_SetRequiredMotorMask(0x0FU);
 
   // 4. 上电等待阶段四轮保持零速使能，用闭环保持力矩防止外力造成车体偏移。
   Boot_ServiceDelay(100);
@@ -2227,9 +2402,10 @@ void RobotApp_Init(void)
   //7.初始化PID参数
   // 注意：坐标单位是 mm，误差 1000mm 时，乘以 Kp=0.001，算出的速度正好是 1.0 m/s
     Pose_InitMotionProfile();
-    PID_Init(&pid_x,   0.001f, 0.0f, 0.0f, POSE_SPEED_DEFAULT_MPS, 5000.0f);
-    PID_Init(&pid_y,   0.001f, 0.0f, 0.0f, POSE_SPEED_DEFAULT_MPS, 5000.0f);
-    PID_Init(&pid_yaw, 0.01f,  0.0f, 0.0f, POSE_YAW_SPEED_DEFAULT_RADPS, 1000.0f);
+    /* 实机分轴调参并完成稳定性验证后的基线参数。 */
+    PID_Init(&pid_x,   0.00495f, 0.0f,     0.0f, POSE_SPEED_DEFAULT_MPS, 5000.0f);
+    PID_Init(&pid_y,   0.0018f,  0.0f,     0.0f, POSE_SPEED_DEFAULT_MPS, 5000.0f);
+    PID_Init(&pid_yaw, 0.02f,    0.000015f, 0.0f, POSE_YAW_SPEED_DEFAULT_RADPS, 1000.0f);
     LLM_TunerInit(&pid_x, &pid_y, &pid_yaw);
 
     StopAllMotors();
@@ -2291,7 +2467,7 @@ void RobotApp_Process(void)
       if (debug_motor_active && (int32_t)(now - debug_motor_stop_tick) >= 0)
       {
           Mecanum_ReportCanTxResult(
-              ZDT_Emm_SetSingleMotorSpeed(debug_motor_id, 0.0f));
+              ZDT_Emm_SetSpeedByID(debug_motor_id, 0.0f));
           printf("# MOTOR AUTO STOP ID=%u\r\n", debug_motor_id);
           debug_motor_active = 0U;
       }
@@ -2311,6 +2487,14 @@ void RobotApp_Process(void)
 
       Motor_ProcessFeedbackPolling(HAL_GetTick());
       ZDT_CAN_Process(HAL_GetTick());
+      if (ZDT_CAN_RecoverWhenIdle(
+              ChassisSafety_GetActiveMotion() == CHASSIS_MOTION_NONE &&
+              Mecanum_FeedbackReady(Mecanum_GetRequiredMotorMask()) &&
+              Mecanum_GetStopStatus().state == MOTOR_STOP_CONFIRMED)) {
+
+          printf("# CAN RECOVERED MOTION=STOPPED MASK=0x%02X\r\n",
+                 Mecanum_GetRequiredMotorMask());
+      }
       if (active_host_link != HOST_LINK_NONE) {
           Telemetry_Process(now);
       }

@@ -55,12 +55,14 @@
 
 <h1>物流小车项目 · 主要文件函数参考手册</h1>
 <p class="sub">STM32F407 下位机 + 树莓派上位机（工创赛智能物流搬运）。
-当前工作树基于提交 <code>39ec12c "Merge PR #2: versioned binary pose-goal protocol"</code>，
-已修订为主机协议 V4 + 二进制 wire v2 + 能力协商/原子目标/异步遥测；视觉与任务层职责不变，184/184 测试通过。
+当前基线为提交 <code>3b3b395 "refactor: separate firmware application and protocol boundaries"</code>
+（main 分支；含 741100f 二进制协议加固）。主机协议 V4 + 二进制 wire v2 + 能力协商/原子目标/异步遥测；
+固件已分层重构（robot_app 运行时 + 六个边界模块）；视觉与任务层职责不变。
+验证：192 Pi 测试 + 5 便携 C 套件 + ARM 独立构建 46 单元（警告即错误）。
 图例：<span class="badge fw">下位机</span><span class="badge pi">上位机</span><span class="badge safe">安全关键</span></p>
 
 <nav>
-  <a href="#fw-main">一、下位机 main.c —— 主循环调度</a>
+  <a href="#fw-main">一、下位机 固件分层架构与运行时（robot_app）★</a>
   <a href="#fw-hostlink">二、下位机 HOST LINK 握手协议 V4 ★</a>
   <a href="#fw-mode">三、下位机 模式状态机 WORK/TUNE/PLOT</a>
   <a href="#fw-pose">四、下位机 POSE 二阶段状态机 ★</a>
@@ -91,27 +93,35 @@
 </nav>
 
 <!-- ================================================================ -->
-<h2 id="fw-main">一、下位机 main.c —— 主循环与调度</h2>
-<p class="sub">文件：Core/Src/main.c（运行时实现；协议数值权威源已迁移到 protocol/rpi_binary_protocol.json，当前 HOST_PROTOCOL_VERSION=4）。主循环顺序固定，安全优先：</p>
-<p><code>HostLink_ProcessUartFault(锁存故障停车) → RpiBinary_Process(二进制 RX) → RpiBinary_TxProcess(DMA TX) →
-Host_ProcessCommand(ASCII) → Motor_ProcessFeedback → 刷新tick → HostLink_ProcessWait → ChassisSafety_Process →
-RpiBinary_ProcessSessionTimeout → Pose_ProcessControl → TUNE/调试超时 → 电机反馈轮询* → Telemetry_Process* → HAL_Delay(1)</code><br>
-<span class="sub">* 反馈轮询与遥测仅在主机链路已声明（COM/RPI）时运行；HOST WAIT 期间静默。</span></p>
+<h2 id="fw-main">一、下位机 固件分层架构与运行时 ★（3b3b395 重构）</h2>
+<p class="sub">main.c（曾 2400+ 行）已瘦身为 CubeMX 外壳：只初始化外设并调用 <code>RobotApp_Init()</code> 一次、
+主循环重复 <code>RobotApp_Process()</code>；应用状态唯一拥有者 robot_app.c；HAL 回调统一收口 board_events.c；
+收流分类与共享数学不依赖 ISR/HAL（可便携回归）。协议数值权威源仍为 protocol/rpi_binary_protocol.json（HOST_PROTOCOL_VERSION=4）。
+RobotApp_Process 循环顺序固定，安全优先：</p>
+<p><code>ControlRuntime_Begin(周期统计) → HostUartTx_ConsumeFault/HostLink_ProcessUartFault(锁存故障停车) →
+RpiBinary_Process(二进制 RX) → RpiBinary_TxProcess(DMA TX) → HostUartTx_Process(ASCII 队列) →
+Host_ProcessCommand(ASCII 命令) → Motor_ProcessFeedback → Mecanum_ProcessFeedback → 刷新tick →
+HostLink_ProcessWait → ChassisSafety_Process → RpiBinary_ProcessSessionTimeout → Pose_ProcessControl →
+TUNE/调试超时 → 反馈轮询/遥测/喂狗</code></p>
 
 <table>
-<tr><th>函数</th><th>位置</th><th>作用</th><th>安全 / 备注</th></tr>
-<tr><td class="fn">main</td><td class="loc">L~2247</td><td>外设初始化、二进制 RX/TX 队列初始化、四轮<b>零速使能</b>（保持力矩防外力推动）、G6220 保持失能、进入 HOST WAIT，随后无限主循环</td><td><span class="badge safe">安全</span> 上电即静止保持，绝不自动进入运行态</td></tr>
-<tr><td class="fn">Host_ProcessCommand</td><td class="loc">L~2020</td><td>从 ISR 双缓冲取 ASCII 命令（关中断快照），先经 HostLink_ProcessCommand，再按 HOST WAIT 门禁放行业务命令</td><td><span class="badge safe">安全</span> 见第二章门禁表</td></tr>
-<tr><td class="fn">Host_ProcessOperationalCommand</td><td class="loc">L~1345</td><td>PING/PROTO/HELP/MODE/TELEM/OPS/CAN/G6220/POSE/MOVE/TURN/MOTOR 等运行命令解析与应答</td><td>未知命令 → # ERROR UNKNOWN COMMAND</td></tr>
-<tr><td class="fn">Motor_ProcessFeedback / …Polling</td><td class="loc">L~643/544</td><td>CAN RX 事件排空打印；W8 开启时每 10ms 轮询一台电机速度</td><td>排在安全与控制之后</td></tr>
-<tr><td class="fn">Telemetry_Process</td><td class="loc">L~1179</td><td>ASCII 模式输出 @W/@P；二进制 active 时输出 WHEEL/POSE CRC 帧并每秒附 LINK_STATS（BOTH 25ms 交错，单组20Hz）</td><td>armed 未 active 时保持关闭，切换窗口不泄漏 ASCII 遥测</td></tr>
-<tr><td class="fn">RpiBinary_TxProcess</td><td class="loc">L~830</td><td>从分级有界 TX 队列取帧，经 USART1 DMA 单写者发送；DMA 完成回调释放稳定缓冲</td><td><span class="badge safe">安全</span> fault &gt; control &gt; latest telemetry</td></tr>
-<tr><td class="fn">_write</td><td class="loc">L~2472</td><td>ASCII printf 底层：USART1 阻塞发送，20ms 有限超时；<b>二进制 active 期间直接抑制（return len）</b>，防止文本破坏帧边界与 CRC</td><td>仅服务 COM/TUNE/自检文本；二进制帧走 DMA 队列</td></tr>
-<tr><td class="fn">HAL_UART_RxCpltCallback / ErrorCallback / TxCpltCallback</td><td class="loc">L~2499/2550/2574</td><td>USART2→OPS；USART1 自动分流 ASCII 双缓冲/二进制增量解析；UART 错误 ISR 仅锁存，下一主循环停车拆会话；DMA 完成释放 TX active</td><td><span class="badge safe">安全</span> ISR 不执行阻塞停车/发送</td></tr>
-<tr><td class="fn">HAL_CAN_RxFifo0MsgPendingCallback</td><td class="loc">L~1868</td><td>CAN1→ZDT 电机；CAN2→G6220</td><td>中断内仅入队</td></tr>
-<tr><td class="fn">Robot_StopAllMotion</td><td class="loc">L~259</td><td>全局停止原语：四轮零速 + 清 debug/pose/planner + LLM_TunerAbort + G6220 失能 + 三轴 PID_Reset</td><td><span class="badge safe">安全</span> 只清历史不改 Kp/Ki/Kd</td></tr>
-<tr><td class="fn">Robot_SetMode</td><td class="loc">L~340</td><td>模式切换：先停车清状态再切，回 # MODE …CHANGED=1</td><td><span class="badge safe">安全</span> 切换即清旧运动</td></tr>
+<tr><th>模块 · 函数</th><th>作用</th><th>安全 / 备注</th></tr>
+<tr><td class="fn">main.c</td><td>CubeMX 外设初始化；USER CODE 区仅 RobotApp_Init/Process（新增源文件须被 CubeIDE 构建收录）</td><td><span class="badge safe">安全</span> 上电四轮零速使能保持力矩，G6220 失能，HOST WAIT</td></tr>
+<tr><td class="fn">robot_app.c/h · RobotApp_Init / Process / HostRxComplete / HostError / HostTxComplete / Can2Rx / Write</td><td><b>应用状态唯一拥有者</b>（PID/模式/目标/会话标志/统计）：业务循环、IWDG 喂狗、控制周期统计（CONTROL LOOP_MAX_MS/LATE/OVERRUN/IWDG_RESET 随 STATUS 输出）</td><td><span class="badge safe">安全</span> ISR 共享状态 volatile；全项目仅此文件经 extern 读写这些状态</td></tr>
+<tr><td class="fn">board_events.c</td><td>HAL 回调与 <code>_write</code> 的唯一入口路由：USART1→应用收流、USART2→OPS、CAN1→ZDT、CAN2→G6220</td><td>ISR 只做路由，不执行运动业务与阻塞发送</td></tr>
+<tr><td class="fn">host_rx_router.c/h · HostRx_Init / Feed / PopText / PopFrame / Reset*</td><td><b>硬件无关</b>收流分类器：维护 ASCII 双缓冲与二进制帧队列，按 binary_active 识别字节归属</td><td>不依赖 ISR/HAL——tests/c/test_host_rx_router.c 便携验证（含 STOP 交错/CRC 拒绝/模式切换）</td></tr>
+<tr><td class="fn">host_command_rx.c</td><td>ASCII 命令行提取（保留关中断快照与未消费丢弃语义）</td><td>—</td></tr>
+<tr><td class="fn">host_uart_tx.c · HostUartTx_Process / ConsumeFault / Busy</td><td>ASCII 发送写者（与二进制 DMA 共享 USART1，二进制忙时让路）；UART 错误消费 → host_uart_fault_pending</td><td><span class="badge safe">安全</span> 故障在下一主循环停车拆会话</td></tr>
+<tr><td class="fn">control_runtime.c/h · ControlRuntime_Begin / End</td><td>控制周期测量与超检（late/overrun 计数）</td><td>—</td></tr>
+<tr><td class="fn">motion_math.c/h · Motion_OpsToCenter / Motion_SlewVector2D 等</td><td>POSE/TUNE 共享纯数学：OPS 中心补偿、二维矢量斜坡、制动限幅、角度归一（记录时重定基 angle−reference，消除安装偏置）——无 HAL 依赖</td><td>tests/c/test_motion_math.c：±180° 安装偏置、退化输入、越界包络</td></tr>
+<tr><td class="fn">motor_monitor.c/h · MotorFeedback_Record / FreshMask / MotorStop_Request / Update</td><td><b>新增执行闭环</b>：四轮反馈新鲜度（300ms）+ 停车确认（|RPM|≤1.0 且 600ms 内到零）；新查询命令 MOTOR FEEDBACK / MOTOR STOP STATE</td><td><span class="badge safe">安全</span> "发过零速"升级为"确认已停住"</td></tr>
+<tr><td class="fn">mecanum_chassis.c · Mecanum_ProcessFeedback / Mecanum_FeedbackReady(mask)</td><td>反馈采样记录与新鲜掩码（配合 motor_monitor）；逆解/限幅不变</td><td>—</td></tr>
+<tr><td class="fn">robot_app.c · Robot_StopAllMotion / Robot_SetMode</td><td>全局停止原语（四轮零速+清全部运动+G6220 失能+PID_Reset）/ 模式切换（先停车清状态再切，回 # MODE…CHANGED=1）</td><td><span class="badge safe">安全</span> 只清历史不改 Kp/Ki/Kd；切换即清旧运动</td></tr>
 </table>
+
+<div class="note">构建与 CI：tools/build_firmware.py 仓库内 ARM GCC 独立构建（-Wall -Werror，46 单元，不依赖 IDE 工程清单）；
+tools/run_c_tests.py 便携运行 5 个 C 套件；.github/workflows/ci.yml 执行 schema 生成检查 + C 测试 + Pi 测试 + ARM 构建。
+架构与验证说明见 docs/architecture.md、docs/control-layer-validation.md。</div>
 
 <!-- ================================================================ -->
 <h2 id="fw-hostlink">二、下位机 HOST LINK 握手协议 V4 ★</h2>
@@ -164,9 +174,9 @@ STATUS 增加 HOST= 字段、HELP 增加握手说明。Pi 侧 StartupStateMachin
 <tr><td><span class="st run">ROTATE</span></td><td>到位且稳定 25 周期</td><td>停车 → <code># POSE TARGET … ERROR_MM/ERROR_YAW</code>（唯一到位终态）</td><td><span class="st okk">IDLE</span></td></tr>
 <tr><td>任意阶段</td><td class="warn">OPS 丢失 / HOST LOST(RPI) / CAN 故障 / 越界&gt;10500mm / 非有限 / 超时(TUNE 15s, WORK 35s)</td><td class="warn">直接零速 + G6220 失能 + PID_Reset → # POSE STOP SAFETY</td><td><span class="st term">IDLE</span>（清除目标不恢复）</td></tr>
 </table>
-<p class="sub">辅助函数（不变）：Pose_InitMotionProfile / ResetPlanner / SlewVector2D / SlewScalar /
-BrakeLimitLinear·Yaw / AngleErrorDeg / OpsToChassisCenter / Math_ClampFloat。心跳条件现为
-<code>active_host_link==RPI &amp;&amp; mode!=TUNE</code>。</p>
+<p class="sub">共享数学已迁至 motion_math.c（无 HAL 依赖，POSE/TUNE 共用）：Motion_OpsToCenter / Motion_SlewVector2D /
+角度归一（记录时重定基 angle−reference）/ 制动限幅；会话内安装偏置不引入轨迹误差。心跳条件为
+<code>active_host_link==RPI &amp;&amp; mode!=TUNE</code>；状态机归属 robot_app.c。</p>
 
 <!-- ================================================================ -->
 <h2 id="fw-safety">五、统一安全监督 ChassisSafety ★</h2>
@@ -231,6 +241,7 @@ BrakeLimitLinear·Yaw / AngleErrorDeg / OpsToChassisCenter / Math_ClampFloat。�
 <tr><td class="fn">PID_Init / SetTarget</td><td>初始化 / 设目标</td><td>—</td></tr>
 <tr><td class="fn">PID_Reset</td><td><span class="badge safe">安全</span> 只清 error/last_error/integral，不改 Kp/Ki/Kd 与限幅</td><td>所有停车/发车路径调用</td></tr>
 <tr><td class="fn">PID_CalcError / PID_Calc</td><td>位置式 PID：积分限幅+抗饱和+输出限幅</td><td>20ms 周期</td></tr>
+<tr><td class="fn">PID_ApplyOutput(pid, applied_output)</td><td>记录实际下发输出（计算与执行分离），供 motor_monitor 停车确认链使用</td><td>3b3b395 新增</td></tr>
 </table>
 
 <!-- ================================================================ -->
@@ -241,13 +252,14 @@ BrakeLimitLinear·Yaw / AngleErrorDeg / OpsToChassisCenter / Math_ClampFloat。�
 <tr><td><span class="st run">RUN</span></td><td>每 20ms</td><td>归一化误差→PID→制动限幅→斜坡→交叉轴保持→四轮输出 + 17 列 CSV(50ms)</td><td>继续</td></tr>
 <tr><td><span class="st run">RUN</span></td><td>TARGET 稳定10周期 / 5s / OPS丢 / CAN故障 / 反向 / 横漂 / 越程 / 航向超限</td><td>StopRound(原因) → # ROUND STOP（Pi 侧解析为 SafetyFault 或正常终态）</td><td><span class="st">WAIT</span></td></tr>
 </table>
-<p class="sub">其余：LLM_TunerInit/SetAxis/GetPid/IsRunning/Abort/ResetSession。</p>
+<p class="sub">其余：LLM_TunerInit/SetAxis/GetPid/IsRunning/Abort/ResetSession；数学已共享 motion_math.c，行为不变（3b3b395）。</p>
 
 <!-- ================================================================ -->
 <h2 id="fw-drv">十一、驱动层</h2>
 <table>
 <tr><th>文件 · 函数</th><th>作用</th><th>备注</th></tr>
-<tr><td class="fn">zdtCan.c · ConfigFilter / Send_ExtId / RxFIFO0_Handler / GetStats</td><td>CAN1 过滤启动 / 扩展帧发送(10ms 邮箱超时) / 中断排空 / 统计</td><td><span class="badge safe">安全</span> 失败计数供锁存</td></tr>
+<tr><td class="fn">zdtCan.c · ConfigFilter / ZDT_CAN_Send_ExtId / BeginStop / SendStop / RxFIFO0_Handler / GetStats</td><td>CAN1 过滤启动；<b>异步待发队列</b>（每电机一槽，速度帧新替旧，计 enqueued/replaced/dropped/max_wait）；<b>BeginStop 中止三邮箱 + SendStop 预算式紧急零速</b>（邮箱超时→tx_fault）；使能 5ms 间隔（enable_wait_mask）</td><td><span class="badge safe">安全</span> 3b3b395 重写：CAN 拥塞不积压过期速度帧，紧急停车走独立预算通道</td></tr>
+<tr><td class="fn">mecanum_chassis.c · Mecanum_ProcessFeedback / FeedbackReady</td><td>反馈采样与新鲜掩码（motor_monitor 数据源）</td><td>3b3b395 新增</td></tr>
 <tr><td class="fn">zdtEmm.c · SetSpeedByID / EnableSingleMotor / Read* / RxHandler / PollEvent</td><td>速度帧 0xF6（RPM±3000 限幅）/ 使能 0xF3 / 读 0x35·0x3A / 中断解析入 8 深环形队列 / 主循环消费</td><td>@W 数据源；满丢旧</td></tr>
 <tr><td class="fn">ops9.c · UART_RxCpltCallback / Reset_Zero</td><td>USART2 组帧 → robot_x/y/yaw + 时间戳 / 零点标定</td><td><span class="badge safe">安全</span> OPS 新鲜度依据</td></tr>
 <tr><td class="fn">dm_g6220.c · Init / StartCan / SendCommand / RxFIFO0_Handler / GetFeedback</td><td>CAN2 1Mbit 使能管理与反馈解析</td><td>电机内部闭环；等待/停车/非 WORK 失能</td></tr>
@@ -478,9 +490,10 @@ BrakeLimitLinear·Yaw / AngleErrorDeg / OpsToChassisCenter / Math_ClampFloat。�
 <tr><td class="fn">event_router.py · subscribe / publish</td><td>主循环唯一事件源顺序广播；单消费者异常不影响其他</td><td>各模块绝不自己 get_event</td></tr>
 <tr><td class="fn">jsonl_logger.py</td><td>JSONL 结构化日志：纯旁路 + 有界丢旧 + 独立写盘线程 + LOG_SUMMARY</td><td><span class="badge safe">安全</span> 不反压事件泵/心跳/STOP</td></tr>
 <tr><td class="fn">models.py · Pose / PoseGoal / NavState / GotoReason / GotoResult</td><td>导航数据模型（PoseGoal.profile 默认 precise）</td><td>—</td></tr>
-<tr><td class="fn">main.py · build_serial_factory / <b>build_auto_serial_factory</b> / build_demo_factory / run_loop / main</td><td>入口。自动枚举工厂<b>每次重连重新扫描</b>（支持 Pi 先于 STM32 上电）。run_loop 可选注入 logger / vision_cache / runtime；状态切换时依次调 vision_guard 与 runtime 的 set_control_ready。退出 finally：<b>先 emergency_stop()（排队 STOP）→ runtime.close() → bridge.stop() → logger.close()</b></td><td><span class="badge safe">安全</span> 退出前 STOP 有机会实际写出</td></tr>
+<tr><td class="fn">main.py · build_serial_factory / <b>build_auto_serial_factory</b> / build_demo_factory / run_loop / main</td><td>入口。自动枚举工厂<b>每次重连重新扫描</b>（支持 Pi 先于 STM32 上电）。run_loop 可选注入 logger / vision_cache / runtime；状态切换时依次调 vision_guard 与 runtime 的 set_control_ready。退出 finally：<b>bridge.shutdown() 有界停车交接</b>（打印 written/acknowledged/thread_stopped）→ runtime.close() → logger.close()</td><td><span class="badge safe">安全</span> 退出确认 STOP 写出后再关口</td></tr>
+<tr><td class="fn">serial_bridge.py · shutdown(timeout=0.75) / ShutdownResult</td><td>3b3b395 新增：closing 标志拒收一切新命令（含各 send 路径）→ emergency_stop → <b>限时等待 STOP 实际写出与固件确认</b> → 停线程，返回 stop_written/stop_acknowledged/thread_stopped</td><td><span class="badge safe">安全</span> 退出从"入队即关"升级为"确认写出再关"；断线/无回复如实报告，不假装成功</td></tr>
 <tr><td class="fn">demo.py · FakeFirmware</td><td>固件仿真：HOST V4/wire v2、SESSION_PROBE、二进制 goal/query/event、原子目标+限速；可注入 opcode 84 INVALID_ARGUMENT，验证拒绝后无 POSE_STARTED</td><td>host_proto 默认 4；测试替身不代替 HAL 上板验证</td></tr>
-<tr><td class="fn">telemetry_plotter.py</td><td>W8/P8 曲线。COM 握手流：SerialConnected→estop+HOST LINK COM → Ack→estop+MODE → ModeChanged→TELEM BOTH+release；<b>heartbeat_enabled=False</b>（COM 免心跳）；握手未完成前控制台输入被拒；断线清 host 状态</td><td>退出先 estop 再关桥</td></tr>
+<tr><td class="fn">telemetry_plotter.py</td><td>W8/P8 曲线。COM 握手流：SerialConnected→estop+HOST LINK COM → Ack→estop+MODE → ModeChanged→TELEM BOTH+release；<b>heartbeat_enabled=False</b>（COM 免心跳）；握手未完成前控制台输入被拒；断线清 host 状态</td><td>退出改用 bridge.shutdown()（3b3b395）</td></tr>
 </table>
 
 <!-- ================================================================ -->
@@ -569,7 +582,7 @@ BrakeLimitLinear·Yaw / AngleErrorDeg / OpsToChassisCenter / Math_ClampFloat。�
 <h3>27.1 命令集（stdin 线程→队列，主循环非阻塞消费）</h3>
 <table>
 <tr><th>命令</th><th>行为</th><th>安全 / 备注</th></tr>
-<tr><td class="fn">go</td><td>发车到配置的地图航点（见 25.2 门禁）</td><td>默认 <b>OBSERVE_ONLY</b>：未加 --armed 时一律拒绝</td></tr>
+<tr><td class="fn">go</td><td>发车到配置的地图航点（见 27.2 门禁）</td><td>默认 <b>OBSERVE_ONLY</b>：未加 --armed 时一律拒绝</td></tr>
 <tr><td class="fn">cancel</td><td>route.cancel() 取消当前航点</td><td>—</td></tr>
 <tr><td class="fn">estop</td><td>bridge.emergency_stop() + ready=False + vision.clear()</td><td><span class="badge safe">安全</span> 锁存后重启程序重新自检</td></tr>
 <tr><td class="fn">status / help / quit</td><td>状态 / 命令表 / 退出（EOF 也自动退出）</td><td>退出走 run_loop finally：先 STOP 后关口</td></tr>
@@ -608,17 +621,29 @@ RPI 链路运动受 1.5s HOST LOST 保护，COM 依赖操作员看护 + 固件�
 </div>
 
 <!-- ================================================================ -->
-<h2 id="project-status">项目状态（2026-09-01）</h2>
+<h2 id="project-status">项目状态（2026-09-09）</h2>
 <table>
 <tr><th>项目</th><th>当前状态</th><th>后续动作</th></tr>
-<tr><td>Git 基线</td><td>本轮开发起点为 <code>39ec12c57dacd9d32a6b5aef319f7f430eb1d9c6</code>；本手册与当前 main 源码同步，发布提交以仓库 <code>git rev-parse HEAD</code> 为准；llm-pid-tuner-main 子模块指针未更新</td><td>后续修改继续保持源码、测试、README 与本手册同步</td></tr>
+<tr><td>Git 基线</td><td><code>3b3b395 "refactor: separate firmware application and protocol boundaries"</code>（main 已推送；含 741100f 协议加固）；本手册与当前 main 同步；llm-pid-tuner-main 子模块与机器特定文件保持未提交</td><td>源码、测试、README、docs 与本手册持续同步</td></tr>
 <tr><td>协议基线</td><td>HOST protocol 4；binary wire 2；CAPS <code>0x0000003F</code>；JSON schema 为数值权威，C/Python/Markdown 生成物一致</td><td>改协议必须先改 schema，再生成并运行 <code>--check</code></td></tr>
-<tr><td>自动化验证</td><td><span class="ok">Python unittest 184/184 通过</span>；生成器一致性检查通过；便携式 C 协议测试通过；main.c 主机 GCC 语法检查通过（仅 CMSIS 64位主机指针宽度预期警告）；<code>git diff --check</code> 通过</td><td>保持新增 QUERY 交错、断连 pending 清理、原子限速拒绝三项回归测试</td></tr>
-<tr><td>STM32 构建/尺寸</td><td class="warn">当前 Debug ELF/map（13:44）早于 main.c（13:51），且现有 Debug 生成清单未包含新增 rpi_protocol.c，不能作为本修订尺寸基线</td><td>在 STM32CubeIDE 刷新工程源文件并执行完整 clean build；确认 rpi_protocol.c 入编译后，用 arm-none-eabi-size 记录 text/data/bss/Flash/RAM</td></tr>
-<tr><td>实车验证</td><td class="warn">HAL 相关 UART ORE/FE 锁存、DMA 饱和优先级/缓冲稳定性、Pi 进程冷重启恢复仍属人工验证项</td><td>按 docs/binary-pose-protocol.md 的 Hardware validation 清单上板验证，保留物理急停</td></tr>
+<tr><td>自动化验证</td><td><span class="ok">Python unittest 192/192 通过</span>；<span class="ok">5 个便携 C 套件通过</span>（host_rx_router/host_command_rx/motion_math/rpi_protocol/control layer 9 组）；<span class="ok">ARM GCC 独立构建 46 单元通过</span>（-Wall -Werror）；CI（GitHub Actions）执行 schema 检查+C 测试+Pi 测试+ARM 构建；<code>git diff --check</code> 通过</td><td>新增模块必须携带便携 C 回归；注意 CI 未覆盖真实 ISR/DMA 时序</td></tr>
+<tr><td>STM32 构建/尺寸</td><td class="warn">命令行基线：build_firmware.py 46 单元全通过；CubeIDE 工程需确认 3b3b395 新增源文件（robot_app/board_events/host_*/control_runtime/motion_math/motor_monitor）已收录并执行 clean build 后用 arm-none-eabi-size 记录 text/data/bss</td><td>IDE 刷新工程 + clean build + 记录尺寸基线</td></tr>
+<tr><td>实车验证</td><td class="warn">UART ORE/FE 锁存、DMA 饱和与缓冲稳定性、CAN BeginStop/SendStop 实时性、motor_monitor 停车确认、Pi 冷重启恢复仍属人工项；portable C 测试不覆盖真实 ISR/DMA 时序</td><td>按 docs/control-layer-validation.md 与 binary-pose-protocol.md Hardware 清单上板验证，保留物理急停</td></tr>
 </table>
-<p class="sub" style="margin-top:30px">本文件更新于 2026-09-01。当前内容由 39ec12c 基线演进并对应 184/184 测试结果；
-完成 STM32 全量构建后请补录有效固件尺寸基线，修改协议、状态机或安全路径后请同步更新本文件。</p>
+
+<!-- ================================================================ -->
+<h2 id="last-update">最后一次更新梗概（2026-09-09）</h2>
+<p class="sub">基线推进：39ec12c →（741100f 协议加固，上一版手册已覆盖）→ <code>3b3b395 "refactor: separate firmware application and protocol boundaries"</code>。
+本手册本次同步内容：</p>
+<table>
+<tr><th>#</th><th>变更</th><th>意义</th></tr>
+<tr><td>1</td><td><b>固件分层重构</b>：main.c 瘦身为 CubeMX 外壳；应用状态/业务迁入 robot_app.c（唯一状态拥有者）；HAL 回调收口 board_events.c；新增 host_rx_router / host_command_rx / host_uart_tx / control_runtime / motion_math / motor_monitor 六个边界模块；IWDG 喂狗与控制周期统计入运行时</td><td>应用与协议/硬件边界分离；收流分类与共享数学不依赖 ISR/HAL，可在主机便携回归（架构自约：应用状态仅 robot_app.c 可 extern 读写）</td></tr>
+<tr><td>2</td><td><b>新增执行闭环</b>：motor_monitor 四轮反馈新鲜度(300ms)+停车确认(±1 RPM/600ms)，新命令 MOTOR FEEDBACK / MOTOR STOP STATE；pid.c 增加 PID_ApplyOutput 分离计算与执行</td><td><span class="badge safe">安全</span> "发过零速"升级为"确认已停住"，闭环覆盖到执行结果</td></tr>
+<tr><td>3</td><td><b>zdtCan 重写</b>：每电机一槽异步待发队列（新速度帧替换旧帧，统计替换/丢弃/最大等待）；ZDT_CAN_BeginStop 中止邮箱 + SendStop 预算式紧急零速；使能 5ms 间隔</td><td><span class="badge safe">安全</span> CAN 拥塞不再积压过期速度帧；紧急停车独立于普通队列</td></tr>
+<tr><td>4</td><td><b>Pi 退出有界停车交接</b>：bridge.shutdown()（closing 拒新命令→STOP 写出→限时等确认→ShutdownResult 三态报告）；main.py / telemetry_plotter 退出接入</td><td><span class="badge safe">安全</span> 程序退出从"入队即关"升级为"确认 STOP 写出后再关口"，结果如实上报</td></tr>
+<tr><td>5</td><td><b>工程化</b>：tools/build_firmware.py 独立 ARM 构建、tools/run_c_tests.py 便携 C 测试、GitHub Actions CI、docs/architecture.md + control-layer-validation.md</td><td>回归与构建脱离单机 IDE；验证 = 192 Pi 测试 + 5 C 套件 + 46 单元 ARM 构建（警告即错误）</td></tr>
+</table>
+<p class="sub" style="margin-top:20px">本文件更新于 2026-09-09，与 3b3b395 源码同步。修改协议、状态机、安全路径或固件架构后请同步更新本文件。</p>
 </div>
 </body>
 </html>

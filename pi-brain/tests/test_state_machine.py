@@ -51,7 +51,7 @@ GOOD_LINES = (
     "D=0.0000000 MAX_OUT=0.150 STATE=0 PLOT=0 MOTOR_PROTO=EMM "
     "OPS_FRAMES=10 UART_TX_OK=5 UART_TX_ERR=0",
     "# OPS LINK=OK X=1.00 Y=2.00 YAW=3.00 CENTER_X=1.00 CENTER_Y=2.00 FRAMES=10",
-    "# CAN STATE=2 ERROR=0x00000000 FREE=3 TX_OK=1 TX_ERR=0 RX=1 LAST=0",
+    "# CAN STATE=2 READY=1 ESR=0 ERROR=0x00000000 FREE=3 TX_OK=1 TX_ERR=0 RX=1 LAST=0",
     "# PID LOADED AXIS=X P=0.0033000 I=0.00000000 D=0.0000000",
     "# PID LOADED AXIS=Y P=0.0033000 I=0.00000000 D=0.0000000",
     "# PID LOADED AXIS=YAW P=0.0200000 I=0.00000000 D=0.0000000",
@@ -158,12 +158,33 @@ class StartupStateMachineTests(unittest.TestCase):
         self.assertIsNone(machine.ops_pose)
         self.assertTrue(bridge.is_emergency_stopped)
 
+    def test_multiline_can_waits_and_accepts_historical_error(self):
+        machine, _, _ = self.make_machine()
+        machine.start()
+        for line in GOOD_LINES[:5]:
+            machine.handle_event(parse_line(line))
+        machine.handle_event(parse_line("# CAN STATE=2 ERROR=0x00000004"))
+        self.assertEqual(machine.state, StartupState.WAIT_CAN)
+        machine.handle_event(parse_line("# CAN TX_QUEUED=10 TX_TIMEOUT=1"))
+        machine.handle_event(parse_line("# CAN READY=1 TX_FAULT=0"))
+        self.assertEqual(machine.state, StartupState.WAIT_CAN)
+        machine.handle_event(parse_line("# CAN ESR=0x00000000 TEC=0 REC=0"))
+        self.assertEqual(machine.state, StartupState.WAIT_PID_X)
+
+    def test_listening_does_not_override_firmware_not_ready(self):
+        machine, _, _ = self.make_machine()
+        machine.start()
+        for line in GOOD_LINES[:5]:
+            machine.handle_event(parse_line(line))
+        machine.handle_event(parse_line("# CAN STATE=2 ERROR=0 READY=0 ESR=0"))
+        self.assertEqual(machine.state, StartupState.FAULT)
+
     def test_can_error_faults(self):
         machine, _, _ = self.make_machine()
         machine.start()
         for line in GOOD_LINES[:5]:
             machine.handle_event(parse_line(line))
-        machine.handle_event(parse_line("# CAN STATE=3 ERROR=0x00000004 TX_OK=1 TX_ERR=1"))
+        machine.handle_event(parse_line("# CAN STATE=3 READY=0 ESR=0 ERROR=0x00000004 TX_OK=1 TX_ERR=1"))
         self.assertEqual(machine.state, StartupState.FAULT)
         self.assertIn("CAN", machine.fault_reason)
 
@@ -172,9 +193,9 @@ class StartupStateMachineTests(unittest.TestCase):
         machine.start()
         for line in GOOD_LINES[:5]:
             machine.handle_event(parse_line(line))
-        machine.handle_event(parse_line("# CAN STATE=3 ERROR=0x00000000 TX_OK=1 TX_ERR=0"))
+        machine.handle_event(parse_line("# CAN STATE=3 READY=0 ESR=0 ERROR=0x00000000 TX_OK=1 TX_ERR=0"))
         self.assertEqual(machine.state, StartupState.FAULT)
-        self.assertIn("not listening", machine.fault_reason)
+        self.assertIn("not ready", machine.fault_reason)
 
     def test_pid_ack_mismatch_faults(self):
         machine, bridge, _ = self.make_machine()

@@ -297,17 +297,19 @@ class OpsStatus(Event):
 
 @dataclass(frozen=True)
 class CanStatus(Event):
-    """CAN STATUS 响应（无错误）。"""
+    """CAN STATUS 的一行；缺失字段保持未知，ERROR 是历史诊断。"""
 
-    state: int = 0
+    state: int | None = None
     error: int = 0
     tx_ok: int = 0
     tx_err: int = 0
+    ready: bool | None = None
+    esr: int | None = None
 
 
 @dataclass(frozen=True)
 class CanError(Event):
-    """CAN 错误（HAL_CAN_GetError 非零，或 ERROR 消息）。"""
+    """固件明确报告的 CAN 错误；不由累积 HAL ERROR 推导。"""
 
     pass
 
@@ -524,14 +526,21 @@ def _parse_ops_status(text: str) -> OpsStatus:
     )
 
 
+def _can_integer(kv, key):
+    try:
+        return int(kv[key], 0)
+    except (KeyError, ValueError):
+        return None
+
+
 def _parse_can(text: str) -> Event:
     kv = _kv(text)
     error = _i(kv.get("ERROR"))
-    if error != 0:
-        return CanError(raw=text)
     return CanStatus(
         raw=text,
-        state=_i(kv.get("STATE")),
+        state=_can_integer(kv, "STATE"),
+        ready=(_can_integer(kv, "READY") == 1) if "READY" in kv else None,
+        esr=_can_integer(kv, "ESR"),
         error=error,
         tx_ok=_i(kv.get("TX_OK")),
         tx_err=_i(kv.get("TX_ERR")),

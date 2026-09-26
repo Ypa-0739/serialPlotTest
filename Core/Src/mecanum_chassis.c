@@ -16,13 +16,23 @@
 #include "zdtCan.h"
 #include <math.h>
 
-static volatile uint8_t can_tx_fault_latched = 0U;
 static MotorStopMonitor stop_monitor;
 static uint32_t stop_motion_generation, stop_retry_tick;
 static float applied_scale = 1.0f;
+static uint8_t required_motor_mask = 0x0FU;
+static uint32_t poll_failures;
 
 float Mecanum_GetAppliedScale(void) { return applied_scale; }
 MotorStopMonitor Mecanum_GetStopStatus(void) { return stop_monitor; }
+uint8_t Mecanum_GetRequiredMotorMask(void) { return required_motor_mask; }
+uint8_t Mecanum_SetRequiredMotorMask(uint8_t mask)
+{
+    if (mask == 0U || (mask & 0xF0U) != 0U) return 0U;
+    required_motor_mask = mask;
+    stop_monitor.state = MOTOR_STOP_IDLE;
+    stop_monitor.baseline_valid = 0U;
+    return 1U;
+}
 uint8_t Mecanum_FeedbackReady(uint8_t mask)
 {
     MotorFeedback samples[4];
@@ -35,10 +45,11 @@ void Mecanum_ProcessFeedback(uint32_t now)
     if (stop_motion_generation != ZDT_Emm_MotionGeneration()) stop_monitor.state = MOTOR_STOP_IDLE;
     ZDT_Emm_GetFeedback(samples);
     now = HAL_GetTick();
-    MotorStop_Update(&stop_monitor, samples, ZDT_CAN_StopPending(), now);
+    MotorStop_UpdateMasked(&stop_monitor, samples, required_motor_mask,
+                           ZDT_CAN_StopPending(), now);
     if (stop_monitor.state == MOTOR_STOP_UNCONFIRMED && (uint32_t)(now - stop_retry_tick) >= 100U) {
         stop_retry_tick = now;
-        Mecanum_ReportCanTxResult(ZDT_Emm_StopAll());
+        Mecanum_ReportCanTxResult(ZDT_Emm_StopMask(required_motor_mask));
     }
 }
 
@@ -67,13 +78,16 @@ uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
     float max_abs = fabsf(V_bl);
     float scale;
     uint8_t result = 0U;
+    uint8_t mask = required_motor_mask;
 
     applied_scale = 1.0f;
+    /* 只对启用掩码内的电机做反馈与下发判定：MASK=0x0F 时行为和四轮模式完全
+     * 一致，MASK=0x01 时允许单电机台架测试。 */
     if (!isfinite(V_bl) || !isfinite(V_fl) || !isfinite(V_fr) || !isfinite(V_br) ||
         ((V_bl != 0.0f || V_fl != 0.0f || V_fr != 0.0f || V_br != 0.0f) &&
-         !Mecanum_FeedbackReady(0x0FU))) {
+         !Mecanum_FeedbackReady(mask))) {
         applied_scale = 0.0f;
-        can_tx_fault_latched = 1U;
+        ZDT_CAN_RaiseFault();
         (void)StopAllMotors();
         return 4U;
     }
@@ -91,12 +105,12 @@ uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br) {
         V_br *= scale;
     }
 
-    result |= ZDT_Emm_SetSpeedByID(1, MsToRpm(V_bl));  // ID 1: 左后
-    result |= ZDT_Emm_SetSpeedByID(2, MsToRpm(V_fl));  // ID 2: 左前
-    result |= ZDT_Emm_SetSpeedByID(3, MsToRpm(V_fr));  // ID 3: 右前
-    result |= ZDT_Emm_SetSpeedByID(4, MsToRpm(V_br));  // ID 4: 右后
+    if (mask & 0x01U) result |= ZDT_Emm_SetSpeedByID(1, MsToRpm(V_bl));  // ID 1: 左后
+    if (mask & 0x02U) result |= ZDT_Emm_SetSpeedByID(2, MsToRpm(V_fl));  // ID 2: 左前
+    if (mask & 0x04U) result |= ZDT_Emm_SetSpeedByID(3, MsToRpm(V_fr));  // ID 3: 右前
+    if (mask & 0x08U) result |= ZDT_Emm_SetSpeedByID(4, MsToRpm(V_br));  // ID 4: 右后
     if (result != 0U) {
-        can_tx_fault_latched = 1U;
+        ZDT_CAN_RaiseFault();
         applied_scale = 0.0f;
         /* 任一轮入队失败时撤销其他轮已入队的速度，避免部分下发。 */
         (void)StopAllMotors();
@@ -123,26 +137,29 @@ uint8_t StopAllMotors(void) {
     MotorStop_Request(&stop_monitor, HAL_GetTick());
     stop_motion_generation = ZDT_Emm_MotionGeneration();
     stop_retry_tick = HAL_GetTick();
-    result = ZDT_Emm_StopAll();
-    if (result) can_tx_fault_latched = 1U;
+    result = ZDT_Emm_StopMask(required_motor_mask);
+    if (result) ZDT_CAN_RaiseFault();
     return result;
 }
 
 uint8_t Mecanum_ConsumeCanTxFault(void)
 {
-    uint8_t fault = can_tx_fault_latched | ZDT_CAN_ConsumeFault();
-    can_tx_fault_latched = 0U;
-    return fault;
-}
-
-void Mecanum_ClearCanTxFault(void)
-{
-    can_tx_fault_latched = 0U;
+    return ZDT_CAN_ConsumeFault();
 }
 
 void Mecanum_ReportCanTxResult(uint8_t result)
 {
-    if (result != 0U) can_tx_fault_latched = 1U;
+    if (result != 0U) ZDT_CAN_RaiseFault();
+}
+
+void Mecanum_ReportPollResult(uint8_t result)
+{
+    if (result != 0U) poll_failures++;
+}
+
+uint32_t Mecanum_GetPollFailures(void)
+{
+    return poll_failures;
 }
 
 

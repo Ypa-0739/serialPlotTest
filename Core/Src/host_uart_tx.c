@@ -53,7 +53,9 @@ int HostUartTx_Write(const char *text, int length)
             telemetry_ready |= (uint8_t)(1U << group);
         } else if (strncmp((char *)assembling.bytes, "# STOP ", 7U) == 0 ||
                    strncmp((char *)assembling.bytes, "# POSE STOP", 11U) == 0 ||
+                   strncmp((char *)assembling.bytes, "# ROUND START", 13U) == 0 ||
                    strncmp((char *)assembling.bytes, "# ROUND STOP", 12U) == 0 ||
+                   strncmp((char *)assembling.bytes, "# CAN FEEDBACK LOST", 19U) == 0 ||
                    strncmp((char *)assembling.bytes, "# MOTION STOP", 13U) == 0 ||
                    strncmp((char *)assembling.bytes, "# MOTOR STOP ", 13U) == 0 ||
                    strncmp((char *)assembling.bytes, "# MOVE STOP", 11U) == 0) {

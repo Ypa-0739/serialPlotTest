@@ -35,10 +35,14 @@ uint8_t SetAllMotorsSpeed(float V_bl, float V_fl, float V_fr, float V_br);
 void ReadAllMotorsSpeed(void);
 uint8_t StopAllMotors(void);
 uint8_t Mecanum_ConsumeCanTxFault(void);
-void Mecanum_ClearCanTxFault(void);
 void Mecanum_ReportCanTxResult(uint8_t result);
+/* 后台速度轮询只做查询：入队失败属于瞬时拥塞，不能升级为会停车的运动故障。 */
+void Mecanum_ReportPollResult(uint8_t result);
+uint32_t Mecanum_GetPollFailures(void);
 void Mecanum_ProcessFeedback(uint32_t now);
 uint8_t Mecanum_FeedbackReady(uint8_t mask);
+uint8_t Mecanum_SetRequiredMotorMask(uint8_t mask);
+uint8_t Mecanum_GetRequiredMotorMask(void);
 MotorStopMonitor Mecanum_GetStopStatus(void);
 float Mecanum_GetAppliedScale(void);
 

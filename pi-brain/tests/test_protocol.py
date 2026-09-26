@@ -306,7 +306,8 @@ class ParseCanTests(unittest.TestCase):
     def test_can_error(self):
         line = "# CAN STATE=3 ERROR=0x00000004 FREE=3 TX_OK=100 TX_ERR=2 RX=50 LAST=0"
         ev = parse_line(line)
-        self.assertIsInstance(ev, CanError)
+        self.assertIsInstance(ev, CanStatus)
+        self.assertEqual(ev.error, 4)
 
 
 class ParseCsvTests(unittest.TestCase):
