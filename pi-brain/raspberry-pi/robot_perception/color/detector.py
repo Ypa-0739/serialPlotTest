@@ -149,11 +149,10 @@ class CompetitionColorDetector:
 
         height, width = mask.shape
         max_area = height * width * self.detection["max_object_area_ratio"]
-        min_area = (
-            self.detection["strict_min_object_area"]
-            if strict_shape_filter
-            else self.detection["min_object_area"]
-        )
+        prefix = "strict_" if strict_shape_filter else ""
+        min_area = self.detection[f"{prefix}min_object_area"]
+        min_fill = self.detection[f"{prefix}min_fill_ratio"]
+        min_solidity = self.detection[f"{prefix}min_solidity"]
         edge_margin = int(self.detection["edge_margin"])
         valid = []
 
@@ -162,7 +161,8 @@ class CompetitionColorDetector:
             if not min_area <= area <= max_area:
                 continue
 
-            x, y, object_width, object_height = cv2.boundingRect(contour)
+            box = cv2.boundingRect(contour)
+            x, y, object_width, object_height = box
             if (
                 x <= edge_margin
                 or y <= edge_margin
@@ -183,20 +183,10 @@ class CompetitionColorDetector:
             ):
                 continue
 
-            min_fill = (
-                self.detection["strict_min_fill_ratio"]
-                if strict_shape_filter
-                else self.detection["min_fill_ratio"]
-            )
-            min_solidity = (
-                self.detection["strict_min_solidity"]
-                if strict_shape_filter
-                else self.detection["min_solidity"]
-            )
             if fill_ratio < min_fill or solidity < min_solidity:
                 continue
 
-            valid.append((contour, area, fill_ratio, solidity))
+            valid.append((box, area, fill_ratio, solidity))
 
         valid.sort(key=lambda item: item[1], reverse=True)
         return valid[: int(self.detection["max_objects_per_color"])]
@@ -212,11 +202,11 @@ class CompetitionColorDetector:
             if collect_masks:
                 masks.append((mask, rule["draw_color"]))
 
-            for contour, area, fill_ratio, solidity in self._valid_object_contours(
+            for box, area, fill_ratio, solidity in self._valid_object_contours(
                 mask,
                 rule["strict_shape_filter"],
             ):
-                x, y, object_width, object_height = cv2.boundingRect(contour)
+                x, y, object_width, object_height = box
                 detections.append(
                     {
                         "code": int(rule["code"]),

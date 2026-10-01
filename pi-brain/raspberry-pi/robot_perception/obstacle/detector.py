@@ -11,7 +11,7 @@ import json
 import math
 from pathlib import Path
 import threading
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,38 @@ class CameraObstacleDetector:
                 "calibration_required 设为 false 后才能启用障碍检测"
             )
         self.config = config
+        a, b, c, d, e, f, g, h, i = config.homography_image_to_base
+        inverse = (e*i-f*h, c*h-b*i, b*f-c*e, f*g-d*i, a*i-c*g, c*d-a*f,
+                   d*h-e*g, b*g-a*h, a*e-b*d)
+        determinant = a*inverse[0] + b*inverse[3] + c*inverse[6]
+        if not math.isfinite(determinant) or abs(determinant) < 1e-9:
+            raise ValueError("前视相机单应矩阵不可逆")
+        self._base_to_image = tuple(value / determinant for value in inverse)
+
+    def is_visible(self, obstacle: DetectedObstacle, robot_pose: object, frame: object) -> bool:
+        """旧障碍接地点仍在有效检测 ROI 内，才允许用漏检帧清除。
+
+        这只是可见范围检查，不宣称单目图像能识别一切遮挡。
+        """
+        shape = getattr(frame, "shape", ())
+        if len(shape) < 2:
+            return False
+        dx, dy = obstacle.x_mm - robot_pose.x_mm, obstacle.y_mm - robot_pose.y_mm
+        cosine, sine = math.cos(robot_pose.yaw_rad), math.sin(robot_pose.yaw_rad)
+        base_x, base_y = cosine*dx + sine*dy, -sine*dx + cosine*dy
+        if base_x <= 0:
+            return False
+        h = self._base_to_image
+        denominator = h[6]*base_x + h[7]*base_y + h[8]
+        if abs(denominator) < 1e-9:
+            return False
+        pixel_x = (h[0]*base_x + h[1]*base_y + h[2]) / denominator
+        pixel_y = (h[3]*base_x + h[4]*base_y + h[5]) / denominator
+        height, width = shape[:2]
+        return (
+            5 <= pixel_x < width - 5
+            and height * self.config.roi_top_fraction + 5 <= pixel_y < height - 5
+        )
 
     def detect(
         self,
@@ -93,15 +125,15 @@ class CameraObstacleDetector:
             gray = image
         else:
             raise ValueError("frame 必须是灰度或 BGR 图像")
-        height, width = gray.shape[:2]
-        roi_top = int(height * self.config.roi_top_fraction)
+        roi_top = int(gray.shape[0] * self.config.roi_top_fraction)
         mask = cv2.inRange(gray, 0, self.config.black_threshold)
         mask[:roi_top, :] = 0
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # OpenCV 默认核就是 3x3 矩形，不必每帧创建相同数组。
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, None)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, None)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         result: list[DetectedObstacle] = []
+        cosine, sine = math.cos(robot_pose.yaw_rad), math.sin(robot_pose.yaw_rad)
         for contour in contours:
             area = float(cv2.contourArea(contour))
             if not self.config.minimum_area_px <= area <= self.config.maximum_area_px:
@@ -113,7 +145,6 @@ class CameraObstacleDetector:
             if not self.config.minimum_aspect_ratio <= aspect <= self.config.maximum_aspect_ratio:
                 continue
             base_x, base_y = self._project(x + box_width / 2.0, y + box_height)
-            cosine, sine = math.cos(robot_pose.yaw_rad), math.sin(robot_pose.yaw_rad)
             map_x = robot_pose.x_mm + cosine * base_x - sine * base_y
             map_y = robot_pose.y_mm + sine * base_x + cosine * base_y
             fill_ratio = min(1.0, area / float(box_width * box_height))
@@ -143,6 +174,8 @@ class CameraObstacleDetector:
 class _Track:
     obstacle: DetectedObstacle
     confirmations: int
+    confirmed: bool = False
+    clear_confirmations: int = 0
 
 
 class ConfirmedObstacleTracker:
@@ -154,24 +187,60 @@ class ConfirmedObstacleTracker:
         confirmations_required: int = 3,
         matching_distance_mm: float = 120.0,
         retention_seconds: float = 1.0,
+        clear_confirmations_required: int = 3,
+        minimum_confidence: float = 0.55,
     ) -> None:
+        if (
+            not isinstance(confirmations_required, int) or isinstance(confirmations_required, bool)
+            or confirmations_required < 2
+            or not isinstance(clear_confirmations_required, int) or isinstance(clear_confirmations_required, bool)
+            or clear_confirmations_required < 2
+        ):
+            raise ValueError("障碍确认和清除都至少需要两帧")
+        if (
+            not math.isfinite(matching_distance_mm) or matching_distance_mm <= 0
+            or not math.isfinite(retention_seconds) or retention_seconds <= 0
+            or not math.isfinite(minimum_confidence) or not 0 <= minimum_confidence <= 1
+        ):
+            raise ValueError("障碍跟踪参数无效")
         self.confirmations_required = confirmations_required
         self.matching_distance_mm = matching_distance_mm
         self.retention_seconds = retention_seconds
+        self.clear_confirmations_required = clear_confirmations_required
+        self.minimum_confidence = minimum_confidence
         self._tracks: list[_Track] = []
+        self._last_update_at: Optional[float] = None
 
     def update(
         self,
         detections: Sequence[DetectedObstacle],
         now: float,
+        *,
+        visible: Optional[Callable[[DetectedObstacle], bool]] = None,
     ) -> tuple[DetectedObstacle, ...]:
+        if not math.isfinite(now):
+            raise ValueError("障碍观测时间戳无效")
+        if self._last_update_at is not None and now <= self._last_update_at:
+            return self._confirmed_obstacles()
+        self._last_update_at = now
         self._tracks = [
             track
             for track in self._tracks
-            if now - track.obstacle.observed_at <= self.retention_seconds
+            if (track.confirmed and visible is not None)
+            or now - track.obstacle.observed_at <= self.retention_seconds
         ]
         matched: set[int] = set()
         for detection in detections:
+            if (
+                not all(math.isfinite(value) for value in (
+                    detection.x_mm, detection.y_mm, detection.radius_mm,
+                    detection.observed_at, detection.confidence,
+                ))
+                or detection.radius_mm <= 0
+                or not self.minimum_confidence <= detection.confidence <= 1
+                or not 0 <= now - detection.observed_at <= self.retention_seconds
+            ):
+                continue
             best_index = None
             best_distance = self.matching_distance_mm
             for index, track in enumerate(self._tracks):
@@ -190,11 +259,30 @@ class ConfirmedObstacleTracker:
                 track = self._tracks[best_index]
                 track.obstacle = detection
                 track.confirmations += 1
+                track.clear_confirmations = 0
+                if track.confirmations >= self.confirmations_required:
+                    track.confirmed = True
                 matched.add(best_index)
+        for index, track in enumerate(self._tracks):
+            if index in matched:
+                continue
+            track.confirmations = 0  # 不把间断噪声累积成连续确认
+            if visible is not None and track.confirmed:
+                if visible(track.obstacle):
+                    track.clear_confirmations += 1
+                else:
+                    track.clear_confirmations = 0
+        self._tracks = [
+            track for track in self._tracks
+            if track.clear_confirmations < self.clear_confirmations_required
+        ]
+        return self._confirmed_obstacles()
+
+    def _confirmed_obstacles(self) -> tuple[DetectedObstacle, ...]:
         return tuple(
             track.obstacle
             for track in self._tracks
-            if track.confirmations >= self.confirmations_required
+            if track.confirmed
         )
 
 
@@ -216,7 +304,10 @@ class FrontCameraObstacleSource:
         candidates = tuple(
             self.detector.detect(frame, robot_pose, observed_at=observed_at)
         )
-        confirmed = self.tracker.update(candidates, observed_at)
+        confirmed = self.tracker.update(
+            candidates, observed_at,
+            visible=lambda obstacle: self.detector.is_visible(obstacle, robot_pose, frame),
+        )
         with self._lock:
             self.latest_candidates = candidates
             self._confirmed = confirmed

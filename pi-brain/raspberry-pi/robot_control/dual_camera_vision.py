@@ -45,7 +45,7 @@ class DualCameraVisionController:
 
     逻辑名称与用户约定一致：
 
-    - 摄像头1：``manager.gripper``，识别物料颜色并计算夹爪对准偏差；
+    - 摄像头1：``manager.gripper``，模型/颜色识别物料并计算夹爪对准偏差；
     - 摄像头2：``manager.front``，巡线，并在需要时扫描任务二维码。
 
     Picamera2 的 ``camera_num`` 是设备枚举编号，不等同于上述逻辑名称。
@@ -63,6 +63,7 @@ class DualCameraVisionController:
         road_detector=None,
         gripper_frame_transform: Optional[Callable[[Any], Any]] = None,
         gripper_calibrator: Optional[Callable[[Any], Callable[[Any], Any]]] = None,
+        material_reporter=None,
         settle_seconds: float = 0.0,
     ):
         if settle_seconds < 0:
@@ -77,6 +78,7 @@ class DualCameraVisionController:
         self.latest_navigation_result: Optional[NavigationVisionResult] = None
         self.gripper_frame_transform = gripper_frame_transform or (lambda frame: frame)
         self.gripper_calibrator = gripper_calibrator
+        self.material_reporter = material_reporter
         self.settle_seconds = float(settle_seconds)
         self.started = False
         self.active_roles = frozenset()
@@ -167,27 +169,42 @@ class DualCameraVisionController:
         *,
         collect_masks: bool = False,
     ) -> GripperVisionResult:
-        """摄像头1识别颜色、物料中心和是否达到抓取容差。"""
+        """cam0 输出视觉结果；配置 reporter 时将类别/像素位置交给 STM32。"""
         self._require_role("gripper")
-        raw_frame = self.camera_1.capture_array("main")
-        frame = self.gripper_frame_transform(raw_frame)
-        detection = self.material_detector.detect(
-            frame,
-            target_material_code=target_material_code,
-            collect_masks=collect_masks,
-        )
+        captured_at = time.monotonic()
+        try:
+            raw_frame = self.camera_1.capture_array("main")
+            frame = self.gripper_frame_transform(raw_frame)
+            detection = self.material_detector.detect(
+                frame,
+                target_material_code=target_material_code,
+                collect_masks=collect_masks,
+            )
+        except Exception:
+            if self.material_reporter is not None:
+                self.material_reporter.report_camera_error()
+            raise
+        if self.material_reporter is not None:
+            height, width = frame.shape[:2]
+            self.material_reporter.publish(
+                detection, frame_size=(width, height), captured_at=captured_at,
+            )
         return GripperVisionResult(frame=frame, material_detection=detection)
 
-    def is_healthy(self, stale_after_seconds: float = 1.0) -> bool:
+    def is_healthy(self, stale_after_seconds: float = 1.0, *, roles=None) -> bool:
         return self.started and self.camera_manager.is_healthy(
             stale_after_seconds,
-            roles=self.active_roles,
+            roles=self.active_roles if roles is None else roles,
         )
 
     def close(self) -> None:
-        self.camera_manager.close()
-        self.started = False
-        self.active_roles = frozenset()
+        try:
+            if self.material_reporter is not None and "gripper" in self.active_roles:
+                self.material_reporter.stop()
+        finally:
+            self.camera_manager.close()
+            self.started = False
+            self.active_roles = frozenset()
 
     shutdown = close
 
@@ -205,6 +222,9 @@ def build_dual_camera_vision(
     obstacle_config_path: Optional[str] = None,
     road_config_path: Optional[str] = None,
     enable_navigation_perception: bool = False,
+    material_config_path: Optional[str] = None,
+    material_backend: Optional[str] = None,
+    material_reporter=None,
 ) -> DualCameraVisionController:
     """读取项目配置并创建树莓派可用的双摄像头视觉系统。
 
@@ -215,15 +235,8 @@ def build_dual_camera_vision(
 
     from robot_hardware.camera import DualCameraManager, load_camera_config
     from robot_control.line_navigation import LineFollower
-    from robot_perception.color import load_config as load_color_config
-    from robot_perception.color.detector import (
-        CompetitionColorDetector,
-        apply_white_balance,
-        build_white_balance_luts,
-        calibrate_white_balance,
-    )
     from robot_perception.line import LineDetector
-    from robot_perception.material import GripperMaterialDetector
+    from robot_perception.material import build_material_pipeline
     from robot_perception.obstacle import (
         CameraObstacleDetector,
         ConfirmedObstacleTracker,
@@ -235,7 +248,6 @@ def build_dual_camera_vision(
 
     cv2.setNumThreads(1)
     camera_config = load_camera_config(camera_config_path)
-    color_config = load_color_config(color_config_path)
     selected_line_path = (
         Path(line_config_path) if line_config_path else DEFAULT_LINE_CONFIG_PATH
     )
@@ -257,10 +269,11 @@ def build_dual_camera_vision(
             camera_config["front"].get("qr_confirmations", 2)
         ),
     )
-    color_detector = CompetitionColorDetector(color_config)
-    material_detector = GripperMaterialDetector(
-        color_detector,
+    material_pipeline = build_material_pipeline(
         camera_config["gripper"],
+        material_config_path=material_config_path,
+        color_config_path=color_config_path,
+        backend=material_backend,
     )
     obstacle_source = None
     road_detector = None
@@ -285,11 +298,6 @@ def build_dual_camera_vision(
         road_config = RoadDetectorConfig.load(road_path)
         road_detector = RoadAreaDetector(road_config)
 
-    def calibrate_gripper(camera):
-        gains = calibrate_white_balance(camera, color_config["white_balance"])
-        lookup_tables = build_white_balance_luts(gains)
-        return lambda frame: apply_white_balance(frame, lookup_tables)
-
     settle_seconds = max(
         float(camera_config["front"].get("settle_seconds", 0.0)),
         float(camera_config["gripper"].get("settle_seconds", 0.0)),
@@ -299,9 +307,10 @@ def build_dual_camera_vision(
         line_detector,
         line_follower,
         task_code_reader,
-        material_detector,
+        material_pipeline.detector,
         obstacle_source=obstacle_source,
         road_detector=road_detector,
-        gripper_calibrator=calibrate_gripper,
+        gripper_calibrator=material_pipeline.calibrator,
+        material_reporter=material_reporter,
         settle_seconds=settle_seconds,
     )

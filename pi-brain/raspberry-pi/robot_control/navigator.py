@@ -92,7 +92,6 @@ class MapNavigator:
         self._target: Optional[TargetArea] = None
         self._plan: Optional[RoutePlan] = None
         self._waypoint_index = 0
-        self._blocked_edges: frozenset[str] = frozenset()
         self._last_pose: Optional[Pose2D] = None
 
     @property
@@ -115,10 +114,13 @@ class MapNavigator:
                 self.velocity.stop()
                 return ActionResult.fatal(f"前视导航感知失败：{error}")
         blocked = self.map.blocked_edges(self.obstacle_reader())
-        if target != self._target or self._plan is None or blocked != self._blocked_edges:
+        if (
+            self._plan is None or target != self._target
+            or self.map.route_is_blocked(self._plan, self._waypoint_index, blocked)
+        ):
             if not self._replan(pose, target, blocked):
                 self.velocity.stop()
-                return ActionResult.retryable("障碍物封路且当前没有可用改道路线")
+                return ActionResult.running("当前无可用路线，保持停车并重新观察封路", activity=False)
 
         assert self._plan is not None
         while self._waypoint_index < len(self._plan.nodes):
@@ -139,7 +141,7 @@ class MapNavigator:
         vx, vy, wz = self._control(pose, waypoint)
         self.velocity.set_velocity(vx, vy, wz)
         return ActionResult.running(
-            f"前往 {waypoint_name}；封闭道路 {sorted(self._blocked_edges)}",
+            f"前往 {waypoint_name}；封闭道路 {sorted(blocked)}",
             activity=activity,
         )
 
@@ -162,7 +164,6 @@ class MapNavigator:
         self._target = target
         self._plan = plan
         self._waypoint_index = 0
-        self._blocked_edges = blocked
         return True
 
     def _control(self, pose: Pose2D, target: Point2D) -> tuple[int, int, int]:
@@ -201,7 +202,6 @@ class MapNavigator:
         self._target = None
         self._plan = None
         self._waypoint_index = 0
-        self._blocked_edges = frozenset()
         self._last_pose = None
 
 

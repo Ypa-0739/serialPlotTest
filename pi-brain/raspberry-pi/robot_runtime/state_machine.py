@@ -1,8 +1,11 @@
 """智能搬运机器人底层有限状态机。"""
 
 import logging
+import math
 import time
 from typing import Callable, Optional
+
+from robot_hardware.stm32.serial_link import SerialLinkError
 
 from robot_mission.task_code import (
     BatchTask,
@@ -38,6 +41,13 @@ class RobotStateMachine:
     """只负责编排流程；硬件行为全部由 ComponentBundle 注入。"""
 
     TERMINAL_STATES = {RobotState.COMPLETED, RobotState.SAFE_STOP}
+    NAVIGATION_STATES = {
+        RobotState.NAVIGATING_TO_SOURCE,
+        RobotState.NAVIGATING_TO_PROCESSING,
+        RobotState.NAVIGATING_TO_TEMPORARY_STORAGE,
+        RobotState.NAVIGATING_TO_STACKING,
+    }
+    REPEATABLE_STATES = NAVIGATION_STATES | {RobotState.LOCATING_MATERIAL}
 
     def __init__(
         self,
@@ -68,6 +78,16 @@ class RobotStateMachine:
         self._retry_count = 0
         self._recovery_resume_state: Optional[RobotState] = None
         self._recovery_reason = ""
+        self._action_wait_resume_state: Optional[RobotState] = None
+        self._action_retry_at = 0.0
+        self._safety_resume_state: Optional[RobotState] = None
+        self._safety_pause_started_at = 0.0
+        self._safety_clear_since: Optional[float] = None
+        self._safety_clear_samples = 0
+        self._safety_last_observation: Optional[float] = None
+        self._safety_pause_reason = ""
+        self._safety_pause_notified = False
+        self._link_wait_started_at: Optional[float] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -107,6 +127,9 @@ class RobotStateMachine:
                 ),
                 RobotState.STACKING_SECOND_BATCH: self._handle_stacking_second_batch,
                 RobotState.RECOVERING: self._handle_recovering,
+                RobotState.ACTION_WAITING: self._handle_action_waiting,
+                # 暂停和恢复都由 _check_safety 驱动，不调用任务动作。
+                RobotState.SAFETY_PAUSED: lambda: None,
                 RobotState.REPORTING: self._handle_reporting,
             }[self.state]
             handler()
@@ -222,7 +245,29 @@ class RobotStateMachine:
                 return
 
         if self.clock.monotonic() >= self._task_code_deadline:
-            self.safe_stop("规定时间内未获得合法任务码")
+            self._task_code_deadline = self.clock.monotonic() + self.config.task_code_timeout_seconds
+            self.components.display.show_state(self.state, "暂未获得合法任务码，保持停车继续扫描")
+            self._publish("task_code_waiting", {"reason": "暂未获得合法任务码"})
+
+    def _handle_action_waiting(self) -> None:
+        resume_state = self._action_wait_resume_state
+        if resume_state not in self.REPEATABLE_STATES:
+            self.safe_stop("动作等待缺少可重复执行的目标状态")
+            return
+        if self.clock.monotonic() < self._action_retry_at:
+            return
+        if self.components.motion.is_active() or self.components.manipulator.is_active():
+            return
+        self._action_wait_resume_state = None
+        self._transition(resume_state, "等待结束，重新规划或识别")
+
+    def _wait_for_action(self, resume_state: RobotState, reason: str) -> None:
+        if not self._stop_motion(allow_disconnected=True):
+            self.safe_stop("动作等待时无法确认停车指令已发送")
+            return
+        self._action_wait_resume_state = resume_state
+        self._action_retry_at = self.clock.monotonic() + self.config.action_retry_wait_seconds
+        self._transition(RobotState.ACTION_WAITING, reason, reset_retries=False)
 
     def _handle_navigating_to_source(self) -> None:
         result = self.components.navigator.navigate_to(TargetArea.SOURCE_TURNTABLE)
@@ -375,7 +420,11 @@ class RobotStateMachine:
             result.status is ActionStatus.RETRYABLE_ERROR
             or self._action_timed_out()
         ):
-            self.safe_stop(f"恢复超时或失败：{result.message}")
+            reason = f"恢复超时或失败：{result.message}"
+            if resume_state in self.REPEATABLE_STATES:
+                self._wait_for_action(resume_state, reason)
+            else:
+                self.safe_stop(reason)
 
     def _handle_reporting(self) -> None:
         self._stop_motion()
@@ -408,13 +457,23 @@ class RobotStateMachine:
             self._begin_recovery(f"{self.state.name}动作超时")
 
     def _begin_recovery(self, reason: str) -> None:
+        # 动作调用期间断线时，先转通信等待，不能耗尽动作重试预算。
+        if self.components.safety.check().waiting_for_link:
+            self._check_safety()
+            return
         if self._retry_count >= self.config.max_action_retries:
-            self.safe_stop(f"动作重试次数耗尽：{reason}")
+            message = f"动作重试次数耗尽：{reason}"
+            if self.state in self.REPEATABLE_STATES:
+                self._wait_for_action(self.state, message)
+            else:
+                self.safe_stop(message)
             return
         self._retry_count += 1
         self._recovery_resume_state = self.state
         self._recovery_reason = reason
-        self._stop_motion()
+        if not self._stop_motion(allow_disconnected=True):
+            self.safe_stop("动作恢复时无法确认停车指令已发送")
+            return
         self._transition(
             RobotState.RECOVERING,
             f"第{self._retry_count}次有界恢复：{reason}",
@@ -422,20 +481,101 @@ class RobotStateMachine:
         )
 
     def _check_safety(self) -> bool:
+        effective_state = (
+            self._safety_resume_state
+            if self.state is RobotState.SAFETY_PAUSED else self.state
+        )
+        if effective_state is RobotState.ACTION_WAITING:
+            effective_state = self._action_wait_resume_state
+        elif effective_state is RobotState.RECOVERING:
+            effective_state = self._recovery_resume_state
+        require_navigation = getattr(self.components.safety, "set_navigation_required", None)
+        if require_navigation is not None:
+            require_navigation(effective_state in self.NAVIGATION_STATES)
         report = self.components.safety.check()
-        if not report.safe or report.emergency_stop or not report.boundary_ok:
+        # 显式急停和真实地图越界不能被 recoverable 覆盖。
+        if report.emergency_stop or not report.boundary_ok or (not report.safe and not report.recoverable):
             self.safe_stop(report.reason or "安全监控触发停车")
             return False
 
-        if not self._mission_started:
-            return True
-        if self.components.motion.is_active() or self.components.manipulator.is_active():
-            self._last_activity_at = self.clock.monotonic()
+        now = self.clock.monotonic()
+        if self._mission_started and (
+            self.components.motion.is_active() or self.components.manipulator.is_active()
+        ):
+            self._last_activity_at = now
+        if not report.safe:
+            if self.state is not RobotState.SAFETY_PAUSED:
+                self._safety_resume_state = self.state
+                self._safety_pause_started_at = now
+                self._safety_pause_notified = False
+                begin_recheck = getattr(self.components.safety, "begin_recheck", None)
+                if begin_recheck is not None:
+                    begin_recheck()
+                if not self._stop_motion(allow_disconnected=True):
+                    self.safe_stop("安全暂停时无法确认停车指令已发送")
+                    return False
+                self._transition(RobotState.SAFETY_PAUSED, report.reason, reset_retries=False)
+            self._safety_pause_reason = report.reason
+            self._safety_clear_since = None
+            self._safety_clear_samples = 0
+            self._safety_last_observation = None
+
+        if self.state is RobotState.SAFETY_PAUSED:
+            if report.waiting_for_link:
+                if self._link_wait_started_at is None:
+                    self._link_wait_started_at = now
+                return False
+            if self._link_wait_started_at is not None:
+                if self._safety_resume_state is RobotState.READING_TASK_CODE:
+                    self._task_code_deadline += now - self._link_wait_started_at
+                self._link_wait_started_at = None
+                self._safety_pause_started_at = now
+            # 超过复核提醒时间仍停着等待；恢复条件不因等待时间变长而放宽。
+            if (
+                not self._safety_pause_notified
+                and now - self._safety_pause_started_at >= self.config.safety_pause_timeout_seconds
+            ):
+                self._safety_pause_notified = True
+                message = f"安全复核仍未完成，保持停车等待：{self._safety_pause_reason}"
+                LOGGER.warning(message)
+                self.components.display.show_state(self.state, message)
+                self._publish("safety_pause_extended", {"reason": self._safety_pause_reason})
+            if not report.safe:
+                return False
+            if self._safety_clear_since is None:
+                self._safety_clear_since = now
+            timestamp = report.observation_timestamp
+            if timestamp is not None and math.isfinite(timestamp) and (
+                self._safety_last_observation is None or timestamp > self._safety_last_observation
+            ):
+                self._safety_clear_samples += 1
+                self._safety_last_observation = timestamp
+            if (
+                now - self._safety_clear_since < self.config.safety_resume_stable_seconds
+                or self._safety_clear_samples < self.config.safety_resume_confirmations
+            ):
+                return False
+            resume_state = self._safety_resume_state
+            if resume_state is None:
+                self.safe_stop("安全暂停缺少恢复目标")
+                return False
+            end_recheck = getattr(self.components.safety, "end_recheck", None)
+            if end_recheck is not None:
+                end_recheck()
+            self._safety_resume_state = None
+            self._transition(resume_state, "新画面持续确认安全，重新执行原任务", reset_retries=False)
+            return False  # 下一周期再次检查安全后才能下发新航点
+
         if (
-            self.clock.monotonic() - self._last_activity_at
+            self._mission_started
+            and self.state not in {
+                RobotState.RECOVERING, RobotState.ACTION_WAITING, RobotState.READING_TASK_CODE,
+            }
+            and now - max(self._last_activity_at, self._action_started_at)
             >= self.config.inactivity_timeout_seconds
         ):
-            self.safe_stop(
+            # 每次动作/恢复重试独立计时，不把等待恢复伪记为物理活动。
+            self._begin_recovery(
                 f"连续{self.config.inactivity_timeout_seconds:g}秒未检测到物理动作"
             )
             return False
@@ -462,16 +602,24 @@ class RobotStateMachine:
         self._action_started_at = self.clock.monotonic()
         self._retry_count = 0
 
-    def _stop_motion(self) -> None:
+    def _stop_motion(self, *, allow_disconnected: bool = False) -> bool:
+        succeeded = True
         for operation in (
-            self.components.navigator.cancel,
             self.components.motion.stop,
+            self.components.navigator.cancel,
             self.components.manipulator.stop,
         ):
             try:
                 operation()
-            except Exception:
+            except Exception as error:
+                # 只容忍已进入重连等待的通信发送失败，其他组件异常仍终止。
+                if not (
+                    allow_disconnected and isinstance(error, SerialLinkError)
+                    and self.components.safety.check().waiting_for_link
+                ):
+                    succeeded = False
                 LOGGER.exception("安全停车操作失败")
+        return succeeded
 
     def _transition(
         self,

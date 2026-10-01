@@ -1,6 +1,7 @@
 """二进制串口帧的编码、CRC16 和流式解码。"""
 
 from dataclasses import dataclass
+from binascii import crc_hqx
 import struct
 from typing import Iterable, List
 
@@ -45,12 +46,7 @@ class Frame:
 def crc16_ccitt(data: Iterable[int], initial: int = 0xFFFF) -> int:
     """CRC-16/CCITT-FALSE：poly=0x1021, init=0xFFFF。"""
 
-    crc = initial
-    for byte in data:
-        crc ^= int(byte) << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
+    return crc_hqx(bytes(data), initial)
 
 
 def decode_frame(raw: bytes) -> Frame:

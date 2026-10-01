@@ -11,9 +11,15 @@ from robot_hardware.stm32 import SerialLink, Stm32Ops9Receiver
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stm32-config", default="config/stm32.json")
+    parser.add_argument("--port", help="覆盖 STM32 端口")
+    parser.add_argument("--transport", choices=("usb_cdc", "uart"), help="覆盖通信方式")
     parser.add_argument("--ops9-config", default="config/ops9.json")
     arguments = parser.parse_args()
     stm32 = json.loads(Path(arguments.stm32_config).read_text(encoding="utf-8"))
+    if arguments.port:
+        stm32["port"] = arguments.port
+    if arguments.transport:
+        stm32["transport"] = arguments.transport
     ops9 = json.loads(Path(arguments.ops9_config).read_text(encoding="utf-8"))
     link = SerialLink.from_config(stm32)
     receiver = Stm32Ops9Receiver(

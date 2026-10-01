@@ -17,7 +17,9 @@
   "tracking": {
     "confirmations_required": 3,
     "matching_distance_mm": 120,
-    "retention_seconds": 1.0
+    "retention_seconds": 1.0,
+    "clear_confirmations_required": 3,
+    "minimum_confidence": 0.55
   },
   "warning": "The homography is only a placeholder. Replace it using the installed front camera before enabling motors."
 }

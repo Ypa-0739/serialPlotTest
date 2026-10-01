@@ -22,6 +22,8 @@ class RobotState(Enum):
     NAVIGATING_TO_STACKING = auto()
     STACKING_SECOND_BATCH = auto()
     RECOVERING = auto()
+    ACTION_WAITING = auto()
+    SAFETY_PAUSED = auto()
     REPORTING = auto()
     COMPLETED = auto()
     SAFE_STOP = auto()
@@ -78,6 +80,11 @@ class SafetyReport:
     battery_voltage: Optional[float] = None
     boundary_ok: bool = True
     emergency_stop: bool = False
+    # 可复核的感知问题只暂停；急停/真实越界仍优先锁定停车。
+    recoverable: bool = False
+    observation_timestamp: Optional[float] = None
+    # 断线/重新握手期间保持暂停，不使用感知复核的超时终止任务。
+    waiting_for_link: bool = False
 
 
 @dataclass(frozen=True)

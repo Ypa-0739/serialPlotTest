@@ -1,4 +1,4 @@
-"""测试树莓派 USB 主机口到 STM32 原生 USB CDC 的 v2 协议。"""
+"""测试树莓派到 STM32 的 USB CDC / USART1 v2 协议。"""
 
 import argparse
 import json
@@ -12,9 +12,10 @@ from robot_hardware.stm32.messages import SessionInfo
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/stm32.json")
-    parser.add_argument("--port", help="覆盖配置端口，例如 /dev/ttyACM0")
-    parser.add_argument("--baudrate", type=int, help="CDC 逻辑波特率，默认 115200")
-    parser.add_argument("--list-ports", action="store_true", help="列出 USB CDC 设备后退出")
+    parser.add_argument("--port", help="覆盖配置端口，例如 /dev/ttyACM0 或 /dev/ttyUSB0")
+    parser.add_argument("--transport", choices=("usb_cdc", "uart"), help="覆盖通信方式")
+    parser.add_argument("--baudrate", type=int, help="串口波特率，默认 115200；CDC 为逻辑参数")
+    parser.add_argument("--list-ports", action="store_true", help="列出串口设备后退出")
     parser.add_argument("--count", type=int, default=10, help="连续探测次数，默认 10")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--handshake", action="store_true", help="进入 RPI 二进制会话；可能使能底盘，请架空车轮")
@@ -33,18 +34,24 @@ def main(argv=None) -> int:
             for port in ports:
                 print(f"{port.device}: {port.description} [{port.hwid}]")
             if not ports:
-                print("未发现串口：检查数据线及 STM32 CDC 固件")
+                print("未发现串口：检查数据线及 CDC 固件或 USB 转串口设备")
             return 0
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
         if args.port:
             config["port"] = args.port
+        if args.transport:
+            config["transport"] = args.transport
         if args.baudrate:
             config["baudrate"] = args.baudrate
         if "替换" in config["port"]:
-            raise SerialLinkError("请先设置 config/stm32.json 的 port，或指定 --port /dev/ttyACM0")
+            raise SerialLinkError("请先设置配置中的 port，或指定 --port /dev/ttyACM0（CDC）或 /dev/ttyUSB0（UART）")
         with SerialLink.from_config(config, negotiate=args.handshake) as link:
-            print(f"USB CDC 已打开：{link.port}")
+            print(f"STM32 {link.transport} 已打开：{link.port}")
             print(f"VERSION={link.session_info.version} CAPS=0x{link.session_info.capabilities:08X}")
+            if link.startup_info is not None:
+                startup = link.startup_info
+                print(f"启动自检：WORK 空闲，OPS9={startup.ops_frames} 帧，CAN STATE={startup.can_state} ESR=0x{startup.can_esr:08X}")
+                print(f"PID：X={startup.pid_x} Y={startup.pid_y} YAW={startup.pid_yaw}")
             if args.stop:
                 link.request(Command.STOP_ALL)
                 print("STOP_ALL 已确认")
@@ -62,9 +69,9 @@ def main(argv=None) -> int:
                         print(f"PROBE {index + 1}/{args.count}: OK，active={info.active} armed={info.armed}")
                     time.sleep(0.1)
                 if args.handshake:
-                    print("PASS：USB 双向通信、v2 握手和二进制 PING 均通过；未发送运动目标")
+                    print("PASS：STM32 双向通信、启动自检、v2 握手和二进制 PING 均通过；未发送运动目标")
                 else:
-                    print("PASS：USB CDC 双向通信及 v2 协议探测通过；未使能新的运动会话")
+                    print("PASS：STM32 双向通信及 v2 协议探测通过；未使能新的运动会话")
             print(f"统计：{link.statistics()}")
             if args.handshake:
                 link.request(Command.STOP_ALL)

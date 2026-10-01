@@ -1,6 +1,5 @@
 """基于 OpenCV 的二维码扫描与相机读取适配器。"""
 
-from collections import OrderedDict
 from typing import Any, Optional, Tuple
 
 
@@ -42,14 +41,10 @@ class QRCodeScanner:
         if not decoded and self.enhance_fallback:
             decoded = self._decode_enhanced(frame)
 
-        unique = OrderedDict()
-        for value in decoded:
-            if not isinstance(value, str):
-                continue
-            text = value.strip()
-            if text:
-                unique.setdefault(text, None)
-        return tuple(unique)
+        return tuple(dict.fromkeys(
+            value.strip() for value in decoded
+            if isinstance(value, str) and value.strip()
+        ))
 
     def _decode_variant(self, frame) -> Tuple[str, ...]:
         decoded = []

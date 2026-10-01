@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 
 from robot_control.dual_camera_vision import DualCameraVisionController
+from robot_control.navigation_runtime import build_navigation_runtime
+from robot_hardware.stm32.serial_link import SerialLink
 
 
 class FakeCamera:
@@ -24,6 +26,7 @@ class FakeManager:
         self.gripper = FakeCamera("gripper-frame")
         self.started = False
         self.closed = False
+        self.stale_roles = set()
 
     def start(self, roles=None):
         self.started = True
@@ -31,7 +34,10 @@ class FakeManager:
 
     def is_healthy(self, _stale_after_seconds=1.0, roles=None):
         requested = set(roles or self.roles)
-        return self.started and not self.closed and requested <= self.roles
+        return (
+            self.started and not self.closed and requested <= self.roles
+            and not requested & self.stale_roles
+        )
 
     def close(self):
         self.closed = True
@@ -179,6 +185,22 @@ class DualCameraVisionTests(unittest.TestCase):
         controller.observe_front()
         with self.assertRaisesRegex(RuntimeError, "gripper摄像头未启动"):
             controller.observe_gripper()
+
+    def test_navigation_health_ignores_idle_gripper_but_checks_front(self):
+        controller = self.make_controller(
+            obstacle_source=FakeObstacleSource(), road_detector=FakeRoadDetector(),
+        )
+        controller.start()
+        navigation = build_navigation_runtime(
+            SerialLink("not-opened", heartbeat_interval=None), controller,
+        )
+        self.manager.stale_roles.add("gripper")
+        self.assertFalse(controller.is_healthy())
+        self.assertTrue(navigation.safety.camera_health(0.5))
+        self.manager.stale_roles.add("front")
+        self.assertFalse(navigation.safety.camera_health(0.5))
+        controller.close()
+        self.assertFalse(navigation.safety.camera_health(0.5))
 
 
 if __name__ == "__main__":

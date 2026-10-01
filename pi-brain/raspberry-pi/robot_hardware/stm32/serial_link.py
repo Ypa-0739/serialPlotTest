@@ -1,8 +1,7 @@
 """树莓派端单实例字节流链路。
 
-需要树莓派安装 ``pyserial``，通过 ``/dev/ttyACM*`` 原生 USB CDC
-连接队友 v2 固件。模块采用后台接收线程，负责拆包、响应匹配，
-并在 USB 设备短暂掉线后尝试重连。
+需要树莓派安装 ``pyserial``，支持原生 USB CDC 和队友固件的 USART1。
+模块采用后台接收线程，负责拆包、响应匹配和掉线重连。
 """
 
 from __future__ import annotations
@@ -22,10 +21,13 @@ from .messages import (
     ResponseStatus,
     SessionInfo,
     REQUIRED_CAPABILITIES,
+    MATERIAL_VISION_CAPABILITY,
     SUPPORTED_COMMANDS,
+    HOST_PROTOCOL_VERSION,
     encode_command,
 )
 from .protocol import Frame, FrameDecoder, PROTOCOL_VERSION
+from .startup import FirmwareStartupInfo
 
 
 LOGGER = logging.getLogger(__name__)
@@ -67,13 +69,14 @@ class LinkStatistics:
 
 
 class SerialLink:
-    """独占一个 USB 串口的双向通信组件。"""
+    """独占一个串口的双向通信组件。"""
 
     def __init__(
         self,
         port: str,
         baudrate: int = 115200,
         *,
+        transport: str = "usb_cdc",
         read_timeout: float = 0.05,
         reconnect_interval: float = 1.0,
         heartbeat_interval: Optional[float] = 0.1,
@@ -81,12 +84,16 @@ class SerialLink:
         handshake_timeout: float = 2.0,
         recovery_timeout: float = 3.0,
         negotiate: bool = True,
+        additional_capabilities: int = 0,
         serial_factory: Optional[Callable[..., SerialPort]] = None,
     ) -> None:
         if not port:
             raise ValueError("port 不能为空")
         if baudrate <= 0:
             raise ValueError("baudrate 必须大于 0")
+        if transport not in ("usb_cdc", "uart"):
+            raise ValueError("transport 必须为 usb_cdc 或 uart")
+        self.transport = transport
         self.port = port
         self.baudrate = baudrate
         self.read_timeout = read_timeout
@@ -102,13 +109,19 @@ class SerialLink:
         self.handshake_timeout = handshake_timeout
         self.recovery_timeout = recovery_timeout
         self.negotiate = negotiate
+        if (not isinstance(additional_capabilities, int) or isinstance(additional_capabilities, bool)
+            or not 0 <= additional_capabilities <= 0xFFFFFFFF):
+            raise ValueError("additional_capabilities 必须为 u32 能力位")
+        self.additional_capabilities = additional_capabilities
         self.session_info: Optional[SessionInfo] = None
+        self.startup_info: Optional[FirmwareStartupInfo] = None
         self.generation = 0
         self._heartbeat_sequence: Optional[int] = None
         self._heartbeat_deadline = 0.0
         self._serial_factory = serial_factory
         self._serial: Optional[SerialPort] = None
         self._decoder = FrameDecoder()
+        self._ascii_buffer = bytearray()
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
         self._reader_thread: Optional[threading.Thread] = None
@@ -136,12 +149,11 @@ class SerialLink:
 
     @classmethod
     def from_config(cls, config: dict, **kwargs) -> "SerialLink":
-        if config.get("transport", "usb_cdc") != "usb_cdc":
-            raise ValueError("当前接口仅支持 STM32 原生 USB CDC")
         if int(config.get("protocol_version", 2)) != PROTOCOL_VERSION:
             raise ValueError("配置协议版本必须为 2")
         return cls(
             str(config["port"]), int(config.get("baudrate", 115200)),
+            transport=str(config.get("transport", "usb_cdc")),
             read_timeout=float(config.get("read_timeout_seconds", 0.05)),
             reconnect_interval=float(config.get("reconnect_interval_seconds", 1.0)),
             heartbeat_interval=float(config.get("heartbeat_interval_seconds", 0.1)),
@@ -173,6 +185,10 @@ class SerialLink:
         if thread and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, self.read_timeout * 3))
         self._reader_thread = None
+
+    def request_reconnect(self) -> None:
+        """丢弃当前会话，由接收线程重新握手；不重放待处理命令。"""
+        self._disconnect()
 
     def __enter__(self) -> "SerialLink":
         self.open()
@@ -326,6 +342,11 @@ class SerialLink:
             raise SerialLinkError(f"队友 v2 固件未实现命令 0x{int(command):02X}")
         if not self.connected and int(command) not in (Command.STOP_ALL, Command.SESSION_PROBE):
             raise SerialLinkError("二进制会话尚未就绪，不能发送运动命令或 PING")
+        if int(command) == Command.UPDATE_MATERIAL_VISION and (
+            self.session_info is None
+            or not self.session_info.capabilities & MATERIAL_VISION_CAPABILITY
+        ):
+            raise SerialLinkError("STM32 未声明物料视觉接收能力 0x40；请先接入并烧录接收模块")
 
     def _default_serial_factory(self, **kwargs: object) -> SerialPort:
         try:
@@ -356,25 +377,29 @@ class SerialLink:
         with self._state_lock:
             self._serial = serial_port
             self._decoder.reset()
+            self._ascii_buffer.clear()
+            self.startup_info = None
         try:
-            info = SessionInfo.decode(self._bootstrap_request(Command.SESSION_PROBE).data)
-            self.validate_session(info)
-            self.session_info = info
+            info = self._probe_session()
             if info.active or info.armed:
                 self._bootstrap_request(Command.STOP_ALL)
                 # 所有有效命令（包括 SESSION_PROBE）都会喂狗，恢复期间必须完全静默。
                 if self._stop_event.wait(self.recovery_timeout):
                     raise SerialLinkError("会话恢复被取消")
-                info = SessionInfo.decode(self._bootstrap_request(Command.SESSION_PROBE).data)
-                self.validate_session(info)
+                info = self._probe_session()
                 if info.active or info.armed:
                     raise SerialLinkError("旧会话未退出；recovery_timeout 必须大于固件看门狗期限")
-                self.session_info = info
             if self.negotiate:
-                self._ascii_command("PROTO VERSION", r"# PROTO VERSION=4(?:\s|$)")
+                self._ascii_command("PROTO VERSION", rf"# PROTO VERSION={HOST_PROTOCOL_VERSION}(?:\s|$)")
                 self._ascii_command("HOST LINK RPI", r"# HOST LINK RPI OK")
                 self._ascii_command("STOP", r"# (?:STOP |ROUND STOP |POSE STOP)")
                 self._ascii_command("MODE WORK", r"# MODE WORK(?:\s|$)")
+                status = self._ascii_command("STATUS", r"^# STATUS ")
+                ops = self._ascii_command("OPS STATUS", r"^# OPS LINK=")
+                can_lines: List[str] = []
+                self._ascii_command("CAN STATUS", r"^# CAN ESR=", lines=can_lines)
+                pid = self._ascii_command("PID STATUS ALL", r"^# PID ALL ")
+                self.startup_info = FirmwareStartupInfo.decode(status, ops, can_lines, pid)
                 ready = self._ascii_command(
                     "HOST BINARY START", r"# HOST BINARY READY VERSION=\d+ CAPS=0x[0-9A-Fa-f]+"
                 )
@@ -382,11 +407,9 @@ class SerialLink:
                 if not match or int(match[1]) != PROTOCOL_VERSION or int(match[2], 16) & REQUIRED_CAPABILITIES != REQUIRED_CAPABILITIES:
                     raise SerialLinkError(f"固件版本或能力不兼容：{ready}")
                 self._bootstrap_request(Command.PING)
-                info = SessionInfo.decode(self._bootstrap_request(Command.SESSION_PROBE).data)
-                self.validate_session(info)
+                info = self._probe_session()
                 if not info.active or not info.armed or info.host_link != 2:
                     raise SerialLinkError("STM32 未进入有效 RPI 二进制会话")
-                self.session_info = info
                 self.generation += 1
                 self._connected_event.set()
         except Exception as error:
@@ -399,12 +422,20 @@ class SerialLink:
             self._disconnect()
             if isinstance(error, SerialLinkError):
                 raise
-            raise SerialLinkError(f"USB CDC 握手失败：{error}") from error
+            raise SerialLinkError(f"STM32 {self.transport} 握手失败：{error}") from error
 
     @staticmethod
     def validate_session(info: SessionInfo) -> None:
         if info.version != PROTOCOL_VERSION or info.capabilities & REQUIRED_CAPABILITIES != REQUIRED_CAPABILITIES:
             raise SerialLinkError(f"需要 VERSION=2 CAPS=0x3F；收到 {info}")
+
+    def _probe_session(self) -> SessionInfo:
+        info = SessionInfo.decode(self._bootstrap_request(Command.SESSION_PROBE).data)
+        self.validate_session(info)
+        if info.capabilities & self.additional_capabilities != self.additional_capabilities:
+            raise SerialLinkError(f"STM32 未声明所需扩展能力 0x{self.additional_capabilities:X}，不启动新会话")
+        self.session_info = info
+        return info
 
     def _bootstrap_write(self, data: bytes) -> None:
         if self._stop_event.is_set() or not self.port_open:
@@ -431,35 +462,40 @@ class SerialLink:
                     if response.status != ResponseStatus.OK:
                         raise CommandRejected(response)
                     return response
-        raise CommandTimeout(f"USB 协议探测超时：0x{int(command):02X}；检查 CDC 固件和数据线")
+        raise CommandTimeout(f"STM32 协议探测超时：0x{int(command):02X}；检查设备、固件及 {self.transport} 接线")
 
-    def _ascii_command(self, command: str, expected: str) -> str:
+    def _ascii_command(self, command: str, expected: str, *, lines: Optional[List[str]] = None) -> str:
         self._bootstrap_write((command + "\r\n").encode("ascii"))
         deadline = time.monotonic() + self.handshake_timeout
-        buffer = bytearray()
         while time.monotonic() < deadline and not self._stop_event.is_set():
-            buffer.extend(self._serial.read(256))
-            if len(buffer) > 8192:
+            if b"\n" not in self._ascii_buffer:
+                self._ascii_buffer.extend(self._serial.read(256))
+            if len(self._ascii_buffer) > 8192:
                 raise SerialLinkError("ASCII 握手响应过长")
-            while b"\n" in buffer:
-                raw, _, remainder = buffer.partition(b"\n")
-                buffer = bytearray(remainder)
+            while b"\n" in self._ascii_buffer:
+                raw, _, remainder = self._ascii_buffer.partition(b"\n")
+                self._ascii_buffer = bytearray(remainder)
                 line = raw.decode("ascii", errors="replace").strip()
+                if lines is not None:
+                    lines.append(line)
                 if line.startswith("# ERROR"):
                     raise SerialLinkError(f"{command} 被拒绝：{line}")
+                if line.startswith(("# CAN ERROR", "# ROUND STOP CAN", "# POSE STOP SAFETY")):
+                    raise SerialLinkError(f"启动期间固件报告故障：{line}")
                 if re.search(expected, line):
                     return line
-        raise CommandTimeout(f"等待 {command} 响应超时；尚未完成 USB/协议握手")
+        raise CommandTimeout(f"等待 {command} 响应超时；尚未完成 STM32 协议握手")
 
     def _disconnect(self) -> None:
         with self._state_lock:
             serial_port, self._serial = self._serial, None
             self._connected_event.clear()
+            self.startup_info = None
         with self._pending_lock:
             self._heartbeat_sequence = None
             for _, response_queue in self._pending.values():
                 try:
-                    response_queue.put_nowait(SerialLinkError("USB CDC 链路已断开；请求不会重放"))
+                    response_queue.put_nowait(SerialLinkError("STM32 链路已断开；请求不会重放"))
                 except queue.Full:
                     pass
         if serial_port is not None:

@@ -44,7 +44,18 @@ rpicam-hello --list
 这些是起始参数，实际值应根据摄像头型号、镜头视场、树莓派温度和并发负载
 实测调整。
 
-## 抓取颜色与对准结果
+## cam0 模型识别与对准框架
+
+当前默认后端由 config/material.json 选择为 model。由于训练模型和物料编号
+尚未确定，权重与类别映射留空，返回 MODEL_NOT_CONFIGURED 且禁止抓取。
+单路、双路调试入口使用同一物料工厂；没有任何按类别编号自动加一的映射。
+模型框、置信度、连续确认和二维对准接口已经预留，
+详见 [物料模型接入说明](MATERIAL_MODEL.md)。
+
+旧 HSV 颜色识别保留为显式对照选项：调试时添加 --material-backend color。
+以下颜色参数仅适用于该旧后端，不代表模型路径也执行颜色阈值判断。
+
+## 旧颜色后端与通用对准结果
 
 `robot_perception.material.GripperMaterialDetector` 复用 `config/color.json` 的
 1～6号颜色规则，并输出：
@@ -81,13 +92,13 @@ python3 -m tools.debug_color --preview
 检查抓取摄像头对4号物料的颜色和对准偏差：
 
 ```bash
-python3 -m tools.debug_gripper --target-code 4
+python3 -m tools.debug_gripper --material-backend color --target-code 4
 ```
 
 同时检查两路相机：
 
 ```bash
-python3 -m tools.debug_dual_camera --mode all --target-code 4
+python3 -m tools.debug_dual_camera --mode all
 ```
 
 联合调试默认不创建Qt窗口，适合SSH运行；有树莓派桌面时添加 `--preview`。
@@ -95,7 +106,8 @@ python3 -m tools.debug_dual_camera --mode all --target-code 4
 采集请求和CPU负载。
 
 调试窗口中的白色十字是配置的夹爪中心；目标框和十字之间的连线就是待消除的
-视觉偏差。SSH无桌面时添加 `--no-preview`，从终端读取颜色、偏差和可抓取状态。
+视觉偏差。单路 SSH 无桌面时添加 `--no-preview`，从终端读取类别、物料编号、
+置信度、偏差和安全等待状态；没有编号映射时只显示原始模型候选，不授权抓取。
 
 ## 接入状态机
 

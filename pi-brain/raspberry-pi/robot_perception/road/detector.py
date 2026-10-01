@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import json
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,17 @@ class RoadAreaDetector:
         if not 0.0 < config.central_corridor_fraction <= 1.0:
             raise ValueError("central_corridor_fraction 必须在 0~1 范围内")
         self.config = config
+        self._hsv_ranges = (
+            (config.gray_hsv_lower, config.gray_hsv_upper),
+            (config.yellow_hsv_lower, config.yellow_hsv_upper),
+            (config.white_hsv_lower, config.white_hsv_upper),
+        )
+
+    @cached_property
+    def _closing_kernel(self):
+        import numpy as np
+
+        return np.ones((5, 5), dtype=np.uint8)
 
     def detect(self, frame: Any, *, observed_at: float) -> RoadObservation:
         try:
@@ -104,23 +116,10 @@ class RoadAreaDetector:
         if roi.size == 0:
             raise ValueError("道路检测 ROI 为空")
 
-        gray = cv2.inRange(
-            roi,
-            np.array(self.config.gray_hsv_lower, dtype=np.uint8),
-            np.array(self.config.gray_hsv_upper, dtype=np.uint8),
+        gray, yellow, white = (
+            cv2.inRange(roi, lower, upper) for lower, upper in self._hsv_ranges
         )
-        yellow = cv2.inRange(
-            roi,
-            np.array(self.config.yellow_hsv_lower, dtype=np.uint8),
-            np.array(self.config.yellow_hsv_upper, dtype=np.uint8),
-        )
-        white = cv2.inRange(
-            roi,
-            np.array(self.config.white_hsv_lower, dtype=np.uint8),
-            np.array(self.config.white_hsv_upper, dtype=np.uint8),
-        )
-        kernel = np.ones((5, 5), dtype=np.uint8)
-        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, self._closing_kernel)
         forbidden = cv2.bitwise_or(yellow, white)
 
         pixel_count = float(roi.shape[0] * roi.shape[1])

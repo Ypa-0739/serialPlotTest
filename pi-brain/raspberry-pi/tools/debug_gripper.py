@@ -1,10 +1,8 @@
-"""抓取摄像头的物料颜色、中心偏差与对准调试入口。"""
+"""cam0 模型/颜色识别、中心偏差与对准调试；不控制夹爪。"""
 
 from argparse import ArgumentParser
 import os
 import time
-
-import cv2
 
 from robot_hardware.camera import (
     DEFAULT_CAMERA_CONFIG_PATH,
@@ -12,25 +10,20 @@ from robot_hardware.camera import (
     PiCamera,
     load_camera_config,
 )
-from robot_perception.color import ConfigError, load_config as load_color_config
-from robot_perception.color.detector import (
-    CompetitionColorDetector,
-    apply_white_balance,
-    build_white_balance_luts,
-    calibrate_white_balance,
-)
-from robot_perception.material import GripperMaterialDetector
+from robot_perception.material import build_material_pipeline
+from robot_perception.material.preview import draw_model_detections, model_detection_summary
 
 
 def parse_arguments():
-    parser = ArgumentParser(description="抓取摄像头颜色和对准调试")
+    parser = ArgumentParser(description="cam0 模型/颜色物料识别和对准调试")
     parser.add_argument("--camera-config", default=str(DEFAULT_CAMERA_CONFIG_PATH))
     parser.add_argument("--color-config")
+    parser.add_argument("--material-config", help="模型路径、类别映射与确认配置")
+    parser.add_argument("--material-backend", choices=("model", "color"), help="覆盖配置后端")
     parser.add_argument(
         "--target-code",
         type=int,
-        choices=range(1, 7),
-        help="只跟踪指定物料编号；不填时选择最接近夹爪中心的物料",
+        help="只跟踪已映射的正整数物料编号；不填时自动选择",
     )
     parser.add_argument("--no-preview", action="store_true")
     return parser.parse_args()
@@ -39,12 +32,18 @@ def parse_arguments():
 def main() -> int:
     args = parse_arguments()
     try:
+        import cv2
+
+        if args.target_code is not None and args.target_code <= 0:
+            raise ValueError("--target-code 必须是正整数")
         camera_config = load_camera_config(args.camera_config)["gripper"]
-        color_config = load_color_config(args.color_config)
+        pipeline = build_material_pipeline(
+            camera_config, material_config_path=args.material_config,
+            color_config_path=args.color_config, backend=args.material_backend,
+        )
         camera = PiCamera(camera_config)
-        color_detector = CompetitionColorDetector(color_config)
-        detector = GripperMaterialDetector(color_detector, camera_config)
-    except (CameraConfigError, ConfigError, ValueError) as error:
+        detector = pipeline.detector
+    except (CameraConfigError, ValueError, ImportError) as error:
         print(f"抓取视觉配置错误：{error}")
         return 2
 
@@ -60,13 +59,15 @@ def main() -> int:
     try:
         camera.start()
         time.sleep(float(camera_config.get("settle_seconds", 1.0)))
-        gains = calibrate_white_balance(camera, color_config["white_balance"])
-        lookup_tables = build_white_balance_luts(gains)
+        transform = (
+            pipeline.calibrator(camera)
+            if pipeline.calibrator is not None else (lambda frame: frame)
+        )
         grip_x, grip_y = (int(value) for value in camera_config["grip_center"])
 
         while True:
             raw_frame = camera.capture_array("main")
-            frame = apply_white_balance(raw_frame, lookup_tables)
+            frame = transform(raw_frame)
             result = detector.detect(
                 frame,
                 target_material_code=args.target_code,
@@ -78,18 +79,23 @@ def main() -> int:
                 tuple(round(value, 1) for value in observation.offset_pixels)
                 if observation
                 else None,
+                result.message,
+                model_detection_summary(result),
             )
             now = time.monotonic()
             if summary != last_summary or now - last_print_time >= 1.0:
                 if observation is None:
                     print(
                         f"状态={result.status} 目标={args.target_code or '自动'} "
-                        "未找到物料 可抓取=False"
+                        f"提示={result.message or '未找到物料'} "
+                        f"模型候选={summary[-1]} 可抓取=False"
                     )
                 else:
                     print(
                         f"状态={result.status} 编号={observation.material_code} "
-                        f"颜色={observation.color_cn_name} "
+                        f"名称={observation.material_name} "
+                        f"模型类别={observation.class_id} "
+                        f"置信度={observation.confidence:.2f} "
                         f"偏差=({observation.offset_pixels[0]:+.1f},"
                         f"{observation.offset_pixels[1]:+.1f}) "
                         f"已对准={result.aligned} 可抓取={result.safe_to_pick}"
@@ -98,6 +104,7 @@ def main() -> int:
                 last_print_time = now
 
             if preview_enabled:
+                draw_model_detections(cv2, frame, result)
                 cv2.drawMarker(
                     frame,
                     (grip_x, grip_y),
@@ -113,7 +120,7 @@ def main() -> int:
                     cv2.line(frame, (grip_x, grip_y), observation.center, color, 2)
                     cv2.putText(
                         frame,
-                        f"{observation.material_code} {observation.color_name}",
+                        f"material={observation.material_code} conf={observation.confidence:.2f}",
                         (x, max(18, y - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,

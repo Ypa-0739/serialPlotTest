@@ -53,19 +53,31 @@ python3 -m tools.debug_color --preview
 ## 树莓派5双摄像头
 
 双摄像头统一配置位于 `config/cameras.json`：CAM/DISP0 上的夹爪相机
-（`camera_num: 0`）用于物料颜色与中心定位；CAM/DISP1 上的前置相机
+（`camera_num: 0`）用于物料模型识别与中心定位；CAM/DISP1 上的前置相机
 （`camera_num: 1`）用于巡线、导航和二维码。摄像头型号未确定时保持 `model: null`。
 
-抓取相机对准调试：
+cam0 默认选择模型后端，配置位于 `config/material.json`。目前没有训练模型
+和物料编号映射，权重保持为空，返回 `MODEL_NOT_CONFIGURED` 且禁止抓取。
+后续接入流程见 [物料模型说明](docs/MATERIAL_MODEL.md)；旧颜色后端需显式添加
+`--material-backend color`。
+
+抓取相机框架与对准调试：
 
 ```bash
-python3 -m tools.debug_gripper --target-code 4
+python3 -m tools.debug_gripper --no-preview
 ```
+
+物料数据交给 STM32：树莓派只发送类别、编号、置信度和像素位置，
+STM32 自己负责纠偏与抓取。新增实机上报入口为 `tools.report_material`；
+这次队友压缩包尚未实现该物料接口；
+需先接入 STM32 的 0x85 接收模块并声明 0x40 扩展能力。旧固件会被拒绝，
+不能把串口 ACK 当作抓取完成。接入和启动步骤见
+[物料数据下发说明](docs/MATERIAL_STM32.md)。
 
 两路相机联合调试（默认无窗口，适合SSH）：
 
 ```bash
-python3 -m tools.debug_dual_camera --mode all --target-code 4
+python3 -m tools.debug_dual_camera --mode all
 ```
 
 这里的“摄像头1”是夹爪相机，“摄像头2”是车头导航相机；它们和 Picamera2
@@ -93,7 +105,19 @@ OPS9 接在 STM32 上，由 STM32 转发统一位姿遥测；树莓派不再占�
 请求序号和 `goal_id` 的 v2 二进制事务。当前队友固件不支持旧连续速度命令，
 必须使用 `stm32_pose_goal` 模式。
 
-先测试 USB CDC 双向通信，不使能新的运动会话（遗留活动会话会先停车）：
+这次队友压缩包实际使用 USART1（PA9/PA10，115200），原生 USB CDC 仍需底层适配。
+直接连接这份固件时使用 USB 转 3.3V TTL 串口，并运行：
+
+```bash
+python3 -m tools.stm32_link_test --transport uart --port /dev/ttyUSB0 --count 10
+```
+
+正式运行时将 `config/stm32.json` 的 `transport` 设置为 `uart` 并填写实际端口，
+模板见 `config/stm32_uart.json`。新握手会检查 WORK、OPS9、CAN 和 PID 参数后才启用
+二进制会话。接口差异及未实现的物料/抓取功能见 [队友接口适配说明](docs/TEAMMATE_INTERFACE.md)。
+
+队友完成 CDC 适配后，先测试 USB CDC 双向通信，不使能新的运动会话
+（遗留活动会话会先停车）：
 
 ```bash
 python3 -m tools.stm32_link_test --port /dev/ttyACM0 --count 10
@@ -108,6 +132,13 @@ USB CDC 配置、队友固件接口要求和测试步骤见
 自动行驶。导航阶段已改为灰色可行域、黄白禁入区域和黑色圆柱检测，不再依赖
 旧黑线巡线。实现与协议说明见 `docs/NAVIGATION_OPS9_DESIGN.md`，真实组件接线见
 `docs/NAVIGATION_RUNTIME.md`。
+
+当前导航采用比赛优先的容错配置：短暂视觉异常有 0.6 秒容错窗口，无动作超时
+先恢复重试，无关道路变化不取消当前航点。停车复核默认在 0.2 秒、2 个新观测
+确认后恢复。扫码和感知复核超时会继续等待；导航、物料定位耗尽重试后停车
+1 秒再尝试，OPS9 丢失和航点超时需核对旧航点及新鲜定位后恢复。详细参数和
+仍保留的保护见
+[`导航运行策略`](docs/NAVIGATION_RUNTIME.md#比赛优先的容错策略)。
 
 ## 树莓派开机启动
 

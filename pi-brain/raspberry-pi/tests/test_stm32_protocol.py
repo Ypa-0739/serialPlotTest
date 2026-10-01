@@ -40,6 +40,12 @@ class ProtocolTests(unittest.TestCase):
     def test_standard_crc_vector(self):
         self.assertEqual(crc16_ccitt(b"123456789"), 0x29B1)
 
+    def test_crc_preserves_custom_seed_and_iterable_input(self):
+        self.assertEqual(crc16_ccitt(b""), 0xFFFF)
+        self.assertEqual(crc16_ccitt(b"123456789", initial=0), 0x31C3)
+        prefix_crc = crc16_ccitt([49, 50, 51, 52])
+        self.assertEqual(crc16_ccitt(iter(b"56789"), initial=prefix_crc), 0x29B1)
+
     def test_frame_round_trip(self):
         original = Frame(
             MessageType.COMMAND,
@@ -104,6 +110,16 @@ class _LoopbackStm32Serial:
         self.fail_read = False
         self.expire_after = None
         self.last_command = time.monotonic()
+        self.status_reply = "# STATUS MODE=WORK HOST_PROTO=4 HOST=RPI STATE=0 PLOT=0"
+        self.ops_reply = "# OPS LINK=OK X=12.50 Y=-40.25 YAW=90.00 FRAMES=20 FRAME_AGE=5"
+        self.can_reply = (
+            "# CAN STATE=2 ERROR=0x00000020 FREE=3 TX_OK=4\r\n"
+            "# CAN TX_QUEUED=0 TX_ABORT=0 TX_TIMEOUT=0 ERR_LATCH=0x00000020\r\n"
+            "# CAN READY=1 TX_FAULT=0 MASK=0x0F\r\n"
+            "# CAN TX_WATCH NO_TX_REPAIR=0\r\n"
+            "# CAN ESR=0x00000000 TSR=0 TEC=0 REC=0 BOFF=0 EPVF=0 EWGF=0"
+        )
+        self.pid_reply = "# PID ALL X=0.0018,0,0 Y=0.0018,0,0 YAW=0.02,0.000015,0"
 
     def _enqueue(self, data):
         for start in range(0, len(data), 3):
@@ -129,6 +145,10 @@ class _LoopbackStm32Serial:
                 "HOST LINK RPI": "# HOST LINK RPI OK HEARTBEAT=REQUIRED",
                 "STOP": "# STOP MODE=WORK",
                 "MODE WORK": "# MODE WORK PLOT=0 CHANGED=0",
+                "STATUS": self.status_reply,
+                "OPS STATUS": self.ops_reply,
+                "CAN STATUS": self.can_reply,
+                "PID STATUS ALL": self.pid_reply,
                 "HOST BINARY START": "# HOST BINARY READY VERSION=2 CAPS=0x0000003F",
             }
             if command == "HOST BINARY START":

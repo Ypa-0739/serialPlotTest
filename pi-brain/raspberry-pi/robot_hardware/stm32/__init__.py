@@ -1,6 +1,7 @@
 """STM32 消息、串口传输和协议实现。"""
 
 from .messages import (
+    Capability,
     Command,
     EventCode,
     MessageType,
@@ -33,15 +34,26 @@ from .pose_goal import (
 )
 from .protocol import Frame, FrameDecoder, ProtocolError, crc16_ccitt
 from .serial_link import CommandRejected, CommandTimeout, SerialLink, SerialLinkError
+from .startup import FirmwareStartupInfo
+from .material_vision import (
+    MaterialVisionBackend, MaterialVisionFlags, MaterialVisionPacket,
+    MaterialVisionStatus, Stm32MaterialVisionPublisher,
+)
 
 __all__ = [
+    "Capability",
     "Command",
     "CommandRejected",
     "CommandTimeout",
     "EventCode",
     "Frame",
     "FrameDecoder",
+    "FirmwareStartupInfo",
     "MessageType",
+    "MaterialVisionBackend",
+    "MaterialVisionFlags",
+    "MaterialVisionPacket",
+    "MaterialVisionStatus",
     "MotionFault",
     "MotionFaultReason",
     "Ops9Pose",
@@ -68,6 +80,7 @@ __all__ = [
     "Stm32ChassisController",
     "Stm32Ops9Receiver",
     "Stm32PoseGoalController",
+    "Stm32MaterialVisionPublisher",
     "TelemetryKind",
     "TimedOps9Pose",
     "crc16_ccitt",

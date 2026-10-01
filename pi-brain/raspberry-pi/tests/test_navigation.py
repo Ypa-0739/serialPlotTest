@@ -1,12 +1,17 @@
 """OPS9 遥测、静态地图和障碍改道测试。"""
 
 from pathlib import Path
+from dataclasses import replace
+from types import SimpleNamespace
 import struct
 import unittest
 
 from robot_control.navigation_map import CircularObstacle, NavigationMap, Pose2D
 from robot_control.navigator import MapNavigator
-from robot_perception.obstacle import ConfirmedObstacleTracker, DetectedObstacle
+from robot_perception.obstacle import (
+    CameraObstacleDetector, ObstacleDetectorConfig,
+    ConfirmedObstacleTracker, DetectedObstacle,
+)
 from robot_hardware.stm32.messages import (
     MessageType,
     Ops9Pose,
@@ -161,6 +166,23 @@ class _VelocityRecorder:
 
 
 class NavigatorTests(unittest.TestCase):
+    def test_no_route_waits_for_reobservation_then_continues(self):
+        navigation_map = NavigationMap.load(ROOT / "config" / "navigation.json")
+        obstacles = [CircularObstacle(1200, 1925, 60)]
+        velocity = _VelocityRecorder()
+        navigator = MapNavigator(
+            navigation_map, lambda: Pose2D(1200, 2050, -1.5708), velocity,
+            obstacle_reader=lambda: obstacles,
+        )
+        for _ in range(5):
+            result = navigator.navigate_to(TargetArea.PROCESSING)
+            self.assertEqual(result.status, ActionStatus.RUNNING)
+            self.assertFalse(result.activity)
+        self.assertFalse(velocity.commands)
+        obstacles.clear()
+        self.assertEqual(navigator.navigate_to(TargetArea.PROCESSING).status, ActionStatus.RUNNING)
+        self.assertTrue(velocity.commands)
+
     def test_navigator_plans_and_issues_velocity(self):
         navigation_map = NavigationMap.load(ROOT / "config" / "navigation.json")
         pose = [Pose2D(1200, 2050, -1.5708)]
@@ -185,6 +207,62 @@ class NavigatorTests(unittest.TestCase):
 
 
 class ObstacleTrackerTests(unittest.TestCase):
+    @staticmethod
+    def detection(now, confidence=0.8):
+        return DetectedObstacle(1200, 1500, 60, now, confidence)
+
+    def confirm(self, tracker):
+        for now in (1.0, 1.1, 1.2):
+            tracker.update([self.detection(now)], now)
+
+    def test_intermittent_noise_does_not_accumulate_confirmation(self):
+        tracker = ConfirmedObstacleTracker()
+        for now in (1.0, 1.2, 1.4):
+            self.assertEqual(tracker.update([self.detection(now)], now), ())
+            self.assertEqual(tracker.update([], now + 0.05), ())
+
+    def test_repeated_timestamp_and_low_confidence_do_not_confirm(self):
+        tracker = ConfirmedObstacleTracker()
+        for _ in range(5):
+            self.assertEqual(tracker.update([self.detection(1.0)], 1.0), ())
+        for now in (1.1, 1.2, 1.3):
+            self.assertEqual(tracker.update([self.detection(now, 0.2)], now), ())
+
+    def test_three_visible_clear_frames_remove_confirmed_false_positive(self):
+        tracker = ConfirmedObstacleTracker()
+        self.confirm(tracker)
+        self.assertTrue(tracker.update([], 1.3, visible=lambda _o: True))
+        self.assertTrue(tracker.update([], 1.4, visible=lambda _o: True))
+        self.assertEqual(tracker.update([], 1.5, visible=lambda _o: True), ())
+
+    def test_confirmed_obstacle_outside_view_is_not_cleared_by_timeout(self):
+        tracker = ConfirmedObstacleTracker()
+        self.confirm(tracker)
+        self.assertTrue(tracker.update([], 5.0, visible=lambda _o: False))
+        self.assertTrue(tracker.update([], 10.0, visible=lambda _o: False))
+
+    def test_disappearance_outside_view_resets_clear_confirmation(self):
+        tracker = ConfirmedObstacleTracker()
+        self.confirm(tracker)
+        tracker.update([], 1.3, visible=lambda _o: True)
+        tracker.update([], 1.4, visible=lambda _o: False)
+        self.assertTrue(tracker.update([], 1.5, visible=lambda _o: True))
+        self.assertTrue(tracker.update([], 1.6, visible=lambda _o: True))
+        self.assertEqual(tracker.update([], 1.7, visible=lambda _o: True), ())
+
+    def test_unknown_camera_visibility_does_not_count_clear_frames(self):
+        config = replace(
+            ObstacleDetectorConfig.load(ROOT / "config" / "obstacle.json"),
+            calibration_required=False,
+        )
+        detector = CameraObstacleDetector(config)
+        pose = Pose2D(0, 0, 0)
+        frame = SimpleNamespace(shape=(480, 640, 3))
+        self.assertTrue(detector.is_visible(DetectedObstacle(400, 0, 60, 1, 0.8), pose, frame))
+        self.assertFalse(detector.is_visible(DetectedObstacle(-400, 0, 60, 1, 0.8), pose, frame))
+        self.assertFalse(detector.is_visible(DetectedObstacle(2000, 0, 60, 1, 0.8), pose, frame))
+        self.assertFalse(detector.is_visible(DetectedObstacle(400, 0, 60, 1, 0.8), pose, object()))
+
     def test_requires_three_consistent_frames(self):
         tracker = ConfirmedObstacleTracker(confirmations_required=3)
         first = DetectedObstacle(1200, 1500, 60, 1.0, 0.8)

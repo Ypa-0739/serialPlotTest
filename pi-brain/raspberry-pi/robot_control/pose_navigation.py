@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Callable, Iterable, Mapping, Optional
 
-from robot_hardware.stm32.messages import MotionFaultReason
+from robot_hardware.stm32.messages import RECOVERABLE_MOTION_FAULTS, MotionFaultReason
 from robot_hardware.stm32.pose_goal import (
     PoseGoalBusy,
     PoseTransactionState,
@@ -27,12 +27,6 @@ from .navigator import NavigationLimits, Ops9MapTransform
 class Stm32PoseMapNavigator:
     """树莓派规划路网，STM32 依次闭环执行带 ``goal_id`` 的航点。"""
 
-    _FATAL_FAULTS = {
-        MotionFaultReason.CAN_FAULT,
-        MotionFaultReason.OUT_OF_BOUNDS,
-        MotionFaultReason.INTERNAL_ERROR,
-    }
-
     def __init__(
         self,
         navigation_map: NavigationMap,
@@ -45,6 +39,7 @@ class Stm32PoseMapNavigator:
         limits: NavigationLimits = NavigationLimits(),
         waypoint_timeout_seconds: float = 35.0,
         target_yaw_mrad: Mapping[TargetArea, int] | None = None,
+        recovery_checker: Optional[Callable[[], bool]] = None,
     ) -> None:
         if waypoint_timeout_seconds <= 0:
             raise ValueError("waypoint_timeout_seconds 必须大于 0")
@@ -57,16 +52,22 @@ class Stm32PoseMapNavigator:
         self.limits = limits
         self.waypoint_timeout_seconds = float(waypoint_timeout_seconds)
         self.target_yaw_mrad = dict(target_yaw_mrad or {})
+        self.recovery_checker = recovery_checker or controller.recover_connection
         self._target: Optional[TargetArea] = None
         self._plan: Optional[RoutePlan] = None
         self._waypoint_index = 0
-        self._blocked_edges: frozenset[str] = frozenset()
 
     @property
     def current_plan(self) -> Optional[RoutePlan]:
         return self._plan
 
     def navigate_to(self, target: TargetArea) -> ActionResult:
+        recovered = self.recovery_checker()
+        transaction = self.controller.snapshot()
+        if transaction.state is PoseTransactionState.FAULT and transaction.fault_reason not in RECOVERABLE_MOTION_FAULTS:
+            return ActionResult.fatal(f"STM32 位姿闭环故障：{_fault_name(transaction.fault_reason)}")
+        if not recovered:
+            return ActionResult.running("等待核对旧航点及有效定位，暂不提交新目标", activity=False)
         pose = self.pose_reader()
         if pose is None:
             if self.controller.commanded_motion_active:
@@ -91,6 +92,8 @@ class Stm32PoseMapNavigator:
                 try:
                     self.controller.cancel()
                 except SerialLinkError as error:
+                    if self.controller.snapshot().fault_reason == MotionFaultReason.HOST_LOST:
+                        return ActionResult.running("通信中断，等待新会话后重新规划", activity=False)
                     return ActionResult.fatal(f"取消旧航点失败：{error}")
                 return ActionResult.running(
                     "路线或障碍变化，等待 STM32 确认取消旧航点",
@@ -103,6 +106,7 @@ class Stm32PoseMapNavigator:
             PoseTransactionState.ACCEPTED,
             PoseTransactionState.MOVING,
             PoseTransactionState.CANCELLING,
+            PoseTransactionState.RECONCILING,
         }:
             return ActionResult.running(
                 self._active_message(transaction.state),
@@ -118,7 +122,7 @@ class Stm32PoseMapNavigator:
             message = f"STM32 位姿闭环故障：{_fault_name(reason)}"
             return (
                 ActionResult.fatal(message)
-                if reason in self._FATAL_FAULTS
+                if reason not in RECOVERABLE_MOTION_FAULTS
                 else ActionResult.retryable(message)
             )
         elif transaction.state == PoseTransactionState.REACHED:
@@ -126,7 +130,9 @@ class Stm32PoseMapNavigator:
             self._waypoint_index += 1
 
         if self._plan is None and not self._replan(pose, target, blocked):
-            return ActionResult.retryable("障碍物封路且当前没有可用改道路线")
+            # 不在几次快速轮询中耗尽重试；持续采集新图像后再规划。
+            # 状态机负责无动作超时后的有限恢复重试。
+            return ActionResult.running("当前无可用路线，保持停车并重新观察封路", activity=False)
 
         assert self._plan is not None
         while self._waypoint_index < len(self._plan.nodes):
@@ -156,6 +162,11 @@ class Stm32PoseMapNavigator:
                 timeout_seconds=self.waypoint_timeout_seconds,
             )
         except (SerialLinkError, PoseGoalBusy) as error:
+            transaction = self.controller.snapshot()
+            if transaction.fault_reason == MotionFaultReason.HOST_LOST:
+                return ActionResult.running("通信中断，等待新会话后重新规划", activity=False)
+            if transaction.state is PoseTransactionState.FAULT and transaction.fault_reason not in RECOVERABLE_MOTION_FAULTS:
+                return ActionResult.fatal(f"提交 STM32 航点失败：{error}")
             return ActionResult.retryable(f"提交 STM32 航点失败：{error}")
         return ActionResult.running(
             f"已提交航点 {node_name}，goal_id={goal_id}",
@@ -173,7 +184,10 @@ class Stm32PoseMapNavigator:
     ) -> bool:
         return (
             self._plan is not None
-            and (target != self._target or blocked != self._blocked_edges)
+            and (
+                target != self._target
+                or self.map.route_is_blocked(self._plan, self._waypoint_index, blocked)
+            )
         )
 
     def _replan(
@@ -193,7 +207,6 @@ class Stm32PoseMapNavigator:
         self._target = target
         self._plan = plan
         self._waypoint_index = 0
-        self._blocked_edges = blocked
         return True
 
     def _waypoint_yaw(self, target: TargetArea, pose: Pose2D) -> float:
@@ -209,7 +222,6 @@ class Stm32PoseMapNavigator:
         self._target = None
         self._plan = None
         self._waypoint_index = 0
-        self._blocked_edges = frozenset()
 
     @staticmethod
     def _active_message(state: PoseTransactionState) -> str:
@@ -217,6 +229,7 @@ class Stm32PoseMapNavigator:
             PoseTransactionState.ACCEPTED: "STM32 已接受航点，等待启动事件",
             PoseTransactionState.MOVING: "STM32 正在执行航点闭环",
             PoseTransactionState.CANCELLING: "等待 STM32 确认航点取消",
+            PoseTransactionState.RECONCILING: "等待查询确认 STM32 航点实际状态",
         }
         return labels[state]
 

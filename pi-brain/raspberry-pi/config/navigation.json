@@ -19,7 +19,7 @@
     "control_mode": "stm32_pose_goal",
     "turn_penalty_mm": 80,
     "maximum_speed_mm_s": 300,
-    "maximum_yaw_rate_mrad_s": 900,
+    "maximum_yaw_rate_mrad_s": 800,
     "waypoint_tolerance_mm": 90,
     "pose_request_timeout_seconds": 0.5,
     "waypoint_timeout_seconds": 35

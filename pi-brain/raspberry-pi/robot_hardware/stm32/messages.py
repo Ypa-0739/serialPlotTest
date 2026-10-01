@@ -53,13 +53,33 @@ class Command(IntEnum):
     QUERY_POSE_GOAL = 0x82
     SET_SPEED_LIMITS = 0x83
     SET_POSE_GOAL_WITH_LIMITS = 0x84
+    UPDATE_MATERIAL_VISION = 0x85
 
 
-REQUIRED_CAPABILITIES = 0x3F
+HOST_PROTOCOL_VERSION = 4
+
+
+class Capability(IntFlag):
+    """与队友 protocol/rpi_binary_protocol.json 一致的基础能力位。"""
+
+    QUERY_POSE = 0x01
+    SPEED_LIMITS = 0x02
+    BINARY_TELEMETRY = 0x04
+    ASYNC_TX = 0x08
+    SESSION_RECOVERY = 0x10
+    ATOMIC_POSE_LIMITS = 0x20
+
+
+REQUIRED_CAPABILITIES = int(
+    Capability.QUERY_POSE | Capability.SPEED_LIMITS | Capability.BINARY_TELEMETRY
+    | Capability.ASYNC_TX | Capability.SESSION_RECOVERY | Capability.ATOMIC_POSE_LIMITS
+)
+MATERIAL_VISION_CAPABILITY = 0x40  # 可选扩展；只有接入物料接收模块的固件才声明
 SUPPORTED_COMMANDS = frozenset({
     Command.PING, Command.STOP_ALL, Command.SESSION_PROBE,
     Command.SET_POSE_GOAL, Command.CANCEL_POSE_GOAL, Command.QUERY_POSE_GOAL,
     Command.SET_SPEED_LIMITS, Command.SET_POSE_GOAL_WITH_LIMITS,
+    Command.UPDATE_MATERIAL_VISION,
 })
 
 
@@ -103,9 +123,28 @@ class MotionFaultReason(IntEnum):
     CAN_FAULT = 0x0003
     OUT_OF_BOUNDS = 0x0004
     TIMEOUT = 0x0005
-    USB_LINK_FAULT = 0x0006  # 队友固件原名 UART_FAULT；USB 适配后沿用编号
+    UART_FAULT = 0x0006  # 队友 v2 schema 的名称；原生 CDC 适配沿用此编号
+    USB_LINK_FAULT = UART_FAULT  # 保留已有调用方名称
     CANCEL_TIMEOUT = 0x0100  # 树莓派本地故障，不与固件编号冲突
+    REQUEST_TIMEOUT = 0x0101  # 应答不确定，先查询航点状态，不重发运动命令
     INTERNAL_ERROR = 0x00FF
+
+
+FATAL_MOTION_FAULTS = frozenset({
+    MotionFaultReason.CAN_FAULT,
+    MotionFaultReason.OUT_OF_BOUNDS,
+    MotionFaultReason.INTERNAL_ERROR,
+    MotionFaultReason.HOST_LOST,
+})
+
+RECOVERABLE_MOTION_FAULTS = frozenset({
+    MotionFaultReason.OPS9_LOST,
+    MotionFaultReason.TIMEOUT,
+    MotionFaultReason.HOST_LOST,
+    MotionFaultReason.USB_LINK_FAULT,
+    MotionFaultReason.CANCEL_TIMEOUT,
+    MotionFaultReason.REQUEST_TIMEOUT,
+})
 
 
 @dataclass(frozen=True)

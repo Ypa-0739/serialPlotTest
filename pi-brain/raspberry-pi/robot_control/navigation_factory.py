@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from robot_hardware.stm32 import SerialLink, Stm32ChassisController, Stm32Ops9Receiver
-from robot_hardware.stm32.pose_goal import Stm32PoseGoalController
+from robot_hardware.stm32.messages import RECOVERABLE_MOTION_FAULTS
+from robot_hardware.stm32.pose_goal import PoseTransactionState, Stm32PoseGoalController
 from robot_runtime.models import ActionResult
 from robot_runtime.models import TargetArea
 
@@ -56,6 +57,11 @@ class Stm32NavigationStack:
         if self.ops9_receiver.latest() is None:
             return ActionResult.running("等待有效 OPS9 位姿", activity=False)
         return ActionResult.done("STM32、OPS9 与导航地图自检通过", activity=False)
+
+    def recover_navigation(self) -> bool:
+        if isinstance(self.navigator, Stm32PoseMapNavigator):
+            return self.navigator.recovery_checker()
+        return True
 
     def navigate_to(self, target):
         return self.navigator.navigate_to(target)
@@ -137,6 +143,33 @@ def build_stm32_navigation(
             TargetArea(key): int(value)
             for key, value in configured_headings.items()
         }
+
+        unmatched_fault_reconnect_requested = False
+
+        def recover_navigation() -> bool:
+            nonlocal unmatched_fault_reconnect_requested
+            if not chassis.recover_connection():
+                return False
+            fault = receiver.motion_fault
+            if fault is None:
+                unmatched_fault_reconnect_requested = False
+                return True
+            if fault.reason not in RECOVERABLE_MOTION_FAULTS:
+                return False
+            snapshot = chassis.snapshot()
+            if snapshot.state is PoseTransactionState.FAULT and snapshot.fault_reason not in RECOVERABLE_MOTION_FAULTS:
+                return False
+            if (
+                snapshot.state is PoseTransactionState.CANCELLED and snapshot.goal is not None
+                and snapshot.goal.goal_id == fault.goal_id and snapshot.fault_reason == fault.reason
+            ):
+                return receiver.recover_fault(snapshot.goal.goal_id, snapshot.fault_reason)
+            # 启动前/迟到事件的软故障没有可匹配事务；用新会话隔离，不能永久卡住。
+            if not unmatched_fault_reconnect_requested:
+                link.request_reconnect()
+                unmatched_fault_reconnect_requested = True
+            return False
+
         navigator = Stm32PoseMapNavigator(
             navigation_map,
             read_map_pose,
@@ -149,6 +182,7 @@ def build_stm32_navigation(
                 planner.get("waypoint_timeout_seconds", 35.0)
             ),
             target_yaw_mrad=target_headings,
+            recovery_checker=recover_navigation,
         )
     else:
         raise ValueError(

@@ -32,7 +32,7 @@ def validate_real_navigation_configuration() -> None:
     }
     errors = []
     if "替换" in str(files["stm32"]["port"]):
-        errors.append("STM32 USB CDC 设备名仍是占位符")
+        errors.append("STM32 串口设备名仍是占位符")
     if files["navigation"].get("nominal_map_requires_field_calibration", True):
         errors.append("场地图和点位尚未现场测量")
     if files["ops9"].get("calibration_required", True):

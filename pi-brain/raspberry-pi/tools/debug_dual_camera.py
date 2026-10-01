@@ -5,6 +5,7 @@ import os
 import time
 
 from robot_control import build_dual_camera_vision
+from robot_perception.material.preview import draw_model_detections, model_detection_summary
 
 
 def parse_arguments():
@@ -18,8 +19,7 @@ def parse_arguments():
     parser.add_argument(
         "--target-code",
         type=int,
-        choices=range(1, 7),
-        help="cam0夹爪相机要寻找的1至6号物料；不填时自动选择",
+        help="cam0要寻找的已映射正整数物料编号；不填时自动选择",
     )
     parser.add_argument(
         "--qr-every",
@@ -40,11 +40,15 @@ def parse_arguments():
     )
     parser.add_argument("--camera-config")
     parser.add_argument("--color-config")
+    parser.add_argument("--material-config")
+    parser.add_argument("--material-backend", choices=("model", "color"))
     parser.add_argument("--line-config")
     return parser.parse_args()
 
 
 def _validate_arguments(args) -> None:
+    if args.target_code is not None and args.target_code <= 0:
+        raise ValueError("--target-code 必须是正整数")
     if args.qr_every < 1:
         raise ValueError("--qr-every 必须大于等于1")
     if args.loop_interval <= 0:
@@ -83,6 +87,7 @@ def _draw_front(cv2, result):
 def _draw_gripper(cv2, result, grip_center):
     frame = result.frame.copy()
     detection = result.material_detection
+    draw_model_detections(cv2, frame, detection)
     cv2.drawMarker(
         frame,
         grip_center,
@@ -117,6 +122,8 @@ def main() -> int:
             camera_config_path=args.camera_config,
             color_config_path=args.color_config,
             line_config_path=args.line_config,
+            material_config_path=args.material_config,
+            material_backend=args.material_backend,
         )
     except Exception as error:
         print(f"双摄像头配置错误：{type(error).__name__}: {error}")
@@ -187,6 +194,8 @@ def main() -> int:
                     if observation
                     else None,
                     detection.safe_to_pick,
+                    model_detection_summary(detection),
+                    detection.message,
                 )
 
             changed = (
@@ -207,7 +216,9 @@ def main() -> int:
                         f"cam0 夹爪状态={gripper_summary[0]} "
                         f"物料={gripper_summary[1] or '未找到'} "
                         f"偏差={gripper_summary[2]} "
-                        f"可抓取={gripper_summary[3]}"
+                        f"可抓取={gripper_summary[3]} "
+                        f"模型候选={gripper_summary[4]} "
+                        f"提示={gripper_summary[5]}"
                     )
                 last_front_summary = front_summary
                 last_gripper_summary = gripper_summary

@@ -165,6 +165,20 @@ class NavigationMap:
                     blocked.add(edge.name)
         return frozenset(blocked)
 
+    def route_is_blocked(
+        self,
+        plan: RoutePlan,
+        waypoint_index: int,
+        blocked_edges: frozenset[str],
+    ) -> bool:
+        """只检查尚未走完的路段；其他道路封闭或重新开放不打断当前路线。"""
+        remaining = plan.nodes[max(0, waypoint_index - 1):]
+        segments = {frozenset(pair) for pair in zip(remaining, remaining[1:])}
+        return any(
+            edge.name in blocked_edges and frozenset((edge.start, edge.end)) in segments
+            for edge in self.edges
+        )
+
     def plan(
         self,
         start: str,

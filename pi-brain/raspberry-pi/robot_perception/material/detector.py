@@ -1,4 +1,4 @@
-"""抓取摄像头的物料颜色识别与二维对准结果。"""
+"""抓取摄像头的模型/颜色识别与二维对准结果；不执行机械动作。"""
 
 from dataclasses import dataclass
 from math import hypot
@@ -18,6 +18,15 @@ class MaterialObservation:
     box: Tuple[int, int, int, int]
     area: float
     confirmed: bool
+    class_id: Optional[int] = None
+    class_name: str = ""
+    confidence: float = 1.0
+    backend: str = "color"
+
+    @property
+    def material_name(self) -> str:
+        """模型和颜色后端通用名称；旧 color_* 字段保留兼容。"""
+        return self.color_cn_name or self.color_name
 
 
 @dataclass(frozen=True)
@@ -31,13 +40,23 @@ class GripperDetection:
     safe_to_pick: bool
     detected_color_codes: Tuple[int, ...]
     masks: Any = None
+    backend: str = "color"
+    message: str = ""
+    raw_model_detections: Tuple[Any, ...] = ()
+
+    @property
+    def detected_material_codes(self) -> Tuple[int, ...]:
+        return self.detected_color_codes
 
 
 class GripperMaterialDetector:
-    """在颜色检测结果中选择目标，并计算相对夹爪中心的像素偏差。"""
+    """在模型或颜色检测结果中选择目标，复用夹爪中心和对准容差。"""
 
     def __init__(self, color_detector, config: Mapping[str, Any]):
+        # 保留旧构造参数/属性名称，已有调用方无需迁移。
         self.color_detector = color_detector
+        self.source_detector = color_detector
+        self._last_target = object()
         grip_center = config.get("grip_center")
         tolerance = config.get("alignment_tolerance_pixels", (18, 18))
         if (
@@ -74,14 +93,45 @@ class GripperMaterialDetector:
         ):
             raise ValueError("target_material_code 必须是正整数或None")
 
-        state, masks = self.color_detector.detect(
+        backend = getattr(self.source_detector, "backend", "color")
+        if backend == "model" and target_material_code != self._last_target:
+            self.source_detector.reset_history()
+        self._last_target = target_material_code
+        state, masks = self.source_detector.detect(
             frame,
             collect_masks=collect_masks,
         )
+        backend = state.get("backend", backend)
         detections = tuple(state.get("detections", ()))
         detected_codes = tuple(
             sorted({int(item["code"]) for item in detections})
         )
+        common = {
+            "backend": backend,
+            "message": str(state.get("message", "")),
+            "raw_model_detections": tuple(state.get("raw_model_detections", ())),
+        }
+        if state.get("blocked", False):
+            return GripperDetection(
+                status=str(state.get("status", "HOLD")),
+                target_material_code=target_material_code,
+                observation=None, aligned=False, safe_to_pick=False,
+                detected_color_codes=detected_codes,
+                masks=masks if collect_masks else None,
+                **common,
+            )
+        if (
+            backend == "model" and target_material_code is not None
+            and target_material_code not in state.get("configured_material_codes", ())
+        ):
+            common["message"] = "请求的物料编号没有模型类别映射"
+            return GripperDetection(
+                status="TARGET_NOT_MAPPED", target_material_code=target_material_code,
+                observation=None, aligned=False, safe_to_pick=False,
+                detected_color_codes=detected_codes,
+                masks=masks if collect_masks else None,
+                **common,
+            )
         candidates = [
             item
             for item in detections
@@ -97,10 +147,12 @@ class GripperMaterialDetector:
                 safe_to_pick=False,
                 detected_color_codes=detected_codes,
                 masks=masks if collect_masks else None,
+                **common,
             )
 
         center_x, center_y = self.grip_center
-        candidates.sort(
+        selected = min(
+            candidates,
             key=lambda item: (
                 not bool(item.get("confirmed", False)),
                 hypot(
@@ -110,7 +162,6 @@ class GripperMaterialDetector:
                 -float(item.get("area", 0.0)),
             )
         )
-        selected = candidates[0]
         object_x = int(selected["center"][0])
         object_y = int(selected["center"][1])
         offset_x = object_x - center_x
@@ -133,6 +184,10 @@ class GripperMaterialDetector:
             box=tuple(int(value) for value in selected["box"]),
             area=float(selected.get("area", 0.0)),
             confirmed=confirmed,
+            class_id=selected.get("class_id"),
+            class_name=str(selected.get("class_name", "")),
+            confidence=float(selected.get("confidence", 1.0)),
+            backend=backend,
         )
         global_status = str(state.get("status", "HOLD"))
         global_ready = bool(state.get("safe_to_pick", False))
@@ -143,7 +198,7 @@ class GripperMaterialDetector:
         )
         safe_to_pick = confirmed and aligned and color_state_allows_pick
         if not confirmed:
-            status = "CONFIRMING_COLOR"
+            status = "CONFIRMING_MATERIAL" if backend == "model" else "CONFIRMING_COLOR"
         elif not aligned:
             status = "ALIGNING"
         elif safe_to_pick:
@@ -159,4 +214,5 @@ class GripperMaterialDetector:
             safe_to_pick=safe_to_pick,
             detected_color_codes=detected_codes,
             masks=masks if collect_masks else None,
+            **common,
         )
